@@ -457,12 +457,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
+        # Tensor-level mixed K (experts of one layer quantized at different K or codebooks): the
+        # fused, mgemm and BC kernels take one K and codebook per projection for the whole layer,
+        # so such layers run every batch shape through the dense per-expert path
+        def _uniform_q(ls):
+            return len({(l.inner.K, l.inner.mcg, l.inner.mul1) for l in ls}) <= 1
+        self.uniform_expert_q = self.is_quantized and all(
+            _uniform_q(ls) for ls in ((self.gates if self.gated else []), self.ups, self.downs))
+        if self.is_quantized and not self.uniform_expert_q:
+            print(f" -- Mixed-K experts in {self.key}: dense per-expert path")
+
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
-            self.is_quantized and
+            self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -476,7 +486,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bsz1 = (
-            self.is_quantized and
+            self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             self.shared_experts is None and
