@@ -88,16 +88,28 @@ def run_pending_swap_sweeps(infer_params):
 
 
 def _uniform_proj_dims(dims_of, mlp, first, gd, ud, dd):
-    """Per-projection (rows, cols, K) shared by every CPU-resident expert of the layer, or None
-    when the experts mix K: the streamed-prefill staging layout and its fused launches assume
-    one K per projection, so mixed-K layers stay on the plain CPU path"""
-    groups = ([mlp.gates[first:]] if mlp.gated else []) + [mlp.ups[first:], mlp.downs[first:]]
+    """Per-projection (rows, cols, K) for each expert of the layer. If all experts have the same
+    dims, returns a single tuple per projection (uniform case). Otherwise, returns a list of
+    tuples (mixed K case). The register_layer function handles both formats and computes
+    per-expert byte offsets accordingly."""
+    E = len(mlp.ups[first:])
+    groups = (([mlp.gates[first:]] if mlp.gated else []) +
+              [mlp.ups[first:], mlp.downs[first:]])
+    names = (["g"] if mlp.gated else []) + ["u", "d"]
     refs = ([gd] if mlp.gated else []) + [ud, dd]
-    for ls, ref in zip(groups, refs):
-        if any(dims_of(l) != ref for l in ls):
-            print(f" -- Mixed-K experts in {mlp.key}: no streamed CPU prefill")
-            return None
-    return dict(g = gd, u = ud, d = dd)
+
+    result = {}
+    for name, ls, ref in zip(names, groups, refs):
+        dims_list = [dims_of(l) for l in ls]
+        if all(d == ref for d in dims_list):
+            # All uniform: store single tuple for backward compat
+            result[name] = ref
+        else:
+            # Mixed K: store per-expert list
+            result[name] = dims_list
+            print(f" -- Mixed-K experts in {mlp.key}, projection {name}: "
+                  f"K values {[d[2] for d in dims_list]}")
+    return result
 
 
 class BlockSparseMLP_CPU:
