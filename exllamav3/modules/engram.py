@@ -3,6 +3,7 @@ from typing_extensions import override
 import hashlib
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -199,6 +200,25 @@ class EngramTable:
         self.threads = threads
         self.pool = ThreadPoolExecutor(max_workers = threads) if threads > 1 else None
 
+        # Load offline Engram rows file if EXL3_ENGRAM_ROWS env var is set
+        self.rows_file_ids = None
+        self.rows_file_weight = None
+        self.rows_file_scale = None
+        rows_file = os.environ.get("EXL3_ENGRAM_ROWS")
+        if rows_file:
+            match = re.search(r"layers\.(\d+)\.engram", key)
+            if match:
+                layer_id = match.group(1)
+                try:
+                    from safetensors import safe_open
+                    with safe_open(rows_file, "pt") as f:
+                        if f"layers.{layer_id}.ids" in f.keys():
+                            self.rows_file_ids = f.get_tensor(f"layers.{layer_id}.ids").to(torch.int64)
+                            self.rows_file_weight = f.get_tensor(f"layers.{layer_id}.weight").to(torch.uint8)
+                            self.rows_file_scale = f.get_tensor(f"layers.{layer_id}.scale").to(torch.uint8)
+                except Exception:
+                    pass
+
     def _gather(self, handle, ids: list, nbytes: int) -> bytes:
         fd = handle._ensure_open()
         base = handle.abs_offset
@@ -215,13 +235,49 @@ class EngramTable:
         """hash_ids: any shape of row ids -> (*shape, head_dim) fp32 dequantized rows on device."""
         flat = hash_ids.reshape(-1).cpu().to(torch.int64)
         uniq, inverse = torch.unique(flat, return_inverse = True)
-        ids = uniq.tolist()
-        wb = self._gather(self.weight, ids, self.weight.row_bytes)
-        sb = self._gather(self.scale, ids, self.scale.row_bytes)
-        w = torch.frombuffer(bytearray(wb), dtype = torch.float8_e4m3fn).view(len(ids), self.head_dim).to(device)
-        s = torch.frombuffer(bytearray(sb), dtype = torch.uint8).view(len(ids), -1).to(device)
-        vals = w.float().view(len(ids), -1, self.block) * torch.exp2(s.float() - 127.0).unsqueeze(-1)
-        vals = vals.view(len(ids), self.head_dim)
+
+        # Hybrid gather: memory hits from rows file, disk fallback for missed ids
+        if self.rows_file_ids is not None:
+            n = len(self.rows_file_ids)
+            pos = torch.searchsorted(self.rows_file_ids, uniq)
+            hit = (pos < n) & (self.rows_file_ids[pos.clamp(max=n-1)] == uniq)
+
+            # Gather hit rows from memory
+            hit_vals = None
+            if hit.any():
+                hit_pos = pos[hit]
+                w_hit = self.rows_file_weight[hit_pos].view(torch.float8_e4m3fn).to(device)
+                s_hit = self.rows_file_scale[hit_pos].to(device)
+                hit_vals = w_hit.float().view(hit_pos.shape[0], -1, self.block) * torch.exp2(s_hit.float() - 127.0).unsqueeze(-1)
+                hit_vals = hit_vals.view(hit_pos.shape[0], self.head_dim)
+
+            # Gather missed rows from disk
+            miss_mask = ~hit
+            if miss_mask.any():
+                miss_ids = uniq[miss_mask].tolist()
+                wb = self._gather(self.weight, miss_ids, self.weight.row_bytes)
+                sb = self._gather(self.scale, miss_ids, self.scale.row_bytes)
+                w_miss = torch.frombuffer(bytearray(wb), dtype = torch.float8_e4m3fn).view(len(miss_ids), self.head_dim).to(device)
+                s_miss = torch.frombuffer(bytearray(sb), dtype = torch.uint8).view(len(miss_ids), -1).to(device)
+                miss_vals = w_miss.float().view(len(miss_ids), -1, self.block) * torch.exp2(s_miss.float() - 127.0).unsqueeze(-1)
+                miss_vals = miss_vals.view(len(miss_ids), self.head_dim)
+
+            # Assemble results in uniq order
+            vals = torch.empty(len(uniq), self.head_dim, device=device, dtype=torch.float32)
+            if hit.any():
+                vals[hit] = hit_vals
+            if miss_mask.any():
+                vals[miss_mask] = miss_vals
+        else:
+            # Disk-only gather (original path)
+            ids = uniq.tolist()
+            wb = self._gather(self.weight, ids, self.weight.row_bytes)
+            sb = self._gather(self.scale, ids, self.scale.row_bytes)
+            w = torch.frombuffer(bytearray(wb), dtype = torch.float8_e4m3fn).view(len(ids), self.head_dim).to(device)
+            s = torch.frombuffer(bytearray(sb), dtype = torch.uint8).view(len(ids), -1).to(device)
+            vals = w.float().view(len(ids), -1, self.block) * torch.exp2(s.float() - 127.0).unsqueeze(-1)
+            vals = vals.view(len(ids), self.head_dim)
+
         return vals[inverse.to(device)].view(*hash_ids.shape, self.head_dim)
 
     def close(self):
