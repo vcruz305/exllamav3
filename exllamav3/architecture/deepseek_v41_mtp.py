@@ -37,6 +37,7 @@ class DeepseekV41MTPModel(Model):
 
         h = config.hidden_size
         n_taps = max(len(config.dspark_target_layer_ids), 1)
+        self.num_mtp_layers = config.num_mtp_layers
 
         # Entry: main_proj / main_norm (consumed by update_kv_from_target) + the noise-block
         # embedder for the draft forward
@@ -56,9 +57,8 @@ class DeepseekV41MTPModel(Model):
         self.attn_modules = []
 
         for idx in range(config.num_mtp_layers):
-            layer_type = config.mtp_layer_types[idx]
-            assert layer_type == "sliding", \
-                f"DeepseekV41 MTP: expected compressor-less (sliding) blocks, got {layer_type}"
+            # V4.1 drafter: all MTP layers are compressor-less (sliding)
+            layer_type = "sliding"
             key = f"mtp.{idx}"
             attn = DSparkV41Attention(
                 config = config,
