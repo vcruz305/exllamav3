@@ -1320,8 +1320,8 @@ class DSV4Attention(Module):
         # owner's (6, MAX_B) array and block-table static, the input pointer is the only
         # patched parameter. Declines (no fan / non-exl3 projections) fall through to the
         # eager batched body below
-        # (the BC graphs fold the V4 q head norm in, so they are skipped without one)
-        if dsv4_batch_graph and self.q_head_norm and B <= 8 and S <= 16 and R <= 32:
+        # (the BC graphs handle q_head_norm optionally)
+        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32:
             if not hasattr(self, "_bc_dsa_batch"):
                 self._bc_dsa_batch = {}
             bcd = self._bc_dsa_batch.get(id(rsl))
@@ -1564,8 +1564,8 @@ class DSV4Attention(Module):
         _, seq, _ = x.shape
 
         # Whole-step graph path (EXL3_BC_DSA=1); not used when the batched path already
-        # projected this job's rows (pre)
-        if pre is None and self.q_head_norm and \
+        # projected this job's rows (pre); q_head_norm is now optional in the C++ backend
+        if pre is None and \
                 bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
             if not hasattr(self, "_bc_dsa"):
                 self._bc_dsa = {}
