@@ -87,6 +87,19 @@ def run_pending_swap_sweeps(infer_params):
         print(f" -- expert swap sweep: {total} swaps", flush = True)
 
 
+def _uniform_proj_dims(dims_of, mlp, first, gd, ud, dd):
+    """Per-projection (rows, cols, K) shared by every CPU-resident expert of the layer, or None
+    when the experts mix K: the streamed-prefill staging layout and its fused launches assume
+    one K per projection, so mixed-K layers stay on the plain CPU path"""
+    groups = ([mlp.gates[first:]] if mlp.gated else []) + [mlp.ups[first:], mlp.downs[first:]]
+    refs = ([gd] if mlp.gated else []) + [ud, dd]
+    for ls, ref in zip(groups, refs):
+        if any(dims_of(l) != ref for l in ls):
+            print(f" -- Mixed-K experts in {mlp.key}: no streamed CPU prefill")
+            return None
+    return dict(g = gd, u = ud, d = dd)
+
+
 class BlockSparseMLP_CPU:
 
     def _cpu_init_state(self):
@@ -390,6 +403,7 @@ class BlockSparseMLP_CPU:
         ud = dims_of(self.ups[0])
         dd = dims_of(self.downs[0])
         hi, ho = ud[0], dd[1]
+        pdims = _uniform_proj_dims(dims_of, self, 0, gd, ud, dd)
 
         # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
         # (lists, not stacks: the fetches may be deferred and fill in place)
@@ -416,7 +430,7 @@ class BlockSparseMLP_CPU:
             {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
-            proj_dims = dict(g = gd, u = ud, d = dd),
+            proj_dims = pdims,
             aux = aux,
         )
         self.cpu_offload = True
@@ -520,6 +534,7 @@ class BlockSparseMLP_CPU:
         ud = dims_of(self.ups[first])
         dd = dims_of(self.downs[first])
         hi, ho = ud[0], dd[1]
+        pdims = _uniform_proj_dims(dims_of, self, first, gd, ud, dd)
 
         def fetch_aux(ls, suffix, optional = False):
             out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
@@ -544,7 +559,7 @@ class BlockSparseMLP_CPU:
             {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
-            proj_dims = dict(g = gd, u = ud, d = dd),
+            proj_dims = pdims,
             aux = aux,
         )
 
