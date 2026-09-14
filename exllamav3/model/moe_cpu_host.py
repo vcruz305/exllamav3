@@ -1057,8 +1057,16 @@ class MoeCpuHost:
             pd = s.get("proj_dims")
             if pd:
                 for k in ("g", "u", "d"):
-                    if pd.get(k):
-                        mx = max(mx, pd[k][0] * pd[k][1])
+                    dims_k = pd.get(k)
+                    if dims_k:
+                        # Handle both single tuple (uniform K) and list of tuples (mixed K)
+                        if isinstance(dims_k, list):
+                            # Per-expert dims: find max numel across all experts
+                            for dims in dims_k:
+                                mx = max(mx, dims[0] * dims[1])
+                        else:
+                            # Single dims for all experts
+                            mx = max(mx, dims_k[0] * dims_k[1])
         return mx
 
     def _device_buffers(self, device):
