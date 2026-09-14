@@ -209,15 +209,19 @@ class EngramTable:
             match = re.search(r"layers\.(\d+)\.engram", key)
             if match:
                 layer_id = match.group(1)
+                # An explicitly requested rows file that cannot be read is an error: falling back to
+                # the disk tables silently would hide a broken offline setup
+                from safetensors import safe_open
                 try:
-                    from safetensors import safe_open
                     with safe_open(rows_file, "pt") as f:
                         if f"layers.{layer_id}.ids" in f.keys():
                             self.rows_file_ids = f.get_tensor(f"layers.{layer_id}.ids").to(torch.int64)
                             self.rows_file_weight = f.get_tensor(f"layers.{layer_id}.weight").to(torch.uint8)
                             self.rows_file_scale = f.get_tensor(f"layers.{layer_id}.scale").to(torch.uint8)
-                except Exception:
-                    pass
+                        else:
+                            print(f" -- EXL3_ENGRAM_ROWS has no rows for layer {layer_id}: disk tables only")
+                except (OSError, RuntimeError, KeyError) as e:
+                    raise RuntimeError(f"EXL3_ENGRAM_ROWS={rows_file} unreadable for layer {layer_id}") from e
 
     def _gather(self, handle, ids: list, nbytes: int) -> bytes:
         fd = handle._ensure_open()
