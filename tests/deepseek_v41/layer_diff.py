@@ -136,6 +136,11 @@ def main() -> int:
             "rel_err_p90": round(torch.quantile(rel, 0.9).item(), 5),
             "rel_err_pos0": round(rel.view(S, N)[:, 0].mean().item(), 5),
             "rel_err_per_seq": [round(v, 5) for v in per_seq.tolist()],
+            "rel_err_by_pos_bucket": {
+                f"{a}-{b - 1}": round(rel.view(S, N)[:, a:min(b, N)].mean().item(), 5)
+                for a, b in ((0, 1), (1, 2), (2, 4), (4, 8), (8, 16), (16, 32), (32, 64), (64, 128),
+                             (128, 129), (129, 256), (256, 512)) if a < N
+            },
             "cosine_mean": round(cos.mean().item(), 5),
             "ref_norm_mean": round(ref_h.norm(dim = -1).mean().item(), 3),
             "exl_norm_mean": round(exl_h.norm(dim = -1).mean().item(), 3),

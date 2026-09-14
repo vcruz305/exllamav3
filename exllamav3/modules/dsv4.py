@@ -374,8 +374,11 @@ class DSV4Attention(Module):
         idx_wq_b: Linear | None = None,
         idx_weights: Linear | None = None,
         tp_defer_compressors: bool = False,
+        q_head_norm: bool = True,
     ):
         super().__init__(config = config, key = key, qmap = None)
+        # V4 applies an unweighted RMS norm to every query head before rope; V4.1 does not
+        self.q_head_norm = q_head_norm
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
         self.layer_type = layer_type
@@ -898,6 +901,24 @@ class DSV4Attention(Module):
         return self.inv_freq_main_neg if self.layer_type == "sliding" else self.inv_freq_compress_neg
 
 
+    def _rope_qkv(self, q, kv, position, positions):
+        """In-place head norms and rope for q (bsz, seq, Hq, D) and kv (bsz, seq, 1, D). V4 folds
+        the unweighted per-head q norm and the weighted kv norm into the rope kernel. Without a
+        q head norm (V4.1) kv is normed on its own and rope runs norm-free: the kernel norms q and
+        k together or not at all."""
+        if self.q_head_norm:
+            q_w, k_w = self.q_ones, self.kv_norm_w
+        else:
+            kv.copy_(self.kv_norm.forward(kv, {}, out_dtype = torch.half).view_as(kv))
+            q_w = k_w = None
+        ext.rope(
+            q, q, kv, kv,
+            self._rope_type(), position, positions, None,
+            int(RopeStyle.GPTJ), 1.0, q_w, k_w,
+            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - self.rope_head_dim,
+        )
+
+
     def _project_qkv(self, x, params, position):
         """Shared front: q_a/q_norm/q_b and wkv, then ONE in-place ext.rope call that also
         applies both head norms (unweighted per-head q norm via a ones weight, weighted
@@ -907,12 +928,7 @@ class DSV4Attention(Module):
         q_res = self.q_norm.forward(self.q_a.forward(x, params), params, out_dtype = torch.half)
         q = self.q_b.forward(q_res, params).view(bsz, seq, self.num_q_heads, self.head_dim)
         kv = self.wkv.forward(x, params).view(bsz, seq, 1, self.head_dim)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), position, None, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1, self.head_dim - rd,
-        )
+        self._rope_qkv(q, kv, position, None)
         return q_res, q, kv.view(bsz, seq, self.head_dim)
 
 
@@ -1304,7 +1320,8 @@ class DSV4Attention(Module):
         # owner's (6, MAX_B) array and block-table static, the input pointer is the only
         # patched parameter. Declines (no fan / non-exl3 projections) fall through to the
         # eager batched body below
-        if dsv4_batch_graph and B <= 8 and S <= 16 and R <= 32:
+        # (the BC graphs fold the V4 q head norm in, so they are skipped without one)
+        if dsv4_batch_graph and self.q_head_norm and B <= 8 and S <= 16 and R <= 32:
             if not hasattr(self, "_bc_dsa_batch"):
                 self._bc_dsa_batch = {}
             bcd = self._bc_dsa_batch.get(id(rsl))
@@ -1527,13 +1544,7 @@ class DSV4Attention(Module):
         positions = a_pos if a_pos is not None else \
             torch.tensor([rs.position for rs in rsg[:B]], dtype = torch.int32,
                          device = x.device)
-        ext.rope(
-            q, q, kv, kv,
-            self._rope_type(), 0, positions, None,
-            int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-            self.rms_norm_eps, 0.0, 0.0, 0, 1,
-            self.head_dim - self.rope_head_dim,
-        )
+        self._rope_qkv(q, kv, 0, positions)
         return q_res, q, kv, comp_kv, comp_gate, idx_kv, idx_gate, q_idx
 
 
@@ -1554,7 +1565,7 @@ class DSV4Attention(Module):
 
         # Whole-step graph path (EXL3_BC_DSA=1); not used when the batched path already
         # projected this job's rows (pre)
-        if pre is None and \
+        if pre is None and self.q_head_norm and \
                 bc_dsa_enable and seq <= 16 and x.dtype == torch.half and x.is_contiguous():
             if not hasattr(self, "_bc_dsa"):
                 self._bc_dsa = {}
@@ -1636,13 +1647,7 @@ class DSV4Attention(Module):
             else:
                 q = self.q_b.forward(q_res, params).view(1, seq, self.num_q_heads, self.head_dim)
 
-            ext.rope(
-                q, q, kv, kv,
-                self._rope_type(), pos0, None, None,
-                int(RopeStyle.GPTJ), 1.0, self.q_ones, self.kv_norm_w,
-                self.rms_norm_eps, 0.0, 0.0, 0, 1,
-                self.head_dim - self.rope_head_dim,
-            )
+            self._rope_qkv(q, kv, pos0, None)
             kv = kv.view(1, seq, self.head_dim)
         else:
             q_res, q, kv = self._project_qkv(x, params, pos0)
