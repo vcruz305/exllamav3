@@ -10,6 +10,7 @@ from ..modules.dsv41 import DSV41Attention
 from ..modules.dsv41_hc import DSV41HyperConnection, DSV41TransformerBlock, DSV41HyperHead, PRE_MIX_KEY
 from ..modules.engram import EngramHasher, EngramLayer
 from ..modules.attn import prepare_for_attn
+from .deepseek_v41_mtp import DeepseekV41MTPModel
 
 # DeepSeek-V4.1: the V4 trunk (mHC streams, sqrt-softplus MoE, DSpark drafter) with
 #  - compress_ratios in {0, 1, 2}: 0 = sliding only; r > 0 = sliding + top-k over a compressed
@@ -29,7 +30,7 @@ class DeepseekV41Config(Config):
     arch_string = "DeepseekV41ForCausalLM"
 
     def __init__(self, directory: str, **kwargs):
-        super().__init__(directory, {"text": DeepseekV41Model}, **kwargs)
+        super().__init__(directory, {"text": DeepseekV41Model, "mtp": DeepseekV41MTPModel}, **kwargs)
 
         # Attention
         self.hidden_size = self.read_cfg(int, _t("hidden_size"), no_default)
@@ -106,7 +107,7 @@ class DeepseekV41Config(Config):
         self.engram_pad_token_id = self.read_cfg(int, _t("engram_pad_token_id"), 2)
         self.engram_compressed_vocab_size = self.read_cfg(int, _t("engram_compressed_vocab_size"), no_default)
 
-        # DSpark drafter (stage 4: not registered as a component yet)
+        # DSpark drafter
         self.dspark_block_size = self.read_cfg(int, _t("dspark_block_size"), 0)
         self.dspark_noise_token_id = self.read_cfg(int, _t("dspark_noise_token_id"), 0)
         self.dspark_markov_rank = self.read_cfg(int, _t("dspark_markov_rank"), 256)
@@ -115,6 +116,9 @@ class DeepseekV41Config(Config):
         self.dspark_num_experts_per_tok = self.read_cfg(int, _t("dspark_num_experts_per_tok"), 0) or self.num_experts_per_tok
         self.block_size = self.dspark_block_size + 1
         self.num_mtp_layers = max(0, len(ratios) - self.num_hidden_layers)
+        if self.num_mtp_layers == 0 or not any(
+            self.stc.has_tensor(f"mtp.0.attn.wkv.{t}") for t in ("weight", "trellis")):
+            del self.model_classes["mtp"]
         self.vision = None
         # Reference cache numerics (fp8 window rows, fp4 latents and indexer keys) for parity
         # tests against DeepSeek's reference implementation; off for speed
