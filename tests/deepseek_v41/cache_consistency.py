@@ -16,7 +16,7 @@ import os
 import sys
 import time
 
-EXL3 = os.path.expanduser("~/tp1/src/exllamav3-new")
+EXL3 = os.path.expanduser("~/tp1/src/exl3-bc")
 sys.path.insert(0, EXL3)
 
 import torch
