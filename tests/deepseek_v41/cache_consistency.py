@@ -35,13 +35,19 @@ def fwd_modules(model, ids, params):
 
 def fwd_cached(model, ids, state, chunks):
     """Forward through chunks with cache state management."""
+    from exllamav3.cache.recurrent_util import _get_slot_tensor
+
     outs = []
     a = 0
     for size in chunks:
         b = min(a + size, ids.shape[1])
         if b <= a:
             break
-        params = {"attn_mode": "flash_attn", "recurrent_states": [state]}
+        params = {
+            "attn_mode": "flash_attn",
+            "recurrent_states": [state],
+            "recurrent_slots": _get_slot_tensor((state.slot,))
+        }
         outs.append(fwd_modules(model, ids[:, a:b], params))
         state.position += b - a
         state.post_advance()
