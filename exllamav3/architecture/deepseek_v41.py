@@ -246,9 +246,11 @@ class DeepseekV41Model(Model):
                 ),
             )
             attn_hc = HyperConnection(config = config, key = f"{key}.hc_attn", hidden_size = config.hidden_size,
-                                      hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters, eps = config.hc_eps)
+                                      hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters,
+                                      hc_eps = config.hc_eps, rms_norm_eps = config.rms_norm_eps)
             mlp_hc = HyperConnection(config = config, key = f"{key}.hc_ffn", hidden_size = config.hidden_size,
-                                     hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters, eps = config.hc_eps)
+                                     hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters,
+                                     hc_eps = config.hc_eps, rms_norm_eps = config.rms_norm_eps)
             self.modules += [TransformerBlock(
                 config = config,
                 key = key,
@@ -263,7 +265,8 @@ class DeepseekV41Model(Model):
 
         self.last_kv_module_idx = len(self.modules) - 1
         self.modules += [
-            HyperHead(config = config, key = "hc_head", hidden_size = config.hidden_size, hc_mult = config.hc_mult, eps = config.hc_eps),
+            HyperHead(config = config, key = "hc_head", hc_mult = config.hc_mult,
+                      rms_norm_eps = config.rms_norm_eps, hc_eps = config.hc_eps),
             RMSNorm(config = config, key = "norm", rms_norm_eps = config.rms_norm_eps, out_dtype = torch.half),
             Linear(config = config, key = "head", qbits_key = "head_bits", in_features = config.hidden_size,
                    out_features = config.vocab_size, qmap = "block", caps = {"logits_output": True}),
