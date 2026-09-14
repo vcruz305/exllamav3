@@ -61,6 +61,7 @@ class ExpertGroup:
     base: int  # Base slot index for this group
     local_to_group: torch.Tensor  # Maps expert id to position within group (n_experts+1)
     ptrs: dict[str, torch.Tensor]  # Pointer tables for gate/up/down trellis/suh/svh
+    cb_flags: tuple[bool, bool, bool, bool, bool, bool]  # (mcg_gate, mul1_gate, mcg_up, mul1_up, mcg_down, mul1_down)
 
 
 @dataclass
@@ -158,12 +159,29 @@ def build_exl3_grouped_fused_state(layer, gates, ups, downs):
                     device=device,
                 )
 
+        # Extract codebook flags from first member (all members in a group have same codebook)
+        if members:
+            first_gate = gates[members[0]] if gates else ups[members[0]]
+            first_up = ups[members[0]]
+            first_down = downs[members[0]]
+            cb_flags = (
+                bool(getattr(getattr(first_gate, "inner", first_gate), "mcg", False)),
+                bool(getattr(getattr(first_gate, "inner", first_gate), "mul1", False)),
+                bool(getattr(getattr(first_up, "inner", first_up), "mcg", False)),
+                bool(getattr(getattr(first_up, "inner", first_up), "mul1", False)),
+                bool(getattr(getattr(first_down, "inner", first_down), "mcg", False)),
+                bool(getattr(getattr(first_down, "inner", first_down), "mul1", False)),
+            )
+        else:
+            cb_flags = (False, False, False, False, False, False)
+
         groups.append(ExpertGroup(
             k_triple=triple,
             members=members,
             base=base,
             local_to_group=local_to_group,
-            ptrs=ptrs
+            ptrs=ptrs,
+            cb_flags=cb_flags
         ))
         base += len(members) + 1
 
@@ -242,6 +260,7 @@ def _launch_grouped_exl3_moe(
         ptrs_d_svh = group.ptrs.get("down_svh")
 
         # Launch exl3_moe for this group with its own K
+        mcg_gate, mul1_gate, mcg_up, mul1_up, mcg_down, mul1_down = group.cb_flags
         ext.exl3_moe(
             y,
             final_hidden_states,
@@ -265,12 +284,12 @@ def _launch_grouped_exl3_moe(
             ptrs_d_trellis,
             ptrs_d_suh,
             ptrs_d_svh,
-            False,  # group.mcg (gate codebook)
-            False,  # group.mul1 (gate codebook)
-            False,  # up codebook mcg
-            False,  # up codebook mul1
-            False,  # down codebook mcg
-            False,  # down codebook mul1
+            mcg_gate,
+            mul1_gate,
+            mcg_up,
+            mul1_up,
+            mcg_down,
+            mul1_down,
             act_limit,
             n_active if n_active > 0 else -1,
             None,  # scratch
