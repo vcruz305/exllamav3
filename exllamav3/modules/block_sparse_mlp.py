@@ -198,7 +198,8 @@ def build_exl3_grouped_fused_state(layer, gates, ups, downs):
 
 def _launch_grouped_exl3_moe(
     y, final_hidden_states, flat_expert_local, token_sorted, weight_sorted,
-    groups, dispatch, temp_bufs, activation_fn_idx, act_limit, mtile_ok, MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED
+    groups, dispatch, temp_bufs, activation_fn_idx, act_limit, mtile_ok, MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED,
+    module=None
 ):
     """Launch one exl3_moe per group for mixed-K experts, accumulating into output."""
 
@@ -215,6 +216,7 @@ def _launch_grouped_exl3_moe(
     slot_valid = dispatch.slot_valid
     slots = counts[:total] * slot_valid
     n_groups = len(groups)
+    n_groups_active = 0
 
     routes_per_group = torch.zeros(n_groups, dtype=torch.long, device=key.device)
     routes_per_group.scatter_add_(0, dispatch.slot_group[:total], slots)
@@ -235,6 +237,7 @@ def _launch_grouped_exl3_moe(
     for group_idx, (group, n_routes, n_active) in enumerate(zip(groups, routes_host, active_host)):
         if n_routes == 0:
             continue
+        n_groups_active += 1
 
         # Expert indices for this group within the flattened array
         base_slot = int(group.base)
@@ -297,6 +300,10 @@ def _launch_grouped_exl3_moe(
             1, 256, 16  # count_lo, count_hi, m_tile
         )
         start += n_routes
+
+    # Increment counter in module
+    if module is not None:
+        module.grouped_launches += n_groups_active
 
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
@@ -394,6 +401,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
+
+        # Counters for grouped dispatch debugging
+        self.grouped_launches = 0
+        self.dense_loop_calls = 0
 
         assert out_dtype in (torch.float, None), \
             f"BlockSparseMLP output dtype must be float"
@@ -1312,19 +1323,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Grouped dispatch for mixed-K: if available and enabled, use grouped exl3_moe
                 grouped_handled = False
                 if self.exl3_k_groups is not None and self.exl3_k_dispatch is not None and self.exl3_grouped_temps is not None:
-                    try:
-                        _launch_grouped_exl3_moe(
-                            y, fhs_ext, flat_expert_local, flat_token, flat_weight,
-                            self.exl3_k_groups, self.exl3_k_dispatch,
-                            self.exl3_grouped_temps,
-                            self.activation_fn_idx,
-                            self.act_limit,
-                            self.mtile_ok if hasattr(self, "mtile_ok") else False,
-                            MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED
-                        )
-                        grouped_handled = True
-                    except Exception as e:
-                        print(f" !! Grouped dispatch failed: {e}, falling back to dense per-expert")
+                    _launch_grouped_exl3_moe(
+                        y, fhs_ext, flat_expert_local, flat_token, flat_weight,
+                        self.exl3_k_groups, self.exl3_k_dispatch,
+                        self.exl3_grouped_temps,
+                        self.activation_fn_idx,
+                        self.act_limit,
+                        self.mtile_ok if hasattr(self, "mtile_ok") else False,
+                        MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED,
+                        self
+                    )
+                    grouped_handled = True
 
                 # Group once by local expert id (including sentinel for expert-P mode) if not already handled
                 if not grouped_handled:
@@ -1488,6 +1497,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         if count <= min_rows or expert_idx in batched:
                             start = end
                             continue
+
+                        # Increment dense loop call counter
+                        self.dense_loop_calls += 1
 
                         top_x = token_sorted[start:end]
                         w = weight_sorted[start:end].unsqueeze(1)
@@ -1769,6 +1781,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
+
+        # Print grouped dispatch debug info
+        if os.environ.get("EXL3_MOE_GROUPED_DEBUG") == "1":
+            if self.grouped_launches > 0 or self.dense_loop_calls > 0:
+                print(f" -- {self.key}: grouped_launches={self.grouped_launches}, dense_loop_calls={self.dense_loop_calls}")
+
         return final_hidden_states
 
 
