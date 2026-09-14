@@ -275,6 +275,8 @@ class DeepseekV41Model(Model):
         ]
         self.logit_layer_idx = len(self.modules) - 1
         self.caps.update({"recurrent_states": True, "default_recurrent_checkpoint_interval": 2048})
+        from ..cache.dsa import DSV4State
+        self.recurrent_state_cls = DSV4State
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
