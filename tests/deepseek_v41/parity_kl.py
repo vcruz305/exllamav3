@@ -115,15 +115,13 @@ def main():
         result["total_time_s"] = round(time.time() - t0, 1)
 
         # Check if all values are finite
-        all_finite = all(
-            torch.isfinite(torch.tensor([
-                result["overall_mean_kl"],
-                result["overall_top1_agreement"],
-                result["overall_nll_exl3"],
-                result["overall_nll_ref"],
-            ])).all()
-        )
-        result["ok"] = bool(all_finite)
+        all_finite = bool(torch.isfinite(torch.tensor([
+            result["overall_mean_kl"],
+            result["overall_top1_agreement"],
+            result["overall_nll_exl3"],
+            result["overall_nll_ref"],
+        ])).all())
+        result["ok"] = all_finite
 
     except Exception:
         result["error"] = traceback.format_exc()[-2000:]
