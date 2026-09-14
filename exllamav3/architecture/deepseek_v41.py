@@ -6,6 +6,7 @@ from ..model.model import Model
 from ..modules import Embedding, RMSNorm, Linear, GatedMLP, BlockSparseMLP, TransformerBlock, \
     HyperConnection, ExpandStreams, HyperHead
 from ..modules.dsv4 import DSV4Attention
+from ..modules.dsv41 import DSV41Attention
 from ..modules.engram import EngramHasher, EngramLayer
 from ..modules.attn import prepare_for_attn
 
@@ -114,6 +115,10 @@ class DeepseekV41Config(Config):
         self.block_size = self.dspark_block_size + 1
         self.num_mtp_layers = max(0, len(ratios) - self.num_hidden_layers)
         self.vision = None
+        # Reference cache numerics (fp8 window rows, fp4 latents and indexer keys) for parity
+        # tests against DeepSeek's reference implementation; off for speed
+        import os
+        self.ref_quant = os.environ.get("EXL3_V41_REF_QUANT", "0") != "0"
 
 
 class DeepseekV41Model(Model):
@@ -168,9 +173,43 @@ class DeepseekV41Model(Model):
                     out_dtype = torch.float,
                 )
             else:
-                raise NotImplementedError(
-                    f"DeepseekV4.1 layer {idx}: compressed attention (ratio {config.compress_ratios[idx]}) "
-                    f"is stage 2 of the port")
+                cand_role = None
+                if idx == config.candidate_source_layer_id:
+                    cand_role = "source"
+                elif config.candidate_source_layer_id >= 0 and idx > config.candidate_source_layer_id \
+                        and idx in config.index_source_layer_ids:
+                    cand_role = "consumer"
+                attn = DSV41Attention(
+                    config = config,
+                    key = f"{key}.attn",
+                    layer_idx = idx,
+                    compress_rate = config.compress_ratios[idx],
+                    is_kv_source = idx in config.kv_source_layer_ids,
+                    is_index_source = idx in config.index_source_layer_ids,
+                    kv_source_layer = config.kv_source_of[idx],
+                    index_source_layer = config.index_source_of[idx],
+                    candidate_role = cand_role,
+                    candidate_topk_blocks = config.candidate_topk_blocks,
+                    candidate_block_size = config.candidate_block_size,
+                    ref_quant = config.ref_quant,
+                    hidden_size = config.hidden_size,
+                    num_q_heads = config.num_q_heads,
+                    head_dim = config.head_dim,
+                    rope_head_dim = config.qk_rope_head_dim,
+                    q_lora_rank = config.q_lora_rank,
+                    o_groups = config.o_groups,
+                    o_lora_rank = config.o_lora_rank,
+                    sliding_window = config.sliding_window,
+                    index_n_heads = config.index_n_heads,
+                    index_head_dim = config.index_head_dim,
+                    index_topk = config.index_topk,
+                    rope_theta = config.rope_theta,
+                    compress_rope_theta = config.compress_rope_theta,
+                    rope_scaling = config.rope_scaling,
+                    rms_norm_eps = config.rms_norm_eps,
+                    qmap = "block.attn",
+                    out_dtype = torch.float,
+                )
             mlp = BlockSparseMLP(
                 config = config,
                 key = f"{key}.ffn",
