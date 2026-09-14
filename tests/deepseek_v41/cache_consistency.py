@@ -129,15 +129,26 @@ def main():
             print(f"\n=== Sequence {seq_idx} ===")
             ids = ref_tokens[seq_idx:seq_idx+1].to(device)
 
-            # No-cache reference forward
-            ref_logits = fwd_modules(model, ids, {"attn_mode": "flash_attn_nc"})
+            try:
+                # No-cache reference forward
+                ref_logits = fwd_modules(model, ids, {"attn_mode": "flash_attn_nc"})
+            except Exception as e:
+                print(f"  ERROR in nc forward: {e}")
+                result["error"] = str(e)
+                continue
 
             # Single-token decode: prefill 0..255, then decode 256..N-1 one token per forward
             print(f"Single-token decode (prefill 256, decode {N-256}):")
             state = cache.get_new_state()
-            prefill_outs = fwd_cached(model, ids[:, :256], state, [256])
-            decode_outs = fwd_cached(model, ids[:, 256:], state, [1] * (N - 256))
-            cached_logits = torch.cat([prefill_outs, decode_outs], dim=0)
+            try:
+                prefill_outs = fwd_cached(model, ids[:, :256], state, [256])
+                decode_outs = fwd_cached(model, ids[:, 256:], state, [1] * (N - 256))
+                cached_logits = torch.cat([prefill_outs, decode_outs], dim=0)
+            except Exception as e:
+                print(f"  ERROR in cached forward: {e}")
+                state.free()
+                result["error"] = str(e)
+                continue
 
             kl_tol = 0.01
             arg_tol = 0.99
