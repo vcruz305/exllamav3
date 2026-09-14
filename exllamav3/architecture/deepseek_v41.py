@@ -7,6 +7,7 @@ from ..modules import Embedding, RMSNorm, Linear, GatedMLP, BlockSparseMLP, Tran
     HyperConnection, ExpandStreams, HyperHead
 from ..modules.dsv4 import DSV4Attention
 from ..modules.dsv41 import DSV41Attention
+from ..modules.dsv41_hc import DSV41HyperConnection, DSV41TransformerBlock, DSV41HyperHead, PRE_MIX_KEY
 from ..modules.engram import EngramHasher, EngramLayer
 from ..modules.attn import prepare_for_attn
 
@@ -245,13 +246,13 @@ class DeepseekV41Model(Model):
                     act_limit = config.swiglu_limit,
                 ),
             )
-            attn_hc = HyperConnection(config = config, key = f"{key}.hc_attn", hidden_size = config.hidden_size,
+            attn_hc = DSV41HyperConnection(config = config, key = f"{key}.hc_attn", hidden_size = config.hidden_size,
                                       hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters,
                                       hc_eps = config.hc_eps, rms_norm_eps = config.rms_norm_eps)
-            mlp_hc = HyperConnection(config = config, key = f"{key}.hc_ffn", hidden_size = config.hidden_size,
+            mlp_hc = DSV41HyperConnection(config = config, key = f"{key}.hc_ffn", hidden_size = config.hidden_size,
                                      hc_mult = config.hc_mult, sinkhorn_iters = config.hc_sinkhorn_iters,
                                      hc_eps = config.hc_eps, rms_norm_eps = config.rms_norm_eps)
-            self.modules += [TransformerBlock(
+            self.modules += [DSV41TransformerBlock(
                 config = config,
                 key = key,
                 layer_idx = idx,
@@ -265,8 +266,7 @@ class DeepseekV41Model(Model):
 
         self.last_kv_module_idx = len(self.modules) - 1
         self.modules += [
-            HyperHead(config = config, key = "hc_head", hc_mult = config.hc_mult,
-                      rms_norm_eps = config.rms_norm_eps, hc_eps = config.hc_eps),
+            DSV41HyperHead(config = config, key = "hc_head", hc_mult = config.hc_mult),
             RMSNorm(config = config, key = "norm", rms_norm_eps = config.rms_norm_eps, out_dtype = torch.half),
             Linear(config = config, key = "head", qbits_key = "head_bits", in_features = config.hidden_size,
                    out_features = config.vocab_size, qmap = "block", caps = {"logits_output": True}),
@@ -277,5 +277,6 @@ class DeepseekV41Model(Model):
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         params["input_ids"] = input_ids
+        params.pop(PRE_MIX_KEY, None)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
