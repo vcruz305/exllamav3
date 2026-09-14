@@ -52,11 +52,32 @@ def _next_prime(start: int, seen: set) -> int:
     return c
 
 
+def _writable_dir(preferred: str) -> str:
+    """Prefer `preferred`; fall back to ~/.cache if that path is missing or read-only
+    (the usual case when tokenizer.json lives on an rclone/Hub mount)."""
+    candidates = [
+        preferred,
+        os.path.join(os.path.expanduser("~/.cache/exllamav3"), "engram"),
+        os.path.join(os.path.expanduser("~"), ".cache", "exllamav3", "engram"),
+    ]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok = True)
+            probe = os.path.join(d, ".engram_write_probe")
+            with open(probe, "wb") as f:
+                f.write(b"")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return preferred
+
+
 def build_compressed_token_map(tokenizer_json: str, cache_dir: str | None = None):
     """Compressed id per token id (tokens that normalize alike collapse), from tokenizer.json;
-    cached as engram_token_map.<sha>.npz in cache_dir (the tokenizer's directory by default)."""
+    cached as engram_token_map.<sha>.npz in cache_dir."""
     from tokenizers import Regex, Tokenizer, normalizers
-    cache_dir = cache_dir or os.path.dirname(os.path.abspath(tokenizer_json))
+    cache_dir = _writable_dir(cache_dir or os.path.dirname(os.path.abspath(tokenizer_json)))
     with open(tokenizer_json, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()[:16]
     cache = os.path.join(cache_dir, f"engram_token_map.{digest}.npz")
@@ -104,6 +125,8 @@ class EngramHasher:
         self.num_embeddings = tuple(config.engram_num_embeddings)
         self.context_len = self.max_ngram - 1
         tokenizer_json = tokenizer_json or os.path.join(config.directory, "tokenizer.json")
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.expanduser("~/.cache/exllamav3"), "engram")
         token_map, vocab_size = build_compressed_token_map(tokenizer_json, cache_dir)
         if vocab_size != config.engram_compressed_vocab_size:
             raise ValueError(f"engram: compressed vocab {vocab_size} != config {config.engram_compressed_vocab_size}")
@@ -337,7 +360,10 @@ class EngramLayer(Module):
 
     def _history(self, ids: torch.Tensor, params: dict):
         """(compressed (bsz, ctx + seq), state layer or None, slots or None)."""
-        comp = self.hasher.compress(ids)
+        tm = params.get("token_mask")
+        if tm is not None:
+            tm = tm.cpu()
+        comp = self.hasher.compress(ids, token_mask = tm)
         rsg = params.get("recurrent_states")
         if rsg:
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
@@ -376,6 +402,9 @@ class EngramLayer(Module):
         window, rsl, slots = self._history(ids, params)
         hash_ids = self.hasher.hash_window(window, pos)[:, :, self.table_index, :]
         delta = self.forward_streams(x, hash_ids, params)
+        tm = params.get("token_mask")
+        if tm is not None:
+            delta = delta * tm.to(device = delta.device, dtype = delta.dtype).unsqueeze(-1).unsqueeze(-1)
         if rsl is not None:
             (id_state,) = rsl.get_state_tensors()
             ctx = self.hasher.context_len
