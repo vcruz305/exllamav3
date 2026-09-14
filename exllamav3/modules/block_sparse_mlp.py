@@ -943,17 +943,28 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # EXL3_MOE_GROUPED is enabled and this layer has mixed K
         self.exl3_k_groups = None
         self.exl3_k_dispatch = None
+        self.exl3_grouped_temps = None
         if (self.is_quantized and not self.uniform_expert_q and EXL3_MOE_GROUPED and
                 self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2"):
             try:
                 self.exl3_k_groups, self.exl3_k_dispatch = build_exl3_grouped_fused_state(
                     self, self.gates if self.gated else [None] * len(self.ups), self.ups, self.downs
                 )
+                # Create temp buffers for grouped dispatch
+                C = ext.exl3_moe_max_concurrency(torch.device(device).index)
+                R = TEMP_ROWS_FUSED  # Use the same buffer size as for fused paths
+                self.exl3_grouped_temps = FusedBuffers(
+                    temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe3_temp_state_g"),
+                    temp_state_u = g_tensor_cache.get(device, (C, R, H), torch.half, "moe3_temp_state_u"),
+                    temp_intermediate_g = g_tensor_cache.get(device, (C, R, I), torch.half, "moe3_temp_intermediate_g"),
+                    temp_intermediate_u = g_tensor_cache.get(device, (C, R, I), torch.half, "moe3_temp_intermediate_u"),
+                )
                 print(f" -- Mixed-K experts in {self.key}: grouped exl3_moe dispatch")
             except Exception as e:
                 print(f" !! Failed to build grouped dispatch for {self.key}: {e}, falling back to dense")
                 self.exl3_k_groups = None
                 self.exl3_k_dispatch = None
+                self.exl3_grouped_temps = None
 
 
     def load_routing(self, **kwargs):
@@ -1300,12 +1311,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Grouped dispatch for mixed-K: if available and enabled, use grouped exl3_moe
                 grouped_handled = False
-                if self.exl3_k_groups is not None and self.exl3_k_dispatch is not None:
+                if self.exl3_k_groups is not None and self.exl3_k_dispatch is not None and self.exl3_grouped_temps is not None:
                     try:
                         _launch_grouped_exl3_moe(
                             y, fhs_ext, flat_expert_local, flat_token, flat_weight,
                             self.exl3_k_groups, self.exl3_k_dispatch,
-                            self.fused_mode_buffers,
+                            self.exl3_grouped_temps,
                             self.activation_fn_idx,
                             self.act_limit,
                             self.mtile_ok if hasattr(self, "mtile_ok") else False,
