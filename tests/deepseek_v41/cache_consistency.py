@@ -83,6 +83,12 @@ def main():
         with torch.inference_mode():
             state = cache.get_new_state()
 
+        # Build block table: need enough pages for all tokens
+        # For V4.1, cache uses DSV4LayerState with epp (entries per page) = PAGE_SIZE/compress_rate
+        # Allocate enough pages for N tokens worth of entries
+        num_pages = (N // 256) + 2  # Conservative allocation
+        block_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+
         t0 = time.time()
         with torch.inference_mode():
             model.forward(
@@ -90,7 +96,7 @@ def main():
                 {
                     "attn_mode": "flash_attn",
                     "cache": cache,
-                    "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                    "block_table": block_table,
                     "cache_seqlens": torch.tensor([0], dtype=torch.int32, device=device),
                     "recurrent_states": [state],
                     "positions": torch.arange(256, dtype=torch.int32, device=device),
@@ -114,7 +120,7 @@ def main():
                     {
                         "attn_mode": "flash_attn",
                         "cache": cache,
-                        "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                        "block_table": block_table,
                         "cache_seqlens": torch.tensor([pos], dtype=torch.int32, device=device),
                         "recurrent_states": [state],
                         "positions": torch.tensor([pos], dtype=torch.int32, device=device),
@@ -166,7 +172,7 @@ def main():
                 {
                     "attn_mode": "flash_attn",
                     "cache": cache,
-                    "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                    "block_table": block_table,
                     "cache_seqlens": torch.tensor([0], dtype=torch.int32, device=device),
                     "recurrent_states": [state],
                     "positions": torch.arange(256, dtype=torch.int32, device=device),
@@ -186,7 +192,7 @@ def main():
                     {
                         "attn_mode": "flash_attn",
                         "cache": cache,
-                        "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                        "block_table": block_table,
                         "cache_seqlens": torch.tensor([chunk_start], dtype=torch.int32, device=device),
                         "recurrent_states": [state],
                         "positions": torch.arange(chunk_start, chunk_end, dtype=torch.int32, device=device),
