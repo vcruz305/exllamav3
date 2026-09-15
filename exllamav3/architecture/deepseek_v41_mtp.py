@@ -202,6 +202,9 @@ class DeepseekV41MTPModel(Model):
         # Draft length gate: keep the longest prefix with sigmoid(confidence) >= threshold
         import os
         self.draft_conf_threshold = float(os.environ.get("EXL3_DSPARK_CONF", "0.5"))
+        # Floor on the gated length: verify at least this many drafts even when none clears the
+        # threshold (the drafter cost is already paid; a verify row is cheaper than a lost token)
+        self.draft_min_len = int(os.environ.get("EXL3_DSPARK_MIN_DRAFT", "0"))
         self._conf_stats = [] if os.environ.get("EXL3_DSPARK_CONF_STATS") else None
 
         self.logit_layer_idx = None
@@ -347,7 +350,7 @@ class DeepseekV41MTPModel(Model):
             self._conf_stats.append(cs[0].tolist())
         keep = cs >= self.draft_conf_threshold
         lens = torch.cumprod(keep.to(torch.int32), dim = 1).sum(dim = 1)
-        params["draft_confidence_len"] = int(lens.max().item())
+        params["draft_confidence_len"] = max(int(lens.max().item()), min(self.draft_min_len, s))
         return out
 
 
