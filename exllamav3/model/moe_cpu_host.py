@@ -643,6 +643,14 @@ class MoeCpuHost:
             # For compatibility: store max and first for fallback paths
             spec["expert_bytes"] = max(expert_bytes_list)  # max for slot sizing
             spec["proj_bytes"] = spec["proj_bytes_list"][0]  # first for compat
+
+            # Mixed-K detection: flag if K values vary across experts in any projection
+            k_values = set()
+            for proj_name in ("g", "u", "d"):
+                if per_expert_dims.get(proj_name) is not None:
+                    for dims_tuple in per_expert_dims[proj_name]:
+                        k_values.add(dims_tuple[2])  # K is the third element
+            spec["mixed_k"] = len(k_values) > 1
         self.specs.append(spec)
         self.live_layers += 1
         idx = len(self.specs) - 1
@@ -1628,11 +1636,7 @@ class MoeCpuHost:
             # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
             # group; see moe_batch_recon.py) when eligible, else per expert. Note: batched
             # reconstruct assumes uniform K per layer, so skip it for mixed-K layers
-            has_mixed_k = per_expert_dims is not None and any(
-                per_expert_dims.get("u")[e][2] != per_expert_dims.get("u")[stream_e][2]
-                for e in ([e for _, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]) if e in streamed
-                for stream_e in [min(e for e in streamed if e in per_expert_dims.get("u", [None]*E))] if stream_e in per_expert_dims.get("u", [])
-            ) if per_expert_dims else False
+            has_mixed_k = spec.get("mixed_k", False)
             recon_mixed_k = recon if not has_mixed_k else None
 
             heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
