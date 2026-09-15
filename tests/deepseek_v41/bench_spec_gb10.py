@@ -51,17 +51,20 @@ def io():
 print("model", M, "lazy", LAZY, "prewarm", PREWARM, "tokens", TOKENS, "draft", DRAFT, "mem", mem(), flush = True)
 config = Config.from_directory(M)
 model = Model.from_config(config)
-cache = Cache(model, max_num_tokens = CTX, max_history = 1, max_batch_size = 1)
-t0 = time.time()
-model.load("cuda:0", progressbar = False, verbose = False)
-
 draft = None
 draft_cache = None
+max_history = 1
 if DRAFT:
     draft = Model.from_config(config, component = "mtp")
     max_history = draft.caps.get("default_draft_size", 4)
-    cache = Cache(model, max_num_tokens = CTX, max_history = max_history, max_batch_size = 1)
+
+# Caches must exist before their models load
+cache = Cache(model, max_num_tokens = CTX, max_history = max_history, max_batch_size = 1)
+if DRAFT:
     draft_cache = Cache(draft, max_num_tokens = CTX)
+t0 = time.time()
+model.load("cuda:0", progressbar = False, verbose = False)
+if DRAFT:
     draft.load("cuda:0", progressbar = False, verbose = False)
 
 load_s = time.time() - t0
