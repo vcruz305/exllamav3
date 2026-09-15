@@ -290,13 +290,22 @@ class EngramTable:
 
 
 class EngramLayerState:
-    """Per-slot compressed-id context for the hashing (max_ngram - 1 ids), CPU-resident, with
-    right-aligned history columns for rewind like the other recurrent states."""
+    """Per-slot ring of compressed token ids indexed by absolute position, CPU-resident. The hash
+    context of a forward starting at position p is the ids at p - ctx .. p - 1 (DEAD before the
+    sequence start), so like the DSA layer states all bookkeeping is position-derived: rewinds,
+    re-fed prefill chunks and accepted/rejected draft rounds need no per-layer action as long as
+    the rewound distance stays inside the ring. (A front-copy + right-aligned history scheme went
+    stale because DSV4State.rewind does not dispatch to layer states and the generator only rewinds
+    when a draft token is rejected.)"""
+
+    RING = 8192
 
     def __init__(self, module, max_batch_size: int, max_history: int, cache_id: int):
         self.module = module
         self.ctx = module.hasher.context_len
-        self.id_state = torch.empty((max_batch_size, self.ctx + max_history), dtype = torch.long, device = "meta")
+        self.ring_len = max(self.RING, max_history + self.ctx)
+        self.id_state = torch.empty((max_batch_size, self.ring_len), dtype = torch.long, device = "meta")
+        self.hi = torch.zeros(max_batch_size, dtype = torch.long)     # one past the highest position written
         self.device = None
         self.max_history = max_history
         self.max_batch_size = max_batch_size
@@ -310,6 +319,7 @@ class EngramLayerState:
 
     def alloc(self, device):
         self.id_state = torch.full_like(self.id_state, DEAD, device = "cpu")
+        self.hi.zero_()
         self.device = device
 
     def free(self):
@@ -319,22 +329,40 @@ class EngramLayerState:
     def clear(self, idx: int):
         if self.device is not None:
             self.id_state[idx].fill_(DEAD)
+            self.hi[idx] = 0
 
     def get_state_tensors(self):
         return (self.id_state,)
 
+    def context(self, slot: int, position: int) -> torch.Tensor:
+        """Compressed ids at position - ctx .. position - 1, DEAD before the sequence start."""
+        assert int(self.hi[slot]) - position <= self.ring_len - self.ctx, \
+            f"EngramLayerState: position {position} rewound past the ring (written up to {int(self.hi[slot])})"
+        idx = torch.arange(position - self.ctx, position)
+        out = self.id_state[slot, idx % self.ring_len].clone()
+        out[idx < 0] = DEAD
+        return out
+
+    def write(self, slot: int, position: int, ids: torch.Tensor):
+        n = ids.shape[0]
+        if n > self.ring_len:
+            ids = ids[-self.ring_len:]
+            position += n - self.ring_len
+            n = self.ring_len
+        self.id_state[slot, torch.arange(position, position + n) % self.ring_len] = ids
+        self.hi[slot] = position + n
+
     def rewind(self, slot: int, last_history: int, num_tokens: int):
-        assert num_tokens <= last_history
-        if last_history > 0:
-            p = self.id_state.shape[-1] - num_tokens
-            temp = self.id_state[slot, p - self.ctx: p].clone()
-            self.id_state[slot, :self.ctx].copy_(temp)
+        pass  # position-indexed: the context is re-read from the ring at the new position
 
     def stash(self, slot, position: int = 0):
-        return (self.id_state[slot, :self.ctx].cpu(),)
+        return (self.context(slot, position),)
 
     def unstash(self, slot, stashed, position: int = 0):
-        self.id_state[slot, :self.ctx].copy_(stashed[0])
+        idx = torch.arange(position - self.ctx, position)
+        keep = idx >= 0
+        self.id_state[slot, idx[keep] % self.ring_len] = stashed[0][keep]
+        self.hi[slot] = position
 
     def tp_export(self, plan):
         return {"cls": EngramLayerState, "args": {"cache_id": self.cache_id, "max_history": self.max_history,
@@ -428,10 +456,9 @@ class EngramLayer(Module):
         if rsg:
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
             rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
-            (id_state,) = rsl.get_state_tensors()
             slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
-            assert len(slots) == ids.shape[0]
-            prev = torch.stack([id_state[s, :self.hasher.context_len] for s in slots])
+            assert len(slots) == ids.shape[0] == len(rsg)
+            prev = torch.stack([rsl.context(s, int(r.position)) for s, r in zip(slots, rsg)])
             return torch.cat((prev, comp), dim = 1), rsl, slots
         assert params.get("position", 0) == 0, "EngramLayer needs recurrent states for forwards past position 0"
         pad = torch.full((ids.shape[0], self.hasher.context_len), DEAD, dtype = torch.long)
@@ -475,12 +502,7 @@ class EngramLayer(Module):
         if tm is not None:
             delta = delta * tm.to(device = delta.device, dtype = delta.dtype).unsqueeze(-1).unsqueeze(-1)
         if rsl is not None:
-            (id_state,) = rsl.get_state_tensors()
             ctx = self.hasher.context_len
-            for i, s in enumerate(slots):
-                if params.get("recurrent_history", False):
-                    w = min(id_state.shape[-1], window.shape[-1])
-                    id_state[s, -w:].copy_(window[i, -w:])
-                else:
-                    id_state[s, :ctx].copy_(window[i, -ctx:])
+            for i, (s, r) in enumerate(zip(slots, rsg)):
+                rsl.write(s, int(r.position), window[i, ctx:])
         return x + delta

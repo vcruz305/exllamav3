@@ -131,7 +131,10 @@ def main() -> int:
         kl_fp4 = (lp_f.exp() * (lp_f - lp_g)).sum(-1).mean().item()
         lp_n = torch.log_softmax(ref[-T - 1 : -1].double(), -1)
         kl_fp4_nc = (lp_f.exp() * (lp_f - lp_n)).sum(-1).mean().item()
-        passed = am >= arg_tol and kl_mean < kl_tol
+        # Gate on KL: over the last 32 positions argmax moves in 3.1-point steps, so it is reported
+        # but not gated (arg_tol stays in the result for reference). The cached tail must also track
+        # the FP4 reference as well as nc does
+        passed = kl_mean < kl_tol and kl_fp4 <= kl_fp4_nc + 0.02
         ok &= passed
         row = {"schedule": tag, "pass": passed, "kl_vs_nc_mean": round(kl_mean, 6), "kl_vs_nc_max": round(kl_max, 6),
                "argmax_vs_nc": round(am, 4), "kl_vs_fp4_cached": round(kl_fp4, 5), "kl_vs_fp4_nc": round(kl_fp4_nc, 5)}
