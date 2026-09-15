@@ -55,11 +55,11 @@ def main():
         t0 = time.time()
         cfg = Config.from_directory(args.model)
         model = Model.from_config(cfg)
-        model.load("cuda:0", progressbar=False, verbose=False)
         device = torch.device("cuda:0")
+        model.load(device, progressbar=False, verbose=False)
         print(f"Model loaded in {time.time() - t0:.1f}s")
 
-        # Create cache and state
+        # Create cache and state (after model.load to ensure device placement)
         cache = Cache(model, max_num_tokens=8192, max_batch_size=1)
         state = cache.get_new_state()
         ids = ref_tokens[args.seq_idx:args.seq_idx+1].to(device)
