@@ -144,7 +144,7 @@ class BCDsa:
             m.indexer.bc if self.has_idx else None,
             mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh, m.woa_indices,
             mu.K, mu.mcg, mu.mul1,
-            m.q_norm.weight.data, m.q_ones if m.q_head_norm else None, m.kv_norm_w,
+            m.q_norm.weight.data, m.q_ones, m.kv_norm_w,
             m._rope_type(), m._rope_type_neg(), m.sinks,
             rsl.ring[slot],
             rsl.comp_buf_kv[slot] if self.has_comp else None,

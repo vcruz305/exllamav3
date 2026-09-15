@@ -116,7 +116,7 @@ struct BC_DSV4Attention
         std::shared_ptr<BC_DSV4Compressor> _idx_bc,
         at::Tensor _woa_trellis, at::Tensor _woa_suh, at::Tensor _woa_svh,
         at::Tensor _woa_indices, int _woa_k, bool _woa_mcg, bool _woa_mul1,
-        at::Tensor _q_norm_w, c10::optional<at::Tensor> _q_ones, at::Tensor _kv_norm_w,
+        at::Tensor _q_norm_w, at::Tensor _q_ones, at::Tensor _kv_norm_w,
         at::Tensor _inv_freq, at::Tensor _inv_freq_neg, at::Tensor _sinks,
         at::Tensor _ring,
         c10::optional<at::Tensor> _comp_buf_kv, c10::optional<at::Tensor> _comp_buf_gate,
