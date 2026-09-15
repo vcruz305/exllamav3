@@ -247,8 +247,15 @@ def _launch_grouped_exl3_moe(
         token_slice = token_sorted_by_group[start:start + n_routes]
         weight_slice = weight_sorted_by_group[start:start + n_routes]
 
-        # Count per expert within this group
-        group_expert_count = counts[base_slot:base_slot + n_members + 1]
+        # Remap global expert IDs to group-local indices (0..n_members)
+        # flat_expert_local contains local expert IDs; map to group member positions
+        token_slice_experts = flat_expert_local[order][start:start + n_routes]
+        member_to_local = torch.full((n_exp,), n_members, dtype=torch.long, device=key.device)
+        member_to_local[torch.tensor(group.members, dtype=torch.long, device=key.device)] = torch.arange(
+            len(group.members), dtype=torch.long, device=key.device
+        )
+        group_expert_ids = member_to_local[token_slice_experts]
+        group_expert_count = torch.bincount(group_expert_ids, minlength=n_members + 1)
 
         # Extract pointers for this group's projections
         k_g, k_u, k_d = group.k_triple
