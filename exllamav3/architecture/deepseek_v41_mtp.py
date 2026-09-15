@@ -205,6 +205,8 @@ class DeepseekV41MTPModel(Model):
         # Floor on the gated length: verify at least this many drafts even when none clears the
         # threshold (the drafter cost is already paid; a verify row is cheaper than a lost token)
         self.draft_min_len = int(os.environ.get("EXL3_DSPARK_MIN_DRAFT", "0"))
+        # Batch-1 early exit: check each position's confidence before paying for its head row
+        self.draft_early_exit = os.environ.get("EXL3_DSPARK_EARLY_EXIT", "0") != "0"
         self._conf_stats = [] if os.environ.get("EXL3_DSPARK_CONF_STATS") else None
 
         self.logit_layer_idx = None
@@ -318,6 +320,9 @@ class DeepseekV41MTPModel(Model):
         else:
             am = self.attached_model()
             lm = am.modules[am.logit_layer_idx]
+        if (self.draft_early_exit and state.shape[0] == 1 and self.draft_min_len == 0 and
+                self._conf_stats is None):
+            return self._sample_early_exit(state, params, lm)
         logits = lm.forward(lm.prepare_for_device(state, params), params).float()
         b, s, V = logits.shape
         # Sequential in the sampled chain but fully on-device: embedding gather + bias
@@ -351,6 +356,39 @@ class DeepseekV41MTPModel(Model):
         keep = cs >= self.draft_conf_threshold
         lens = torch.cumprod(keep.to(torch.int32), dim = 1).sum(dim = 1)
         params["draft_confidence_len"] = max(int(lens.max().item()), min(self.draft_min_len, s))
+        return out
+
+
+    def _sample_early_exit(self, state: torch.Tensor, params: dict, lm) -> torch.Tensor:
+        """Batch-1 sample_from_state with the same gated result: the confidence of position i
+        needs only the pre-norm state and the markov embedding of the token at i (the seed for
+        i = 0), so it is checked before the head runs on that row, and drafting stops at the
+        first position below the threshold. Positions past the gated length stay 0 (cropped by
+        the generator's window)."""
+        import torch.nn.functional as F
+        dev = self.markov_head.device
+        cdev = self.confidence.device
+        s = state.shape[1]
+        seed = to_dev(params["dspark_seed_ids"], dev)
+        if getattr(self, "_markov_embed_dev", None) is None:
+            self._markov_embed_dev = to_dev(self.markov_embed.embedding.weight.data, dev)
+        xpre = to_dev(params["dspark_prenorm"], cdev).half()
+        out = torch.zeros((1, s + 1), dtype = torch.long, device = dev)
+        out[:, 0] = seed[:, -1]
+        n = 0
+        for i in range(s):
+            emb = F.embedding(out[:, i], self._markov_embed_dev).half()
+            conf = self.confidence.forward(
+                torch.cat((xpre[:, i:i + 1], to_dev(emb, cdev).unsqueeze(1)), dim = -1), params)
+            if float(torch.sigmoid(conf.float()).item()) < self.draft_conf_threshold:
+                break
+            logits = lm.forward(lm.prepare_for_device(state[:, i:i + 1], params), params).float()
+            logits = to_dev(logits, dev)
+            bias = self.markov_head.forward(emb.unsqueeze(1), params)
+            logits[:, 0] += bias[:, 0].float()
+            out[:, i + 1] = torch.argmax(logits[:, 0], dim = -1)
+            n += 1
+        params["draft_confidence_len"] = n
         return out
 
 
