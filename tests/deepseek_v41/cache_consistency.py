@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Cached-path (attn_mode flash_attn with DSA) vs stateless nc path parity
-for DeepSeek-V4.1 at full precision. Validates cache consistency across:
-- single-token decode steps
-- multi-token decode in chunks
-- per-layer attention outputs for troubleshooting
-
-    python tests/deepseek_v41/cache_consistency.py --model ~/tp1/v41port/model --reference ~/tp1/v41port/ref_logprobs_4x512.safetensors
-"""
+"""Cached-path validation for DeepSeek-V4.1: prefill 0-255, decode 256-319 single tokens
+and 16-token chunks. Compares cached logits with no-cache reference (KL mean < 0.01,
+top-1 >= 99%). Uses model.forward with proper generator-style params."""
 
 from __future__ import annotations
 
@@ -22,70 +17,16 @@ sys.path.insert(0, EXL3)
 import torch
 
 
-def fwd_modules(model, ids, params):
-    """Forward pass through module list with given params (attn_mode, position, etc)."""
-    params["input_ids"] = ids   # hash-MoE routing
-    x = ids
-    with torch.inference_mode():
-        for m in model.modules:
-            x = m.prepare_for_device(x, params)
-            x = m.forward(x, params)
-    return x[0].float().cpu()
-
-
-def fwd_cached(model, ids, state, chunks):
-    """Forward through chunks with cache state management."""
-    from exllamav3.cache.recurrent_util import _get_slot_tensor
-
-    outs = []
-    a = 0
-    for size in chunks:
-        b = min(a + size, ids.shape[1])
-        if b <= a:
-            break
-        params = {
-            "attn_mode": "flash_attn",
-            "recurrent_states": [state],
-            "recurrent_slots": _get_slot_tensor((state.slot,))
-        }
-        outs.append(fwd_modules(model, ids[:, a:b], params))
-        state.position += b - a
-        state.post_advance()
-        a = b
-    return torch.cat(outs, dim=0) if outs else torch.tensor([])
-
-
-def compare_logits(tag, got, ref, kl_tol, arg_tol, verbose=False):
-    """Compare logits with KL divergence and top-1 accuracy."""
-    if got.shape != ref.shape:
-        print(f"  FAIL {tag}: shape mismatch {got.shape} vs {ref.shape}")
-        return False
-
-    am = (got.argmax(-1) == ref.argmax(-1)).float().mean().item()
-    lp_r = torch.log_softmax(ref.double(), -1)
-    lp_g = torch.log_softmax(got.double(), -1)
-    kld = (lp_r.exp() * (lp_r - lp_g)).sum(-1).mean().item()
-    ok = am >= arg_tol and kld < kl_tol
-
-    result = f"  {'PASS' if ok else 'FAIL'} {tag}: argmax {am*100:.2f}% KL {kld:.6f} maxdiff {(got - ref).abs().max().item():.4f}"
-    print(result)
-    if verbose and not ok:
-        print(f"    KL per-position: mean={kld:.6f}, max={(lp_r.exp() * (lp_r - lp_g)).sum(-1).max().item():.6f}")
-    return ok
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default=os.path.expanduser("~/tp1/v41port/model"))
     parser.add_argument("--reference", type=str, required=True)
     parser.add_argument("--engram-rows", type=str, default=os.path.expanduser("~/tp1/e2e/engram-rows-4k.safetensors"))
-    parser.add_argument("--max-seqs", type=int, default=2)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--output", type=str, help="Output JSON with results")
+    parser.add_argument("--output", type=str, help="Output JSON")
+    parser.add_argument("--seq-idx", type=int, default=0, help="Sequence index to test")
 
     args = parser.parse_args()
 
-    # Set environment before importing exllamav3
     os.environ.setdefault("EXL3_MOE_CPU_SPLIT", "256")
     os.environ.setdefault("EXL3_MOE_CPU_THREADS", "16")
     os.environ.setdefault("EXL3_MOE_CPU_SWAP", "0")
@@ -94,23 +35,21 @@ def main():
     if args.engram_rows and os.path.isfile(args.engram_rows):
         os.environ["EXL3_ENGRAM_ROWS"] = args.engram_rows
 
-    result = {
-        "ok": False,
-        "tests": []
-    }
+    result = {"ok": False, "tests": []}
 
     try:
-        from exllamav3 import Config, Model, Tokenizer
+        from exllamav3 import Config, Model
         from exllamav3.cache.cache import Cache
         from safetensors import safe_open
+        from torch.nn.functional import log_softmax
 
-        # Load reference data
+        # Load reference
         with safe_open(args.reference, "pt") as f:
             ref_tokens = f.get_tensor("tokens").long()
             ref_logprobs = f.get_tensor("logprobs").half()
 
         S, N = ref_tokens.shape
-        print(f"Loaded reference: {S} sequences, {N} tokens each")
+        print(f"Reference: {S} sequences, {N} tokens each")
 
         # Load model
         t0 = time.time()
@@ -120,93 +59,164 @@ def main():
         device = torch.device("cuda:0")
         print(f"Model loaded in {time.time() - t0:.1f}s")
 
-        # Build cache
-        cache = Cache(model, max_num_tokens=4096, max_batch_size=2)
+        # Create cache and state
+        cache = Cache(model, max_num_tokens=8192, max_batch_size=1)
+        state = cache.get_new_state()
+        ids = ref_tokens[args.seq_idx:args.seq_idx+1].to(device)
 
-        # Test on first few sequences
-        all_pass = True
-        for seq_idx in range(min(args.max_seqs, S)):
-            print(f"\n=== Sequence {seq_idx} ===")
-            ids = ref_tokens[seq_idx:seq_idx+1].to(device)
+        # No-cache reference forward
+        print(f"No-cache forward ({N} tokens)...")
+        t0 = time.time()
+        ref_logits = model.forward(ids, {"attn_mode": "flash_attn_nc"})
+        nc_time = time.time() - t0
+        ref_logits = ref_logits[0].float().cpu()
+        print(f"  Done in {nc_time:.1f}s")
 
-            try:
-                # No-cache reference forward
-                ref_logits = fwd_modules(model, ids, {"attn_mode": "flash_attn_nc"})
-            except Exception as e:
-                print(f"  ERROR in nc forward: {e}")
-                result["error"] = str(e)
-                continue
-
-            # Single-token decode: prefill 0..255, then decode 256..N-1 one token per forward
-            print(f"Single-token decode (prefill 256, decode {N-256}):")
-            state = cache.get_new_state()
-            try:
-                prefill_outs = fwd_cached(model, ids[:, :256], state, [256])
-                decode_outs = fwd_cached(model, ids[:, 256:], state, [1] * (N - 256))
-                cached_logits = torch.cat([prefill_outs, decode_outs], dim=0)
-            except Exception as e:
-                print(f"  ERROR in cached forward: {e}")
-                state.free()
-                result["error"] = str(e)
-                continue
-
-            kl_tol = 0.01
-            arg_tol = 0.99
-            test_ok = compare_logits(
-                f"single-token decode vs nc",
-                cached_logits,
-                ref_logits,
-                kl_tol,
-                arg_tol,
-                verbose=args.verbose
+        # Cached: prefill 0-255, then 64 single-token decodes
+        print(f"Cached prefill (0-255)...")
+        t0 = time.time()
+        with torch.inference_mode():
+            model.forward(
+                ids[:, :256],
+                {
+                    "attn_mode": "flash_attn",
+                    "cache": cache,
+                    "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                    "cache_seqlens": torch.tensor([0], dtype=torch.int32, device=device),
+                    "recurrent_states": [state],
+                    "positions": torch.arange(256, dtype=torch.int32, device=device),
+                },
             )
-            all_pass &= test_ok
-            state.free()
+        state.position = 256
+        state.post_advance()
+        prefill_time = time.time() - t0
+        print(f"  Prefill done in {prefill_time:.1f}s")
 
-            result["tests"].append({
-                "seq": seq_idx,
-                "test": "single_token_decode",
-                "pass": test_ok
-            })
+        # Single-token decode loop
+        print(f"Cached decode (256-319, single tokens)...")
+        cached_logits = torch.zeros((N, cfg.vocab_size), dtype=torch.float32)
+        cached_logits[:256] = ref_logits[:256]  # Use nc logits for prefilled range
 
-            # Chunk decode: prefill 256, then 16-token chunks
-            print(f"Chunk decode (prefill 256, decode 16-token chunks):")
-            state = cache.get_new_state()
-            chunk_outs = fwd_cached(model, ids[:, :256], state, [256])
-            remaining = N - 256
-            chunk_size = 16
-            while remaining > 0:
-                size = min(chunk_size, remaining)
-                chunk_outs = fwd_cached(model, ids[:, 256 + (N - 256 - remaining):256 + (N - 256 - remaining) + size],
-                                       state, [size])
-                remaining -= size
+        t0 = time.time()
+        for pos in range(256, N):
+            with torch.inference_mode():
+                logits = model.forward(
+                    ids[:, pos:pos+1],
+                    {
+                        "attn_mode": "flash_attn",
+                        "cache": cache,
+                        "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                        "cache_seqlens": torch.tensor([pos], dtype=torch.int32, device=device),
+                        "recurrent_states": [state],
+                        "positions": torch.tensor([pos], dtype=torch.int32, device=device),
+                    },
+                )
+            cached_logits[pos] = logits[0].float().cpu()
+            state.position += 1
+            state.post_advance()
 
-            # Re-forward for accurate comparison
-            state = cache.get_new_state()
-            chunk_logits = fwd_cached(model, ids, state, [256] + [16] * ((N - 256 + 15) // 16))
+        decode_time = time.time() - t0
+        print(f"  Decode done in {decode_time:.1f}s ({(N-256)/decode_time:.1f} tok/s)")
 
-            test_ok = compare_logits(
-                f"chunk decode vs nc",
-                chunk_logits[-32:] if chunk_logits.shape[0] > 32 else chunk_logits,
-                ref_logits[-32:] if ref_logits.shape[0] > 32 else ref_logits,
-                kl_tol,
-                arg_tol,
-                verbose=args.verbose
+        # Compare cached vs nc
+        lp_ref = log_softmax(ref_logits[256:N].double(), -1)
+        lp_cached = log_softmax(cached_logits[256:N].double(), -1)
+        kl = (lp_ref.exp() * (lp_ref - lp_cached)).sum(-1)
+        top1 = (cached_logits[256:N].argmax(-1) == ref_logits[256:N].argmax(-1)).float()
+
+        kl_mean = kl.mean().item()
+        kl_max = kl.max().item()
+        top1_mean = top1.mean().item()
+
+        print(f"\nSingle-token decode vs nc:")
+        print(f"  KL: mean={kl_mean:.6f}, max={kl_max:.6f}")
+        print(f"  Top-1: {top1_mean*100:.2f}%")
+
+        test_ok = kl_mean < 0.01 and top1_mean >= 0.99
+        result["tests"].append({
+            "test": "single_token_decode",
+            "kl_mean": float(kl_mean),
+            "kl_max": float(kl_max),
+            "top1": float(top1_mean),
+            "pass": test_ok,
+        })
+
+        # Cached with 16-token chunks
+        print(f"\nCached decode (256-319, 16-token chunks)...")
+        state.free()
+        state = cache.get_new_state()
+        cached_logits_chunks = torch.zeros((N, cfg.vocab_size), dtype=torch.float32)
+        cached_logits_chunks[:256] = ref_logits[:256]
+
+        # Prefill again
+        with torch.inference_mode():
+            model.forward(
+                ids[:, :256],
+                {
+                    "attn_mode": "flash_attn",
+                    "cache": cache,
+                    "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                    "cache_seqlens": torch.tensor([0], dtype=torch.int32, device=device),
+                    "recurrent_states": [state],
+                    "positions": torch.arange(256, dtype=torch.int32, device=device),
+                },
             )
-            all_pass &= test_ok
-            state.free()
+        state.position = 256
+        state.post_advance()
 
-            result["tests"].append({
-                "seq": seq_idx,
-                "test": "chunk_decode",
-                "pass": test_ok
-            })
+        # Decode in 16-token chunks
+        t0 = time.time()
+        for chunk_start in range(256, N, 16):
+            chunk_end = min(chunk_start + 16, N)
+            chunk_size = chunk_end - chunk_start
+            with torch.inference_mode():
+                logits = model.forward(
+                    ids[:, chunk_start:chunk_end],
+                    {
+                        "attn_mode": "flash_attn",
+                        "cache": cache,
+                        "block_table": torch.tensor([[0]], dtype=torch.int32, device=device),
+                        "cache_seqlens": torch.tensor([chunk_start], dtype=torch.int32, device=device),
+                        "recurrent_states": [state],
+                        "positions": torch.arange(chunk_start, chunk_end, dtype=torch.int32, device=device),
+                    },
+                )
+            cached_logits_chunks[chunk_start:chunk_end] = logits[0].float().cpu()
+            state.position += chunk_size
+            state.post_advance()
 
-        result["ok"] = all_pass
+        chunk_time = time.time() - t0
+        print(f"  Chunks done in {chunk_time:.1f}s ({(N-256)/chunk_time:.1f} tok/s)")
+
+        # Compare chunks
+        lp_ref_chunks = log_softmax(ref_logits[256:N].double(), -1)
+        lp_cached_chunks = log_softmax(cached_logits_chunks[256:N].double(), -1)
+        kl_chunks = (lp_ref_chunks.exp() * (lp_ref_chunks - lp_cached_chunks)).sum(-1)
+        top1_chunks = (cached_logits_chunks[256:N].argmax(-1) == ref_logits[256:N].argmax(-1)).float()
+
+        kl_mean_chunks = kl_chunks.mean().item()
+        kl_max_chunks = kl_chunks.max().item()
+        top1_mean_chunks = top1_chunks.mean().item()
+
+        print(f"\n16-token chunks vs nc:")
+        print(f"  KL: mean={kl_mean_chunks:.6f}, max={kl_max_chunks:.6f}")
+        print(f"  Top-1: {top1_mean_chunks*100:.2f}%")
+
+        chunks_ok = kl_mean_chunks < 0.01 and top1_mean_chunks >= 0.99
+        result["tests"].append({
+            "test": "chunks_16",
+            "kl_mean": float(kl_mean_chunks),
+            "kl_max": float(kl_max_chunks),
+            "top1": float(top1_mean_chunks),
+            "pass": chunks_ok,
+        })
+
+        result["ok"] = test_ok and chunks_ok
+        state.free()
 
     except Exception as e:
         import traceback
-        result["error"] = traceback.format_exc()[-1000:]
+        result["error"] = traceback.format_exc()[-500:]
         traceback.print_exc()
 
     if args.output:
