@@ -432,7 +432,9 @@ class SafetensorsCollection:
         # cache rather than pinned allocations, so a model can approach total system memory
         self.ats_mmap = os.environ.get("EXL3_ATS_MMAP", "0") != "0"
         self.ats_min_bytes = int(os.environ.get("EXL3_ATS_MMAP_MIN", str(1 << 20)))
+        self.ats_align = int(os.environ.get("EXL3_ATS_MMAP_ALIGN", "8"))
         self.ats_maps = {}
+        self.ats_bytes = [0, 0]            # aliased, copied because off the alignment grid
 
 
     def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
@@ -772,8 +774,13 @@ class SafetensorsCollection:
             torch.device(device).type == "cuda" and not transpose and pad_to is None and
             not (dtype == torch.bfloat16 and not allow_bf16) and not (dtype == torch.float and float2half)
         ):
-            self.metrics.direct_tensors += 1
-            return self._ats_alias(filename, offset + beg, bytesize, dtype, shape, device)
+            # GPU kernels fault on misaligned loads, and a mapping cannot shift a file offset onto
+            # the grid, so tensors packed at an odd offset take the normal copy path
+            if (offset + beg) % self.ats_align == 0:
+                self.metrics.direct_tensors += 1
+                self.ats_bytes[0] += bytesize
+                return self._ats_alias(filename, offset + beg, bytesize, dtype, shape, device)
+            self.ats_bytes[1] += bytesize
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:
