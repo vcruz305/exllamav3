@@ -90,3 +90,15 @@ at::Tensor pinned_cuda_view(const at::Tensor& t, int64_t device)
     auto options = t.options().device(at::kCUDA, static_cast<c10::DeviceIndex>(device));
     return at::from_blob(dev_ptr, t.sizes(), t.strides(), [](void*) {}, options);
 }
+
+at::Tensor ats_cuda_view(const at::Tensor& t, int64_t device)
+{
+    // CUDA-device alias of pageable host memory on ATS systems (Grace/GB10), where the GPU
+    // shares the process page tables: the device pointer is the host address, nothing is
+    // pinned, and file-backed pages stay reclaimable page cache. The alias holds a reference
+    // to the source tensor, so the mapping lives as long as any view of it
+    TORCH_CHECK(t.device().is_cpu(), "ats_cuda_view: tensor must be a CPU tensor");
+    auto options = t.options().device(at::kCUDA, static_cast<c10::DeviceIndex>(device));
+    at::Tensor keep = t;
+    return at::from_blob(t.data_ptr(), t.sizes(), t.strides(), [keep](void*) mutable {}, options);
+}

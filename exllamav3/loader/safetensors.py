@@ -426,6 +426,27 @@ class SafetensorsCollection:
         self.arena_enable = os.environ.get("EXL3_LOAD_ARENA", "1") != "0"
         self.deferred_arena = True
 
+        # EXL3_ATS_MMAP=1: on ATS systems (Grace/GB10, GPU shares the process page tables) CUDA
+        # tensors of at least EXL3_ATS_MMAP_MIN bytes that need no conversion alias a private
+        # mapping of the file instead of being copied. Weights then live in reclaimable page
+        # cache rather than pinned allocations, so a model can approach total system memory
+        self.ats_mmap = os.environ.get("EXL3_ATS_MMAP", "0") != "0"
+        self.ats_min_bytes = int(os.environ.get("EXL3_ATS_MMAP_MIN", str(1 << 20)))
+        self.ats_maps = {}
+
+
+    def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
+        import mmap
+        base = self.ats_maps.get(filename)
+        if base is None:
+            with open(filename, "rb") as f:
+                mm = mmap.mmap(f.fileno(), 0, flags = mmap.MAP_PRIVATE, prot = mmap.PROT_READ | mmap.PROT_WRITE)
+            base = self.ats_maps[filename] = torch.frombuffer(mm, dtype = torch.uint8)
+        t = base[file_offset : file_offset + bytesize].view(dtype).view(tuple(shape))
+        device = torch.device(device)
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return ext.ats_cuda_view(t, index)
+
 
     def add_tensor_files(
         self,
@@ -745,6 +766,14 @@ class SafetensorsCollection:
             beg += esize * numel * fidx
             end = beg + esize * numel
             bytesize = end - beg
+
+        if (
+            self.ats_mmap and bytesize >= self.ats_min_bytes and
+            torch.device(device).type == "cuda" and not transpose and pad_to is None and
+            not (dtype == torch.bfloat16 and not allow_bf16) and not (dtype == torch.float and float2half)
+        ):
+            self.metrics.direct_tensors += 1
+            return self._ats_alias(filename, offset + beg, bytesize, dtype, shape, device)
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:

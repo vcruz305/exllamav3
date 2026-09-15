@@ -182,7 +182,7 @@ class DSV4Compressor:
         for tag, inner in [("wkv", wkv_i), ("wgate", wgate_i)]:
             if isinstance(inner, LinearEXL3):
                 args[f"{tag}_exl3"] = inner.bc
-            elif hasattr(inner, "weight") and inner.weight.dtype == torch.half:
+            elif hasattr(inner, "weight") and not getattr(inner, "lazy", False) and inner.weight.dtype == torch.half:
                 args[f"{tag}_fp16"] = ext.BC_LinearFP16(inner.weight, getattr(inner, "bias", None))
             else:
                 return
