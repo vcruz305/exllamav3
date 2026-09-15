@@ -436,6 +436,11 @@ class SafetensorsCollection:
         self.ats_align = int(os.environ.get("EXL3_ATS_MMAP_ALIGN", "16"))
         self.ats_maps = {}
         self.ats_bytes = [0, 0]            # aliased, copied because off the alignment grid
+        # EXL3_ATS_COPY=<regex>: tensors whose key matches load into CUDA memory even when they
+        # could be aliased (unevictable, and mapped in large pages rather than 4 KB page cache)
+        copy_re = os.environ.get("EXL3_ATS_COPY")
+        self.ats_copy_re = re.compile(copy_re) if copy_re else None
+        self.ats_copied_policy = 0
 
 
     def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
@@ -785,11 +790,14 @@ class SafetensorsCollection:
             # a 16-byte grid (on CUDA allocations too); other dtypes need only their item size. A
             # mapping cannot shift a file offset onto the grid, so off-grid tensors are copied
             align = self.ats_align if dtype == torch.int16 else dtype.itemsize
-            if (offset + beg) % align == 0:
+            if self.ats_copy_re is not None and self.ats_copy_re.search(key):
+                self.ats_copied_policy += bytesize
+            elif (offset + beg) % align == 0:
                 self.metrics.direct_tensors += 1
                 self.ats_bytes[0] += bytesize
                 return self._ats_alias(filename, offset + beg, bytesize, dtype, shape, device)
-            self.ats_bytes[1] += bytesize
+            else:
+                self.ats_bytes[1] += bytesize
 
         load_method = self.load_method
         if load_method == "mt_fread" and self.deferred_mode and not no_defer:
