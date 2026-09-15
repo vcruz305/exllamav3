@@ -232,6 +232,11 @@ def _launch_grouped_exl3_moe(
     token_sorted_by_group = token_sorted[order]
     weight_sorted_by_group = weight_sorted[order]
 
+    # Build full expert count (all experts, but count non-group as zero)
+    full_counts = torch.zeros(n_exp + 1, dtype=torch.long, device=key.device)
+    for e in range(n_exp):
+        full_counts[e] = (flat_expert_local == e).sum().long()
+
     # Launch one exl3_moe per group, accumulating into shared output
     start = 0
     for group_idx, (group, n_routes, n_active) in enumerate(zip(groups, routes_host, active_host)):
@@ -239,44 +244,49 @@ def _launch_grouped_exl3_moe(
             continue
         n_groups_active += 1
 
-        # Expert indices for this group within the flattened array
-        base_slot = int(group.base)
         n_members = len(group.members)
+        member_ids_tensor = torch.tensor(group.members, dtype=torch.long, device=key.device)
 
-        # Get the token/weight slice for this group
-        token_slice = token_sorted_by_group[start:start + n_routes]
-        weight_slice = weight_sorted_by_group[start:start + n_routes]
+        # Create expert_count for this group: only non-zero for group members
+        group_counts = torch.zeros(n_exp + 1, dtype=torch.long, device=key.device)
+        for member_id in group.members:
+            group_counts[member_id] = full_counts[member_id]
 
-        # Remap global expert IDs to group-local indices (0..n_members)
-        # flat_expert_local contains local expert IDs; map to group member positions
-        token_slice_experts = flat_expert_local[order][start:start + n_routes]
-        member_to_local = torch.full((n_exp,), n_members, dtype=torch.long, device=key.device)
-        member_to_local[torch.tensor(group.members, dtype=torch.long, device=key.device)] = torch.arange(
-            len(group.members), dtype=torch.long, device=key.device
-        )
-        group_expert_ids = member_to_local[token_slice_experts]
-        group_expert_count = torch.bincount(group_expert_ids, minlength=n_members + 1)
-
-        # Extract pointers for this group's projections
+        # Extract pointers for this group's projections (full-sized arrays with zeros for non-group)
         k_g, k_u, k_d = group.k_triple
-        ptrs_g_trellis = group.ptrs.get("gate_trellis")
-        ptrs_g_suh = group.ptrs.get("gate_suh")
-        ptrs_g_svh = group.ptrs.get("gate_svh")
-        ptrs_u_trellis = group.ptrs.get("up_trellis")
-        ptrs_u_suh = group.ptrs.get("up_suh")
-        ptrs_u_svh = group.ptrs.get("up_svh")
-        ptrs_d_trellis = group.ptrs.get("down_trellis")
-        ptrs_d_suh = group.ptrs.get("down_suh")
-        ptrs_d_svh = group.ptrs.get("down_svh")
+
+        # Build full pointer arrays, filling non-group experts with a dummy pointer
+        ptrs_g_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_g_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_g_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_u_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_u_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_u_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_d_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_d_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+        ptrs_d_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
+
+        # Fill in pointers only for group members
+        for local_idx, member_id in enumerate(group.members):
+            ptrs_g_trellis_full[member_id] = group.ptrs.get("gate_trellis")[local_idx]
+            ptrs_g_suh_full[member_id] = group.ptrs.get("gate_suh")[local_idx]
+            ptrs_g_svh_full[member_id] = group.ptrs.get("gate_svh")[local_idx]
+            ptrs_u_trellis_full[member_id] = group.ptrs.get("up_trellis")[local_idx]
+            ptrs_u_suh_full[member_id] = group.ptrs.get("up_suh")[local_idx]
+            ptrs_u_svh_full[member_id] = group.ptrs.get("up_svh")[local_idx]
+            ptrs_d_trellis_full[member_id] = group.ptrs.get("down_trellis")[local_idx]
+            ptrs_d_suh_full[member_id] = group.ptrs.get("down_suh")[local_idx]
+            ptrs_d_svh_full[member_id] = group.ptrs.get("down_svh")[local_idx]
 
         # Launch exl3_moe for this group with its own K
+        # Pass full expert arrays; kernel will skip non-group experts due to zero counts
         mcg_gate, mul1_gate, mcg_up, mul1_up, mcg_down, mul1_down = group.cb_flags
         ext.exl3_moe(
             y,
             final_hidden_states,
-            group_expert_count,
-            token_slice,
-            weight_slice,
+            group_counts,
+            token_sorted,
+            weight_sorted,
             temp_bufs.temp_state_g,
             temp_bufs.temp_state_u,
             temp_bufs.temp_intermediate_g,
@@ -285,15 +295,15 @@ def _launch_grouped_exl3_moe(
             k_g,
             k_u,
             k_d,
-            ptrs_g_trellis,
-            ptrs_g_suh,
-            ptrs_g_svh,
-            ptrs_u_trellis,
-            ptrs_u_suh,
-            ptrs_u_svh,
-            ptrs_d_trellis,
-            ptrs_d_suh,
-            ptrs_d_svh,
+            ptrs_g_trellis_full,
+            ptrs_g_suh_full,
+            ptrs_g_svh_full,
+            ptrs_u_trellis_full,
+            ptrs_u_suh_full,
+            ptrs_u_svh_full,
+            ptrs_d_trellis_full,
+            ptrs_d_suh_full,
+            ptrs_d_svh_full,
             mcg_gate,
             mul1_gate,
             mcg_up,
