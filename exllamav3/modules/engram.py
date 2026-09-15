@@ -458,7 +458,16 @@ class EngramLayer(Module):
         if ids is None:
             ids = torch.zeros((bsz, seq), dtype = torch.long)               # measuring forward
         ids = ids.to("cpu", torch.int64)
-        pos = int(params.get("position", 0))
+        rsg = params.get("recurrent_states")
+        if rsg:
+            # Cached forwards carry the absolute position in the recurrent state, not params["position"].
+            # Hashing a chunk from position 0 would block every n-gram of its first context_len tokens
+            # (positions < shift), so single-token decode hashed unigram-only rows. With a batch of
+            # differently advanced sequences the DEAD-filled history before each sequence start blocks
+            # the same n-grams, so a start position past the context is exact for all of them
+            pos = int(rsg[0].position) if len(rsg) == 1 else self.hasher.context_len
+        else:
+            pos = int(params.get("position", 0))
         window, rsl, slots = self._history(ids, params)
         hash_ids = self.hasher.hash_window(window, pos)[:, :, self.table_index, :]
         delta = self.forward_streams(x, hash_ids, params)
