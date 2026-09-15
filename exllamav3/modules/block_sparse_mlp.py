@@ -49,10 +49,14 @@ EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") != "0"
 # and accumulation order). Opt-in with EXL3_MOE_MIXED_BSZ1=1: measured ~5% warm decode on
 # DeepSeek-V4.1 (GB10), but greedy output was not reproducible run to run while the Python loop was
 EXL3_MOE_MIXED_BSZ1 = os.environ.get("EXL3_MOE_MIXED_BSZ1", "0") != "0"
-_GROUPED_STATS = {"launches": 0}
+# Mixed-K layers at bsz 1..MAX_BSZN: one BC_BlockSparseMLP multi-row graph per quantization group,
+# sync-free (EXL3_MOE_GROUP_GRAPH=1)
+EXL3_MOE_GROUP_GRAPH = os.environ.get("EXL3_MOE_GROUP_GRAPH", "0") != "0"
+_GROUPED_STATS = {"launches": 0, "group_graph_calls": 0}
 if os.environ.get("EXL3_MOE_GROUPED_DEBUG", "0") != "0":
     import atexit
-    atexit.register(lambda: print(f" -- grouped MoE: {_GROUPED_STATS['launches']} fused group launches"))
+    atexit.register(lambda: print(f" -- grouped MoE: {_GROUPED_STATS['launches']} fused group launches, "
+                                  f"{_GROUPED_STATS['group_graph_calls']} group graph calls"))
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -515,6 +519,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.bc = None
         self.bc_mixed_bsz1 = None
+        self.bc_groups = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
@@ -857,6 +862,90 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" -- Mixed-K experts in {self.key}: grouped fused dispatch, "
                   f"{len(self.grouped_state['groups'])} groups over {n_members} device experts")
 
+        # Mixed-K layers at bsz 1..MAX_BSZN: the uniform run_bszN graph once per quantization group.
+        # Each group's pointer tables hold only its members; routes are remapped global -> local
+        # with other groups' experts at -1, which the mgemm range filter [0, members) drops on the
+        # device, so the routed sum needs no host sync. The shared expert rides in group 0's graph
+        self.bc_groups = None
+        n_exp = len(self.ups)
+        if (
+            EXL3_MOE_GROUP_GRAPH and self.is_quantized and not self.uniform_expert_q and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
+            not self.config.infer_params.no_reconstruct and
+            cfg.min_expert < 0 and n_exp == self.num_experts and
+            Hi == H and Ho == H and self.latent_in is None and
+            all(
+                l.inner.bias is None and not l.lora_a_tensors and
+                l.pre_scale == 1.0 and l.post_scale == 1.0 and l.softcap == 0.0 and
+                l.in_features == l.in_features_unpadded and l.out_features == l.out_features_unpadded and
+                l.inner.trellis.device == torch.device(device)
+                for l in self.gates + self.ups + self.downs
+            )
+        ):
+            gates_l = self.gates if self.gated else self.ups
+            by_key = {}
+            for e in range(n_exp):
+                key = (_expert_quant_key(gates_l[e]), _expert_quant_key(self.ups[e]), _expert_quant_key(self.downs[e]))
+                by_key.setdefault(key, []).append(e)
+            members_list = [m for _, m in sorted(by_key.items())]
+            remap = torch.full((len(members_list), n_exp), -1, dtype = torch.long)
+            for g, members in enumerate(members_list):
+                remap[g, members] = torch.arange(len(members))
+            self.bc_group_remap = remap.to(device)
+
+            self.bc_group_sh_exp = bool(
+                self.shared_experts
+                and isinstance(self.shared_experts, GatedMLP)
+                and self.shared_experts.bc is not None
+                and self.shared_experts_post_norm is None
+                and not self.alt_residual_channel
+            )
+            dq_up = g_tensor_cache.get(device, (Hi, I), torch.half, "dq_temp")
+            dq_down = dq_up.view(I, Ho)
+            groups, outs = [], []
+            for g, members in enumerate(members_list):
+                mg = MultiLinear(self.device, [gates_l[e] for e in members])
+                mu = MultiLinear(self.device, [self.ups[e] for e in members])
+                md = MultiLinear(self.device, [self.downs[e] for e in members])
+                out_g = g_tensor_cache.get(device, (bszn_rows, Ho), torch.float, f"moe1_group_out_{g}")
+                gu = {
+                    attr: torch.tensor(
+                        [[getattr(gates_l[e].inner, attr).data_ptr(), getattr(self.ups[e].inner, attr).data_ptr()]
+                         for e in members], dtype = torch.long, device = device)
+                    for attr in ("trellis", "suh", "svh")
+                }
+                sh_bc = sh_t = sh_gate_bc = sh_gate_t = None
+                if g == 0 and self.bc_group_sh_exp:
+                    sh_bc = self.shared_experts.bc
+                    sh_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = device)
+                    if self.shared_gate:
+                        assert self.shared_gate.quant_type == "fp16"
+                        sh_gate_bc = self.shared_gate.inner.bc
+                        sh_gate_t = torch.empty((1, 1, 1), dtype = self.shared_gate.out_dtype, device = device)
+                groups.append(ext.BC_BlockSparseMLP(
+                    temp_hidden, cfg.yh, temp_interm, cfg.interm_g, cfg.interm_u, cfg.interm_a, temp_activa,
+                    out_g.view(bszn_rows, 1, Ho), out_g,
+                    sh_t, sh_gate_t, dq_up, dq_down,
+                    0, len(members),
+                    mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh, mg.K, mg.mcg, mg.mul1,
+                    mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh, mu.K, mu.mcg, mu.mul1,
+                    md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh, md.K, md.mcg, md.mul1,
+                    self.activation_fn == "silu",
+                    self.activation_fn == "gelu",
+                    self.activation_fn == "swiglu_oai",
+                    sh_bc, sh_gate_bc, self.act_limit,
+                    [self.gates[e].inner.bc for e in members] if self.gated else [],
+                    [self.ups[e].inner.bc for e in members],
+                    [self.downs[e].inner.bc for e in members],
+                    gu["trellis"], gu["suh"], gu["svh"],
+                    a_gather, None, None, None, None, None,
+                    act_relu2 = self.activation_fn == "relu2",
+                ))
+                outs.append(out_g.view(bszn_rows, 1, Ho))
+            self.bc_groups, self.bc_group_outs = groups, outs
+            print(f" -- Mixed-K experts in {self.key}: {len(groups)} group graphs "
+                  f"(sizes {[len(m) for m in members_list]})")
+
 
     def load_routing(self, **kwargs):
 
@@ -1063,6 +1152,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.cpu_unload()
         self.bc = None
         self.bc_mixed_bsz1 = None
+        self.bc_groups = None
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1159,6 +1249,27 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # Mixed-K layers at bsz 1..MAX_BSZN: one multi-row graph per quantization group over the
+        # remapped routes; the groups' weighted sums (group 0 carries the shared expert) add up in place
+        elif (
+            self.bc_groups is not None and bsz <= MAX_BSZN and y.dtype == torch.half and y.is_contiguous() and
+            selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
+            routing_weights.is_contiguous() and self.num_local_experts == self.num_experts and
+            self.routing_device is None and cpu_partial is None and cpu_pending is None and
+            not self.cpu_offload and self.cpu_split_first is None and
+            not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
+        ):
+            k = selected_experts.shape[-1]
+            local = self.bc_group_remap.index_select(1, selected_experts.reshape(-1)).view(-1, bsz, k)
+            for g, bc in enumerate(self.bc_groups):
+                bc.run_bszN(y, local[g], routing_weights)
+            final_hidden_states = self.bc_group_outs[0][:bsz]
+            for out_g in self.bc_group_outs[1:]:
+                final_hidden_states.add_(out_g[:bsz])
+            final_hidden_states = final_hidden_states.view(eshape)
+            bc_sh_exp = self.bc_group_sh_exp
+            _GROUPED_STATS["group_graph_calls"] += 1
 
         # Batch-1 mixed-K decode: the dense per-expert loop below as one C++ call. A fresh output per
         # call: the shared expert is added into it in place
