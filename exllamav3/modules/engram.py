@@ -224,9 +224,10 @@ class EngramTable:
                 except (OSError, RuntimeError, KeyError) as e:
                     raise RuntimeError(f"EXL3_ENGRAM_ROWS={rows_file} unreadable for layer {layer_id}") from e
 
-        # GPU-direct ATS aliases per device (lazy-initialized)
-        self.ats_weight_alias = {}
-        self.ats_scale_alias = {}
+        # GPU-direct gather from the file-mapped tables when the collection aliases mappings (ATS)
+        self.ats_off = not (getattr(stc, "ats_mmap", False) and self.rows_file_ids is None and
+                            os.environ.get("EXL3_ENGRAM_ATS", "1") != "0")
+        self.ats_tables = {}
 
     def _gather(self, handle, ids: list, nbytes: int) -> bytes:
         fd = handle._ensure_open()
@@ -240,52 +241,36 @@ class EngramTable:
             return b"".join(one(r) for r in ids)
         return b"".join(self.pool.map(one, ids, chunksize = 8))
 
-    def _get_ats_aliases(self, device):
-        """Create GPU-direct ATS aliases for weight and scale tables on first use per device."""
-        device_obj = torch.device(device)
-        device_key = device_obj.index if device_obj.index is not None else torch.cuda.current_device()
-
-        if device_key not in self.ats_weight_alias:
-            # Alias weight table (fp8 values viewed as uint8)
-            w_filename = self.weight.filename
-            w_offset = self.weight.abs_offset
-            w_bytesize = self.weight.num_rows * self.weight.row_bytes
-            w_shape = [self.weight.num_rows] + self.weight.row_shape
-            self.ats_weight_alias[device_key] = self.stc._ats_alias(
-                w_filename, w_offset, w_bytesize, torch.uint8, w_shape, device
+    def _ats_aliases(self, device):
+        """uint8 CUDA aliases [rows, row_bytes] of the weight and scale tables, created on first use
+        per device; None when the GPU-direct path is off. Nothing is copied: the tables stay in
+        reclaimable page cache and the GPU faults rows in on demand"""
+        if self.ats_off:
+            return None
+        device = torch.device(device)
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        if idx not in self.ats_tables:
+            self.ats_tables[idx] = tuple(
+                self.stc._ats_alias(h.filename, h.abs_offset, h.num_rows * h.row_bytes, torch.uint8,
+                                    [h.num_rows, h.row_bytes], device)
+                for h in (self.weight, self.scale)
             )
-
-            # Alias scale table (uint8)
-            s_filename = self.scale.filename
-            s_offset = self.scale.abs_offset
-            s_bytesize = self.scale.num_rows * self.scale.row_bytes
-            s_shape = [self.scale.num_rows] + self.scale.row_shape
-            self.ats_scale_alias[device_key] = self.stc._ats_alias(
-                s_filename, s_offset, s_bytesize, torch.uint8, s_shape, device
-            )
-
-        return self.ats_weight_alias[device_key], self.ats_scale_alias[device_key]
+        return self.ats_tables[idx]
 
     def rows(self, hash_ids: torch.Tensor, device) -> torch.Tensor:
         """hash_ids: any shape of row ids -> (*shape, head_dim) fp32 dequantized rows on device."""
+        tables = self._ats_aliases(device)
+        if tables is not None:
+            w_u8, s_u8 = tables
+            ids = hash_ids.reshape(-1).to(device, torch.int64)
+            n = ids.shape[0]
+            w = w_u8.index_select(0, ids).view(torch.float8_e4m3fn).float()
+            s = s_u8.index_select(0, ids).float()
+            vals = (w.view(n, -1, self.block) * torch.exp2(s - 127.0).unsqueeze(-1)).view(n, self.head_dim)
+            return vals.view(*hash_ids.shape, self.head_dim)
+
         flat = hash_ids.reshape(-1).cpu().to(torch.int64)
         uniq, inverse = torch.unique(flat, return_inverse = True)
-
-        # GPU-direct ATS path: alias file-mapped tables and gather on GPU
-        use_ats = (self.stc.ats_mmap and self.rows_file_ids is None and
-                   os.environ.get("EXL3_ENGRAM_ATS", "1") != "0")
-
-        if use_ats:
-            try:
-                w_alias, s_alias = self._get_ats_aliases(device)
-                ids = uniq.reshape(-1).to(device, torch.int64)
-                w_u8 = w_alias.index_select(0, ids).view(torch.float8_e4m3fn).float()
-                s = s_alias.index_select(0, ids).float()
-                vals = (w_u8.view(len(ids), -1, self.block) * torch.exp2(s - 127.0).unsqueeze(-1)).view(len(ids), self.head_dim)
-                return vals[inverse.to(device)].view(*hash_ids.shape, self.head_dim)
-            except Exception:
-                # Fall back to disk path if ATS aliasing fails
-                use_ats = False
 
         # Hybrid gather: memory hits from rows file, disk fallback for missed ids
         if self.rows_file_ids is not None:
