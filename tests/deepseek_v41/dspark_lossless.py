@@ -92,6 +92,23 @@ def main() -> int:
                          draft_cache = draft_cache, max_chunk_size = 2048)
     spec = [run(spec_gen, pr) for pr in PROMPTS]
 
+    def near_tie(prompt, bt, st, i):
+        """No-cache target logits at the first divergent position: how far apart the baseline and
+        speculative tokens are. Verification runs the target on up to block + 1 tokens per forward,
+        so fp16 kernel differences can flip a near-tie; a large gap would point to a real bug."""
+        if i is None or i >= len(bt) or i >= len(st):
+            return None
+        ids = torch.cat([tokenizer.encode(prompt, add_bos = True).flatten(), torch.tensor(bt[:i])]).unsqueeze(0)
+        with torch.inference_mode():
+            logits = model.forward(ids.to("cuda:0"), {"attn_mode": "flash_attn_nc", "position": 0})[0, -1].float().cpu()
+        top2 = logits.topk(2)
+        return {
+            "base_token_logit": round(logits[bt[i]].item(), 3), "spec_token_logit": round(logits[st[i]].item(), 3),
+            "gap": round((logits[bt[i]] - logits[st[i]]).item(), 3),
+            "top2_margin": round((top2.values[0] - top2.values[1]).item(), 3),
+            "nc_argmax_is_base": int(top2.indices[0]) == bt[i], "nc_argmax_is_spec": int(top2.indices[0]) == st[i],
+        }
+
     rows, lossless = [], True
     for pr, (bt, btps, *_), (st, stps, dacc, drej, n) in zip(PROMPTS, base, spec):
         same = bt == st
@@ -103,6 +120,7 @@ def main() -> int:
             "base_tps": round(btps, 2), "spec_tps": round(stps, 2),
             "accepted_per_round": round(dacc / rounds, 3) if rounds else None,
             "acceptance_rate": round(dacc / (dacc + drej), 3) if dacc is not None and (dacc + drej) else None,
+            "divergence": None if same else near_tie(pr, bt, st, first_diff),
         })
         print(json.dumps(rows[-1]), flush = True)
         print("  base text:", repr(tokenizer.decode(torch.tensor(bt[:60]))), flush = True)
