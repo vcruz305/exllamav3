@@ -72,6 +72,10 @@ with torch.inference_mode():
                 if not bool(torch.isfinite(yg).all()):
                     rec["nonfinite"] += 1
                 rel = float((yg - yr).norm() / (yr.norm() + 1e-9))
+                if rel > rec["max_rel"]:
+                    rec["worst_case"] = {"bsz": bsz, "rep": rep, "ref_norm": round(float(yr.norm()), 3),
+                                         "max_abs_diff": round(float((yg - yr).abs().max()), 4),
+                                         "ref_max_abs": round(float(yr.abs().max()), 3)}
                 rec["max_rel"] = max(rec["max_rel"], rel)
         rec["max_rel"] = float(f"{rec['max_rel']:.3e}")
         worst = max(worst, rec["max_rel"])
