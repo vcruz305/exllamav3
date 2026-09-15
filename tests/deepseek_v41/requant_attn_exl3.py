@@ -135,6 +135,12 @@ def main():
         cap["on"] = False
         print(f"chunk {ci} layers {layers[0]}-{layers[-1]}: {len(cap['H'])} Hessians from {len(rows)} rows in {time.time() - t1:.0f}s", flush = True)
 
+        # The generator runs under inference mode, so the captured tensors are inference tensors; the
+        # quantizer updates H in place, which torch only allows on normal tensors
+        for H_data in cap["H"].values():
+            H_data["H"] = H_data["H"].clone()
+            H_data["inf_nan"] = H_data["inf_nan"].clone()
+
         tensors = {}
         for lin in chunk_lins:
             H_data = cap["H"].get(lin.qmap)
