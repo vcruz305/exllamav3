@@ -124,11 +124,14 @@ def main():
         for ri, row in enumerate(rows):
             ids = row.view(1, -1).clone()
             ids[0, 0] = 1000 + ci * 97 + ri   # unique first token: no prefix reuse between passes
+            tr = time.time()
             generator.enqueue(Job(input_ids = ids, max_new_tokens = 1, stop_conditions = [], sampler = GreedySampler()))
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     if r.get("stage") == "error":
                         raise RuntimeError(str({k: v for k, v in r.items() if not torch.is_tensor(v) and k != "job"}))
+            avail = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable")) / 1048576
+            print(f"  chunk {ci} row {ri + 1}/{len(rows)}: {time.time() - tr:.1f}s, MemAvailable {avail:.1f} GiB", flush = True)
         cap["on"] = False
         print(f"chunk {ci} layers {layers[0]}-{layers[-1]}: {len(cap['H'])} Hessians from {len(rows)} rows in {time.time() - t1:.0f}s", flush = True)
 
@@ -142,6 +145,9 @@ def main():
                 "apply_out_scales": None, "debug_dir": os.path.join(args.out, "debug"), "mul1": True,
             }
             t2 = time.time()
+            if getattr(lin.inner, "lazy", False):
+                # EXL3_FP8_LAZY=1: store the dequantized weight once, contiguous, for the quantizer
+                lin.inner.weight = lin.inner.weight.contiguous()
             proxy = lin.convert_exl3(H_data, qa)
             for k, v in lin.get_tensors().items():
                 tensors[k] = v.detach().to("cpu").contiguous()
