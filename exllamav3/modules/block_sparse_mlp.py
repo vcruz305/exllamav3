@@ -232,6 +232,9 @@ def _launch_grouped_exl3_moe(
     token_sorted_by_group = token_sorted[order]
     weight_sorted_by_group = weight_sorted[order]
 
+    # Determine number of experts from flat_expert_local range
+    n_exp = int(flat_expert_local.max()) + 1
+
     # Build full expert count (all experts, but count non-group as zero)
     full_counts = torch.zeros(n_exp + 1, dtype=torch.long, device=key.device)
     for e in range(n_exp):
