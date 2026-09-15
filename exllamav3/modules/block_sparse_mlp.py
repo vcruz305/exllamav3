@@ -45,9 +45,10 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # launch, so experts are grouped by quantization and the kernel launches once per group; EXL3_MOE_GROUPED=1
 # (opt-in: no measured gain over the per-expert loop on DeepSeek-V4.1 1.59bpw) enables it. EXL3_MOE_GROUPED_DEBUG=1 prints the launch count at exit
 EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") != "0"
-# Mixed-K layers at batch 1: the per-expert loop in one C++ call (BC_MixedExpertsBsz1, identical
-# kernels and accumulation order); EXL3_MOE_MIXED_BSZ1=0 keeps the Python loop
-EXL3_MOE_MIXED_BSZ1 = os.environ.get("EXL3_MOE_MIXED_BSZ1", "1") != "0"
+# Mixed-K layers at batch 1: the per-expert loop in one C++ call (BC_MixedExpertsBsz1, same kernels
+# and accumulation order). Opt-in with EXL3_MOE_MIXED_BSZ1=1: measured ~5% warm decode on
+# DeepSeek-V4.1 (GB10), but greedy output was not reproducible run to run while the Python loop was
+EXL3_MOE_MIXED_BSZ1 = os.environ.get("EXL3_MOE_MIXED_BSZ1", "0") != "0"
 _GROUPED_STATS = {"launches": 0}
 if os.environ.get("EXL3_MOE_GROUPED_DEBUG", "0") != "0":
     import atexit
