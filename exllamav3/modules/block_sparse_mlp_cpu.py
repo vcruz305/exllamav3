@@ -107,8 +107,13 @@ def _uniform_proj_dims(dims_of, mlp, first, gd, ud, dd):
         else:
             # Mixed K: store per-expert list
             result[name] = dims_list
-            print(f" -- Mixed-K experts in {mlp.key}, projection {name}: "
-                  f"K values {[d[2] for d in dims_list]}")
+    if any(isinstance(result.get(name), list) for name in ("g", "u", "d")) and os.environ.get("EXL3_MOE_STREAM_DEBUG"):
+        # Report mixed K once per layer (debug-only)
+        k_set = set()
+        for name in ("g", "u", "d"):
+            if isinstance(result.get(name), list):
+                k_set.update(d[2] for d in result[name])
+        print(f" -- Mixed-K in {mlp.key}: K in {sorted(k_set)}")
     return result
 
 
