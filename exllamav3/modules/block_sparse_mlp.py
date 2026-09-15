@@ -42,9 +42,9 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # Mixed-K layers (experts quantized with different K or codebooks): the fused kernel takes one K per
-# launch, so experts are grouped by quantization and the kernel launches once per group; EXL3_MOE_GROUPED=0
-# keeps such layers on the per-expert loop. EXL3_MOE_GROUPED_DEBUG=1 prints the launch count at exit
-EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "1") != "0"
+# launch, so experts are grouped by quantization and the kernel launches once per group; EXL3_MOE_GROUPED=1
+# (opt-in: no measured gain over the per-expert loop on DeepSeek-V4.1 1.59bpw) enables it. EXL3_MOE_GROUPED_DEBUG=1 prints the launch count at exit
+EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") != "0"
 _GROUPED_STATS = {"launches": 0}
 if os.environ.get("EXL3_MOE_GROUPED_DEBUG", "0") != "0":
     import atexit
