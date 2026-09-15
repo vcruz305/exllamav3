@@ -956,7 +956,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.exl3_k_dispatch = None
         self.exl3_grouped_temps = None
         if (self.is_quantized and not self.uniform_expert_q and EXL3_MOE_GROUPED and
-                self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2"):
+                (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2")):
             try:
                 self.exl3_k_groups, self.exl3_k_dispatch = build_exl3_grouped_fused_state(
                     self, self.gates if self.gated else [None] * len(self.ups), self.ups, self.downs
