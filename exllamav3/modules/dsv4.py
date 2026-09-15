@@ -1566,6 +1566,13 @@ class DSV4Attention(Module):
             key = (id(rsl), rs.slot)
             bcd = self._bc_dsa.get(key)
             if bcd is None:
+                # The graph needs the lazily built fans (wo_a multilinear, compressor/indexer BC
+                # objects); the first call is often a short prefill that has not built them yet,
+                # and a decline is cached for the slot
+                if not self.x_fan_ready:
+                    self._build_x_fan()
+                if not self.woa_multi_ready and self.device is not None:
+                    self._build_woa_multi()
                 bcd = build_bc_dsa(self, rs, rsl, kl)
                 self._bc_dsa[key] = bcd if bcd is not None else False
             if bcd:

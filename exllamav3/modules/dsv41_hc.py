@@ -25,6 +25,17 @@ class DSV41HyperConnection(HyperConnection):
     def mix_full(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """streams (b, s, H, D) -> (pre (b,s,H), post (b,s,H), comb (b,s,H,H)), fp32."""
         hc = self.hc_mult
+        b, s, H, D = streams.shape
+        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+            # post and comb (with the Sinkhorn iterations) from the fused mixer, two launches instead
+            # of ~130; its collapsed output uses this site's pre, which V4.1 applies at the next site,
+            # so it is ignored here. post/comb live in shared static workspaces and are consumed by
+            # apply_() before the next site mixes
+            post, comb, _ = self.mix(streams, {})
+            xf = streams.view(b, s, H * D)
+            pre_w = F.linear(xf, self.fn[:hc]) * torch.rsqrt(xf.square().mean(-1, keepdim = True) + self.rms_eps)
+            pre = torch.sigmoid(pre_w * self.scale[0] + self.base[:hc]) + self.hc_eps
+            return pre, post, comb
         xf = streams.flatten(2).float()
         mix = F.linear(xf, self.fn) * torch.rsqrt(xf.square().mean(-1, keepdim = True) + self.rms_eps)
         pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim = -1)
