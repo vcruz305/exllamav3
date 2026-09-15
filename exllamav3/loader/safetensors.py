@@ -441,6 +441,9 @@ class SafetensorsCollection:
         copy_re = os.environ.get("EXL3_ATS_COPY")
         self.ats_copy_re = re.compile(copy_re) if copy_re else None
         self.ats_copied_policy = 0
+        # EXL3_ATS_HUGEPAGE=1: advise huge pages on the weight mappings, so page cache held in large
+        # folios (ext4 on recent kernels) is mapped with 2 MB translations instead of 4 KB ones
+        self.ats_hugepage = os.environ.get("EXL3_ATS_HUGEPAGE", "0") != "0"
 
 
     def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
@@ -452,6 +455,8 @@ class SafetensorsCollection:
             # defeats the point of keeping weights in reclaimable page cache
             with open(filename, "rb") as f:
                 mm = mmap.mmap(f.fileno(), 0, flags = mmap.MAP_SHARED, prot = mmap.PROT_READ)
+                if self.ats_hugepage and hasattr(mmap, "MADV_HUGEPAGE"):
+                    mm.madvise(mmap.MADV_HUGEPAGE)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 base = self.ats_maps[filename] = torch.frombuffer(mm, dtype = torch.uint8)
