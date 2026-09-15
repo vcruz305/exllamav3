@@ -438,12 +438,17 @@ class SafetensorsCollection:
 
 
     def _ats_alias(self, filename: str, file_offset: int, bytesize: int, dtype: torch.dtype, shape, device) -> torch.Tensor:
-        import mmap
+        import mmap, warnings
         base = self.ats_maps.get(filename)
         if base is None:
+            # Shared read-only mapping: a private one turns every page the GPU faults in into an
+            # anonymous copy-on-write page (measured 18.8 GiB after 200 decode tokens), which
+            # defeats the point of keeping weights in reclaimable page cache
             with open(filename, "rb") as f:
-                mm = mmap.mmap(f.fileno(), 0, flags = mmap.MAP_PRIVATE, prot = mmap.PROT_READ | mmap.PROT_WRITE)
-            base = self.ats_maps[filename] = torch.frombuffer(mm, dtype = torch.uint8)
+                mm = mmap.mmap(f.fileno(), 0, flags = mmap.MAP_SHARED, prot = mmap.PROT_READ)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                base = self.ats_maps[filename] = torch.frombuffer(mm, dtype = torch.uint8)
         t = base[file_offset : file_offset + bytesize].view(dtype).view(tuple(shape))
         device = torch.device(device)
         index = device.index if device.index is not None else torch.cuda.current_device()
