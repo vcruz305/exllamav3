@@ -45,6 +45,9 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # launch, so experts are grouped by quantization and the kernel launches once per group; EXL3_MOE_GROUPED=1
 # (opt-in: no measured gain over the per-expert loop on DeepSeek-V4.1 1.59bpw) enables it. EXL3_MOE_GROUPED_DEBUG=1 prints the launch count at exit
 EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") != "0"
+# Mixed-K layers at batch 1: the per-expert loop in one C++ call (BC_MixedExpertsBsz1, identical
+# kernels and accumulation order); EXL3_MOE_MIXED_BSZ1=0 keeps the Python loop
+EXL3_MOE_MIXED_BSZ1 = os.environ.get("EXL3_MOE_MIXED_BSZ1", "1") != "0"
 _GROUPED_STATS = {"launches": 0}
 if os.environ.get("EXL3_MOE_GROUPED_DEBUG", "0") != "0":
     import atexit
@@ -510,6 +513,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.register_submodule(self.routed_post_norm)
 
         self.bc = None
+        self.bc_mixed_bsz1 = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
@@ -664,6 +668,38 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             out_trim = out_trim,
         )
         self.experts_cfg = cfg
+
+        # Batch-1 mixed-K decode (BC_MixedExpertsBsz1): only where the Python per-expert loop is a
+        # plain BC GEMV chain (no biases, LoRA, scales, softcap or padding), with its buffer dtypes
+        self.bc_mixed_bsz1 = None
+        mixed_lins = self.gates + self.ups + self.downs
+        if (
+            EXL3_MOE_MIXED_BSZ1 and self.is_quantized and not self.uniform_expert_q and self.gated and
+            self.activation_fn in ("silu", "gelu", "swiglu_oai") and
+            not self.config.infer_params.no_reconstruct and
+            all(
+                l.inner.bias is None and l.inner.bc is not None and not l.lora_a_tensors and
+                l.pre_scale == 1.0 and l.post_scale == 1.0 and l.softcap == 0.0 and
+                l.in_features == l.in_features_unpadded and l.out_features == l.out_features_unpadded
+                for l in mixed_lins
+            ) and
+            len({l.inner.default_out_dtype for l in self.gates}) == 1 and
+            len({l.inner.default_out_dtype for l in self.ups}) == 1 and
+            all(l.inner.default_out_dtype == torch.float for l in self.downs)
+        ):
+            I_g, I_u = self.gates[0].out_features, self.ups[0].out_features
+            ig = torch.empty((1, I_g), dtype = self.gates[0].inner.default_out_dtype, device = device)
+            iu = torch.empty((1, I_u), dtype = self.ups[0].inner.default_out_dtype, device = device)
+            ia = iu if self.interm_dtype == torch.half else torch.empty((1, I_u), dtype = torch.half, device = device)
+            od = torch.empty((1, self.downs[0].out_features), dtype = torch.float, device = device)
+            self.bc_mixed_bsz1 = ext.BC_MixedExpertsBsz1(
+                [l.inner.bc for l in self.gates],
+                [l.inner.bc for l in self.ups],
+                [l.inner.bc for l in self.downs],
+                ig, iu, ia, od,
+                {"silu": 0, "gelu": 1, "swiglu_oai": 2}[self.activation_fn],
+                self.act_limit,
+            )
 
         if (self.support_quant_paths or self.support_bc_bsz1) \
                 and not self.config.infer_params.no_reconstruct:
@@ -1025,6 +1061,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def unload(self):
         self.cpu_unload()
         self.bc = None
+        self.bc_mixed_bsz1 = None
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1121,6 +1158,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # Batch-1 mixed-K decode: the dense per-expert loop below as one C++ call. A fresh output per
+        # call: the shared expert is added into it in place
+        elif (
+            bsz == 1 and self.bc_mixed_bsz1 is not None and y.dtype == torch.half and y.is_contiguous() and
+            self.num_local_experts in (None, self.num_experts) and self.routing_device is None and
+            cpu_partial is None and cpu_pending is None and self.latent_in is None and
+            not any(k in params for k in ("capture", "quant_preserve", "ovr", "reconstruct"))
+        ):
+            final_hidden_states = torch.empty((1, self.expert_size), dtype = torch.float, device = y.device)
+            self.bc_mixed_bsz1.run(y, selected_experts, routing_weights, final_hidden_states)
+            final_hidden_states = final_hidden_states.view(eshape)
 
         # Torch/C++/fused path
         elif (
