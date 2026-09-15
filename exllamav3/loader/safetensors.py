@@ -427,9 +427,10 @@ class SafetensorsCollection:
         self.deferred_arena = True
 
         # EXL3_ATS_MMAP=1: on ATS systems (Grace/GB10, GPU shares the process page tables) CUDA
-        # tensors of at least EXL3_ATS_MMAP_MIN bytes that need no conversion alias a private
-        # mapping of the file instead of being copied. Weights then live in reclaimable page
-        # cache rather than pinned allocations, so a model can approach total system memory
+        # tensors of at least EXL3_ATS_MMAP_MIN bytes that need no conversion alias a shared
+        # read-only mapping of the file instead of being copied. Weights then live in reclaimable
+        # page cache rather than pinned allocations, so a model can approach total system memory
+        # (doc/gb10_ats_loading.md)
         self.ats_mmap = os.environ.get("EXL3_ATS_MMAP", "0") != "0"
         self.ats_min_bytes = int(os.environ.get("EXL3_ATS_MMAP_MIN", str(1 << 20)))
         self.ats_align = int(os.environ.get("EXL3_ATS_MMAP_ALIGN", "16"))
