@@ -275,10 +275,14 @@ class DeepseekV41Model(Model):
         ]
         self.logit_layer_idx = len(self.modules) - 1
         self.caps.update({"recurrent_states": True, "default_recurrent_checkpoint_interval": 2048})
+        from ..cache.dsa import DSV4State
+        self.recurrent_state_cls = DSV4State
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        from ..cache.recurrent_util import prepare_for_recurrence
         params["input_ids"] = input_ids
         params.pop(PRE_MIX_KEY, None)
+        prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
