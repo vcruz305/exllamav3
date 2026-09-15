@@ -47,7 +47,9 @@ def needs_rewrite(header: dict, data0: int, align: int, min_bytes: int, skip: li
     return False
 
 
-def plan_layout(header: dict, align: int):
+def plan_layout(header: dict, align: int, tag: str):
+    # Pad names carry the shard tag: loaders that merge shard headers would otherwise see the
+    # same pad key in every shard
     new = {}
     if "__metadata__" in header:
         new["__metadata__"] = header["__metadata__"]
@@ -58,7 +60,7 @@ def plan_layout(header: dict, align: int):
         b, e = v["data_offsets"]
         at = -(-pos // align) * align
         if at > pos:
-            new[f"{PAD_PREFIX}{pads}"] = {"dtype": "U8", "shape": [at - pos], "data_offsets": [pos, at]}
+            new[f"{PAD_PREFIX}{tag}.{pads}"] = {"dtype": "U8", "shape": [at - pos], "data_offsets": [pos, at]}
             pads += 1
         new[k] = {"dtype": v["dtype"], "shape": v["shape"], "data_offsets": [at, at + e - b]}
         plan.append((k, b, at, e - b))
@@ -156,7 +158,7 @@ def process_shard(src_path: str, dst_path: str, args) -> str:
     if not needs_rewrite(header, data0, args.align, args.min_bytes, args.skip):
         os.symlink(os.path.realpath(src_path), dst_path)
         return f"{name}: already on grid, linked"
-    blob, plan, end, pads = plan_layout(header, args.align)
+    blob, plan, end, pads = plan_layout(header, args.align, name.removesuffix(".safetensors"))
     tmp = dst_path + ".tmp"
     t0 = time.time()
     sfd = os.open(src_path, os.O_RDONLY | O_BINARY)

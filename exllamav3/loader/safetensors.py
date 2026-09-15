@@ -475,7 +475,8 @@ class SafetensorsCollection:
             header = read_header(st_file, self.tensor_name_fixes)
             self.file_headers[st_file] = header
             for key in header.keys():
-                if key in ["__metadata__", "_header_offset"]:
+                # __align_pad__.* are gap fillers written by util/align_safetensors.py, never weights
+                if key in ["__metadata__", "_header_offset"] or key.startswith("__align_pad__."):
                     continue
                 for k, v in self.tensor_name_fixes.items():
                     if key.endswith(k):
