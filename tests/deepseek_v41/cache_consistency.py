@@ -51,16 +51,21 @@ def main():
         S, N = ref_tokens.shape
         print(f"Reference: {S} sequences, {N} tokens each")
 
-        # Load model
+        # Load model - BEFORE Cache (per test_dsv4_cached.py pattern)
         t0 = time.time()
         cfg = Config.from_directory(args.model)
         model = Model.from_config(cfg)
         device = torch.device("cuda:0")
-        model.load(device, progressbar=False, verbose=False)
-        print(f"Model loaded in {time.time() - t0:.1f}s")
+        print(f"Model from_config done in {time.time() - t0:.1f}s")
 
-        # Create cache and state (after model.load to ensure device placement)
+        # Create cache BEFORE model.load (same model object)
         cache = Cache(model, max_num_tokens=8192, max_batch_size=1)
+
+        # Now load model to device
+        t0_load = time.time()
+        model.load(device, progressbar=False, verbose=False)
+        print(f"Model loaded in {time.time() - t0_load:.1f}s")
+
         state = cache.get_new_state()
         ids = ref_tokens[args.seq_idx:args.seq_idx+1].to(device)
 
@@ -216,8 +221,11 @@ def main():
 
     except Exception as e:
         import traceback
-        result["error"] = traceback.format_exc()[-500:]
-        traceback.print_exc()
+        tb_str = traceback.format_exc()
+        print("\n=== FULL TRACEBACK ===")
+        print(tb_str)
+        print("=== END TRACEBACK ===\n")
+        result["error"] = tb_str[-1000:]
 
     if args.output:
         with open(args.output, "w") as f:
