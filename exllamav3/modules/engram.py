@@ -190,6 +190,7 @@ class EngramTable:
     """fp8 rows + e8m0 scales of one engram layer, gathered from disk on demand."""
 
     def __init__(self, stc, key: str, head_dim: int, threads: int = 32):
+        self.stc = stc
         self.weight = stc.get_tensor_handle(f"{key}.weight")
         self.scale = stc.get_tensor_handle(f"{key}.scale")
         assert self.weight.dtype == torch.float8_e4m3fn and list(self.weight.row_shape) == [head_dim], \
@@ -223,6 +224,10 @@ class EngramTable:
                 except (OSError, RuntimeError, KeyError) as e:
                     raise RuntimeError(f"EXL3_ENGRAM_ROWS={rows_file} unreadable for layer {layer_id}") from e
 
+        # GPU-direct ATS aliases per device (lazy-initialized)
+        self.ats_weight_alias = {}
+        self.ats_scale_alias = {}
+
     def _gather(self, handle, ids: list, nbytes: int) -> bytes:
         fd = handle._ensure_open()
         base = handle.abs_offset
@@ -235,10 +240,52 @@ class EngramTable:
             return b"".join(one(r) for r in ids)
         return b"".join(self.pool.map(one, ids, chunksize = 8))
 
+    def _get_ats_aliases(self, device):
+        """Create GPU-direct ATS aliases for weight and scale tables on first use per device."""
+        device_obj = torch.device(device)
+        device_key = device_obj.index if device_obj.index is not None else torch.cuda.current_device()
+
+        if device_key not in self.ats_weight_alias:
+            # Alias weight table (fp8 values viewed as uint8)
+            w_filename = self.weight.filename
+            w_offset = self.weight.abs_offset
+            w_bytesize = self.weight.num_rows * self.weight.row_bytes
+            w_shape = [self.weight.num_rows] + self.weight.row_shape
+            self.ats_weight_alias[device_key] = self.stc._ats_alias(
+                w_filename, w_offset, w_bytesize, torch.uint8, w_shape, device
+            )
+
+            # Alias scale table (uint8)
+            s_filename = self.scale.filename
+            s_offset = self.scale.abs_offset
+            s_bytesize = self.scale.num_rows * self.scale.row_bytes
+            s_shape = [self.scale.num_rows] + self.scale.row_shape
+            self.ats_scale_alias[device_key] = self.stc._ats_alias(
+                s_filename, s_offset, s_bytesize, torch.uint8, s_shape, device
+            )
+
+        return self.ats_weight_alias[device_key], self.ats_scale_alias[device_key]
+
     def rows(self, hash_ids: torch.Tensor, device) -> torch.Tensor:
         """hash_ids: any shape of row ids -> (*shape, head_dim) fp32 dequantized rows on device."""
         flat = hash_ids.reshape(-1).cpu().to(torch.int64)
         uniq, inverse = torch.unique(flat, return_inverse = True)
+
+        # GPU-direct ATS path: alias file-mapped tables and gather on GPU
+        use_ats = (self.stc.ats_mmap and self.rows_file_ids is None and
+                   os.environ.get("EXL3_ENGRAM_ATS", "1") != "0")
+
+        if use_ats:
+            try:
+                w_alias, s_alias = self._get_ats_aliases(device)
+                ids = uniq.reshape(-1).to(device, torch.int64)
+                w_u8 = w_alias.index_select(0, ids).view(torch.float8_e4m3fn).float()
+                s = s_alias.index_select(0, ids).float()
+                vals = (w_u8.view(len(ids), -1, self.block) * torch.exp2(s - 127.0).unsqueeze(-1)).view(len(ids), self.head_dim)
+                return vals[inverse.to(device)].view(*hash_ids.shape, self.head_dim)
+            except Exception:
+                # Fall back to disk path if ATS aliasing fails
+                use_ats = False
 
         # Hybrid gather: memory hits from rows file, disk fallback for missed ids
         if self.rows_file_ids is not None:
@@ -267,7 +314,7 @@ class EngramTable:
                 miss_vals = miss_vals.view(len(miss_ids), self.head_dim)
 
             # Assemble results in uniq order
-            vals = torch.empty(len(uniq), self.head_dim, device=device, dtype=torch.float32)
+            vals = torch.empty(len(uniq), self.head_dim, device = device, dtype = torch.float32)
             if hit.any():
                 vals[hit] = hit_vals
             if miss_mask.any():
