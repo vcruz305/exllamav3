@@ -30,7 +30,8 @@ from exllamav3.modules.linear import Linear
 # Target all "mtp." Linears with quant_type "fp16", multiples of 16
 TARGET = re.compile(r"^mtp\.")
 # Exclude routers, small heads, embeddings, norms
-EXCLUDE = re.compile(r"(markov|confidence|embed|norm|gate\.weight)")
+# Routers (ffn.gate: routing scores read by the MoE kernels), small heads, embeddings and norms stay as loaded
+EXCLUDE = re.compile(r"(markov|confidence|embed|norm|\.gate$)")
 
 
 def main():

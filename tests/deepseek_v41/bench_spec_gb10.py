@@ -125,20 +125,20 @@ def run(name, prompt, n, generator):
                 continue
             if r.get("text"):
                 text.append(r["text"])
+            # Draft counters are running totals for the job (final values ride on the eos result)
+            if "accepted_draft_tokens" in r:
+                accepted_tokens = r["accepted_draft_tokens"]
+                rejected_tokens = r.get("rejected_draft_tokens", 0)
             t = r.get("token_ids")
             if t is None or not t.numel():
                 continue
-            # Count tokens emitted in this result
-            n_tokens = t.numel()
-            total_tokens += n_tokens
-            if DRAFT:
-                accepted_tokens += r.get("accepted_draft_tokens", 0)
-                rejected_tokens += r.get("rejected_draft_tokens", 0)
             now = time.perf_counter()
             if first is None:
                 c0 = io()
                 first = last = time.perf_counter()
                 continue
+            # Tokens streamed after the first result, over the time since it
+            total_tokens += t.numel()
             steps.append(now - last)
             last = now
     c1 = io()
@@ -157,16 +157,15 @@ def run(name, prompt, n, generator):
     print(json.dumps(rep), flush = True)
     return rep
 
-base_gen = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
-fresh = [run(f"p{i:02d}", p, TOKENS, base_gen) for i, p in enumerate(PROMPTS)]
-
-spec_gen = None
+# One generator per run: a plain pass ahead of the speculative pass would warm the page cache and
+# bias the comparison, so the baseline is a separate DRAFT=0 run
 if DRAFT:
-    spec_gen = Generator(model = model, cache = cache, tokenizer = tokenizer, draft_model = draft,
-                         draft_cache = draft_cache, max_chunk_size = 2048)
-    fresh = [run(f"p{i:02d}", p, TOKENS, spec_gen) for i, p in enumerate(PROMPTS)]
-
-again = [run(f"p{i:02d}_again", p, TOKENS, base_gen if not DRAFT else spec_gen, ) for i, p in enumerate(PROMPTS[:4])]
+    gen = Generator(model = model, cache = cache, tokenizer = tokenizer, draft_model = draft,
+                    draft_cache = draft_cache, max_chunk_size = 2048)
+else:
+    gen = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
+fresh = [run(f"p{i:02d}", p, TOKENS, gen) for i, p in enumerate(PROMPTS)]
+again = [run(f"p{i:02d}_again", p, TOKENS, gen) for i, p in enumerate(PROMPTS[:4])]
 tail = [r["decode_tps"] for r in fresh[4:]]
 summary = {
     "draft": DRAFT, "lazy": LAZY, "prewarm": PREWARM,
