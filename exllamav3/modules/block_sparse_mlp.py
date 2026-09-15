@@ -41,8 +41,14 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
-# Grouped mixed-K dispatch for mixed-K expert layers; EXL3_MOE_GROUPED=0 falls back to dense per-expert
+# Mixed-K layers (experts quantized with different K or codebooks): the fused kernel takes one K per
+# launch, so experts are grouped by quantization and the kernel launches once per group; EXL3_MOE_GROUPED=0
+# keeps such layers on the per-expert loop. EXL3_MOE_GROUPED_DEBUG=1 prints the launch count at exit
 EXL3_MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "1") != "0"
+_GROUPED_STATS = {"launches": 0}
+if os.environ.get("EXL3_MOE_GROUPED_DEBUG", "0") != "0":
+    import atexit
+    atexit.register(lambda: print(f" -- grouped MoE: {_GROUPED_STATS['launches']} fused group launches"))
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -53,24 +59,87 @@ class FusedBuffers:
     temp_intermediate_u: torch.Tensor
 
 
-@dataclass
-class ExpertGroup:
-    """Group of experts with the same physical (gate, up, down) K quantization."""
-    k_triple: tuple[int, int, int]  # (K_gate, K_up, K_down)
-    members: list[int]  # Expert indices in this group
-    base: int  # Base slot index for this group
-    local_to_group: torch.Tensor  # Maps expert id to position within group (n_experts+1)
-    ptrs: dict[str, torch.Tensor]  # Pointer tables for gate/up/down trellis/suh/svh
-    cb_flags: tuple[bool, bool, bool, bool, bool, bool]  # (mcg_gate, mul1_gate, mcg_up, mul1_up, mcg_down, mul1_down)
+def _expert_quant_key(linear):
+    inner = linear.inner
+    return int(inner.K), bool(inner.mcg), bool(inner.mul1)
 
 
-@dataclass
-class GroupedDispatch:
-    """Grouped expert dispatch state for mixed-K layers."""
-    flat_key: torch.Tensor  # Maps expert id to (group, member) slot
-    slot_group: torch.Tensor  # Group index for each slot
-    slot_valid: torch.Tensor  # Whether each slot is valid
-    total: int  # Total slots across all groups
+def build_grouped_state(gates, ups, downs, n_exp, device):
+    """Grouped fused dispatch state for a mixed-K layer. Experts are grouped by the (K, mcg, mul1)
+    of their gate/up/down projections; each group owns pointer tables over its members. Every
+    local expert id maps to a flat (group, member) slot, with one unused sentinel slot after each
+    group and one slot past the end for routes another path owns, so a single argsort lays every
+    group's routes out contiguously. Gateless layers pass ups as gates (the kernel skips the gate)."""
+    by_key = {}
+    for e in range(n_exp):
+        # Only experts whose tensors live on this device join a group (CPU-resident experts of a
+        # split layer keep host tensors); the rest map past every group and are never launched here
+        if not all(l[e].inner.trellis.device == torch.device(device) for l in (gates, ups, downs)):
+            continue
+        key = (_expert_quant_key(gates[e]), _expert_quant_key(ups[e]), _expert_quant_key(downs[e]))
+        by_key.setdefault(key, []).append(e)
+    flat_key = torch.full((n_exp + 1,), -1, dtype = torch.long, device = device)
+    slot_group, slot_valid, groups = [], [], []
+    base = 0
+    for g, (key, members) in enumerate(sorted(by_key.items())):
+        ids = torch.tensor(members, dtype = torch.long, device = device)
+        flat_key[ids] = torch.arange(base, base + len(members), dtype = torch.long, device = device)
+        slot_group += [g] * (len(members) + 1)
+        slot_valid += [1] * len(members) + [0]
+        ptrs = {}
+        for name, lins in (("g", gates), ("u", ups), ("d", downs)):
+            for attr in ("trellis", "suh", "svh"):
+                ptrs[f"{name}_{attr}"] = torch.tensor(
+                    [getattr(lins[e].inner, attr).data_ptr() for e in members], dtype = torch.long, device = device)
+        groups.append((key, base, len(members), ptrs))
+        base += len(members) + 1
+    flat_key[flat_key < 0] = base
+    return {
+        "groups": groups,
+        "flat_key": flat_key,
+        "total": base,
+        "slot_group": torch.tensor(slot_group, dtype = torch.long, device = device),
+        "slot_valid": torch.tensor(slot_valid, dtype = torch.long, device = device),
+    }
+
+
+def launch_grouped_moe(module, y, out, flat_expert_local, flat_token, flat_weight, count_hi):
+    """One exl3_moe launch per quantization group, scatter-adding weighted rows into `out`. Each
+    group's routes are a contiguous slice of one sort, read from offset 0 with the group's own
+    counts (members + sentinel). Experts with more than count_hi routes are skipped by the kernel
+    and left to the caller's per-expert path."""
+    st = module.grouped_state
+    temps = module.grouped_buffers
+    key = st["flat_key"].index_select(0, flat_expert_local)
+    order = key.argsort()
+    total = st["total"]
+    counts = torch.bincount(key, minlength = total + 1)
+    slots = counts[:total] * st["slot_valid"]
+    n_groups = len(st["groups"])
+    routes = torch.zeros(n_groups, dtype = torch.long, device = y.device).scatter_add_(0, st["slot_group"], slots)
+    active = torch.zeros(n_groups, dtype = torch.long, device = y.device).scatter_add_(
+        0, st["slot_group"], ((slots > 0) & (slots <= count_hi)).long())
+    routes_host, active_host = torch.stack([routes, active]).tolist()
+    token_sorted = flat_token[order]
+    weight_sorted = flat_weight[order]
+    start = 0
+    for ((kg, ku, kd), base, n, p), n_routes, n_active in zip(st["groups"], routes_host, active_host):
+        if n_active:
+            ext.exl3_moe(
+                y, out, counts[base : base + n + 1],
+                token_sorted[start : start + n_routes], weight_sorted[start : start + n_routes],
+                temps.temp_state_g, temps.temp_state_u, temps.temp_intermediate_g, temps.temp_intermediate_u,
+                module.activation_fn_idx,
+                kg[0], ku[0], kd[0],
+                p["g_trellis"], p["g_suh"], p["g_svh"],
+                p["u_trellis"], p["u_suh"], p["u_svh"],
+                p["d_trellis"], p["d_suh"], p["d_svh"],
+                kg[1], kg[2], ku[1], ku[2], kd[1], kd[2],
+                module.act_limit, n_active, None, None, 1, count_hi, 16,
+            )
+            _GROUPED_STATS["launches"] += 1
+        start += n_routes
+
 
 
 @dataclass
@@ -84,246 +153,6 @@ class ExpertsCFG:
     min_expert: int
     max_expert: int
     out_trim: torch.Tensor | None = None
-
-
-def _exl3_k_triple_from_linear(gate, up, down):
-    """Extract physical (gate, up, down) K from LinearEXL3 modules."""
-    triple = []
-    for proj, name in [(gate, "gate"), (up, "up"), (down, "down")]:
-        if proj is None:
-            triple.append(0)
-            continue
-        inner = getattr(proj, "inner", proj)
-        trellis = getattr(inner, "trellis", None)
-        if trellis is not None and hasattr(trellis, "shape") and len(trellis.shape) == 3:
-            words = int(trellis.shape[-1])
-            if words > 0 and words % 16 == 0:
-                triple.append(words // 16)
-            else:
-                raise RuntimeError(f"EXL3 {name} trellis shape {trellis.shape} yields invalid K")
-        else:
-            raise RuntimeError(f"EXL3 {name} has no valid trellis tensor")
-    return tuple(triple)
-
-
-def build_exl3_grouped_fused_state(layer, gates, ups, downs):
-    """Build grouped dispatch state for mixed-K experts.
-
-    Experts are grouped by their physical (gate, up, down) K. Each group owns
-    pointer tables over its members and a local->group index. One argsort of
-    routed ids by flat_key lays every group's routes out contiguously, so each
-    group launches its own exl3_moe kernel.
-    """
-    device = ups[0].device
-    n_exp = len(ups)
-
-    # Group experts by K triple
-    by_triple = {}
-    for e in range(n_exp):
-        gate_e = gates[e] if gates else ups[e]
-        triple = _exl3_k_triple_from_linear(gate_e, ups[e], downs[e])
-
-        # Validate K is within supported range
-        if not all(1 <= k <= 8 for k in triple):
-            raise RuntimeError(f"EXL3 expert {e} physical K {triple} is outside K1-K8")
-
-        if triple not in by_triple:
-            by_triple[triple] = []
-        by_triple[triple].append(e)
-
-    groups = []
-    flat_key = torch.empty(n_exp + 1, dtype=torch.long, device=device)
-    slot_group_list = []
-    slot_valid_list = []
-    base = 0
-
-    # Build flat (group, member) slots
-    for g, (triple, members) in enumerate(sorted(by_triple.items())):
-        member_ids = torch.tensor(members, dtype=torch.long, device=device)
-        local_to_group = torch.full((n_exp + 1,), len(members), dtype=torch.long, device=device)
-        local_to_group[member_ids] = torch.arange(len(members), dtype=torch.long, device=device)
-
-        flat_key[member_ids] = torch.arange(base, base + len(members), dtype=torch.long, device=device)
-        slot_group_list += [g] * (len(members) + 1)
-        slot_valid_list += [1] * len(members) + [0]
-
-        # Collect pointers for this group
-        ptrs = {}
-        for which in ("gate", "up", "down"):
-            projs = [gates[e] if which == "gate" else (ups[e] if which == "up" else downs[e]) for e in members]
-            for attr in ("trellis", "suh", "svh"):
-                key = f"{which}_{attr}"
-                ptrs[key] = torch.tensor(
-                    [int(getattr(getattr(p, "inner", p), attr).data_ptr()) for p in projs],
-                    dtype=torch.int64,
-                    device=device,
-                )
-
-        # Extract codebook flags from first member (all members in a group have same codebook)
-        if members:
-            first_gate = gates[members[0]] if gates else ups[members[0]]
-            first_up = ups[members[0]]
-            first_down = downs[members[0]]
-            cb_flags = (
-                bool(getattr(getattr(first_gate, "inner", first_gate), "mcg", False)),
-                bool(getattr(getattr(first_gate, "inner", first_gate), "mul1", False)),
-                bool(getattr(getattr(first_up, "inner", first_up), "mcg", False)),
-                bool(getattr(getattr(first_up, "inner", first_up), "mul1", False)),
-                bool(getattr(getattr(first_down, "inner", first_down), "mcg", False)),
-                bool(getattr(getattr(first_down, "inner", first_down), "mul1", False)),
-            )
-        else:
-            cb_flags = (False, False, False, False, False, False)
-
-        groups.append(ExpertGroup(
-            k_triple=triple,
-            members=members,
-            base=base,
-            local_to_group=local_to_group,
-            ptrs=ptrs,
-            cb_flags=cb_flags
-        ))
-        base += len(members) + 1
-
-    # Sentinel for routes not in any group (non-local or fat)
-    flat_key[n_exp] = base
-
-    return groups, GroupedDispatch(
-        flat_key=flat_key,
-        slot_group=torch.tensor(slot_group_list, dtype=torch.long, device=device),
-        slot_valid=torch.tensor(slot_valid_list, dtype=torch.long, device=device),
-        total=base,
-    )
-
-
-def _launch_grouped_exl3_moe(
-    y, final_hidden_states, flat_expert_local, token_sorted, weight_sorted,
-    groups, dispatch, temp_bufs, activation_fn_idx, act_limit, mtile_ok, MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED,
-    module=None
-):
-    """Launch one exl3_moe per group for mixed-K experts, accumulating into output."""
-
-    # Sort routes by (group, member) slot so each group's routes form one contiguous slice
-    key = dispatch.flat_key.index_select(0, flat_expert_local.long())
-    order = key.argsort()
-    total = int(dispatch.total)
-
-    # Count assignments per (group, member) slot
-    counts = torch.zeros(total + 1, dtype=torch.long, device=key.device)
-    counts.scatter_add_(0, key, torch.ones_like(key))
-
-    # Count routes per group and how many groups are active
-    slot_valid = dispatch.slot_valid
-    slots = counts[:total] * slot_valid
-    n_groups = len(groups)
-    n_groups_active = 0
-
-    routes_per_group = torch.zeros(n_groups, dtype=torch.long, device=key.device)
-    routes_per_group.scatter_add_(0, dispatch.slot_group[:total], slots)
-
-    active_per_group = torch.zeros(n_groups, dtype=torch.long, device=key.device)
-    active_per_group.scatter_add_(0, dispatch.slot_group[:total], (slots > 0).long())
-
-    # Move to host for control flow
-    routes_host = routes_per_group.tolist()
-    active_host = active_per_group.tolist()
-
-    # Sort tokens and weights
-    token_sorted_by_group = token_sorted[order]
-    weight_sorted_by_group = weight_sorted[order]
-
-    # Determine number of experts from flat_expert_local range
-    n_exp = int(flat_expert_local.max()) + 1
-
-    # Build full expert count (all experts, but count non-group as zero)
-    full_counts = torch.zeros(n_exp + 1, dtype=torch.long, device=key.device)
-    for e in range(n_exp):
-        full_counts[e] = (flat_expert_local == e).sum().long()
-
-    # Launch one exl3_moe per group, accumulating into shared output
-    start = 0
-    for group_idx, (group, n_routes, n_active) in enumerate(zip(groups, routes_host, active_host)):
-        if n_routes == 0:
-            continue
-        n_groups_active += 1
-
-        n_members = len(group.members)
-        member_ids_tensor = torch.tensor(group.members, dtype=torch.long, device=key.device)
-
-        # Create expert_count for this group: only non-zero for group members
-        group_counts = torch.zeros(n_exp + 1, dtype=torch.long, device=key.device)
-        for member_id in group.members:
-            group_counts[member_id] = full_counts[member_id]
-
-        # Extract pointers for this group's projections (full-sized arrays with zeros for non-group)
-        k_g, k_u, k_d = group.k_triple
-
-        # Build full pointer arrays, filling non-group experts with a dummy pointer
-        ptrs_g_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_g_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_g_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_u_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_u_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_u_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_d_trellis_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_d_suh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-        ptrs_d_svh_full = torch.zeros(n_exp, dtype=torch.int64, device=key.device)
-
-        # Fill in pointers only for group members
-        for local_idx, member_id in enumerate(group.members):
-            ptrs_g_trellis_full[member_id] = group.ptrs.get("gate_trellis")[local_idx]
-            ptrs_g_suh_full[member_id] = group.ptrs.get("gate_suh")[local_idx]
-            ptrs_g_svh_full[member_id] = group.ptrs.get("gate_svh")[local_idx]
-            ptrs_u_trellis_full[member_id] = group.ptrs.get("up_trellis")[local_idx]
-            ptrs_u_suh_full[member_id] = group.ptrs.get("up_suh")[local_idx]
-            ptrs_u_svh_full[member_id] = group.ptrs.get("up_svh")[local_idx]
-            ptrs_d_trellis_full[member_id] = group.ptrs.get("down_trellis")[local_idx]
-            ptrs_d_suh_full[member_id] = group.ptrs.get("down_suh")[local_idx]
-            ptrs_d_svh_full[member_id] = group.ptrs.get("down_svh")[local_idx]
-
-        # Launch exl3_moe for this group with its own K
-        # Pass full expert arrays; kernel will skip non-group experts due to zero counts
-        mcg_gate, mul1_gate, mcg_up, mul1_up, mcg_down, mul1_down = group.cb_flags
-        ext.exl3_moe(
-            y,
-            final_hidden_states,
-            group_counts,
-            token_sorted,
-            weight_sorted,
-            temp_bufs.temp_state_g,
-            temp_bufs.temp_state_u,
-            temp_bufs.temp_intermediate_g,
-            temp_bufs.temp_intermediate_u,
-            activation_fn_idx,
-            k_g,
-            k_u,
-            k_d,
-            ptrs_g_trellis_full,
-            ptrs_g_suh_full,
-            ptrs_g_svh_full,
-            ptrs_u_trellis_full,
-            ptrs_u_suh_full,
-            ptrs_u_svh_full,
-            ptrs_d_trellis_full,
-            ptrs_d_suh_full,
-            ptrs_d_svh_full,
-            mcg_gate,
-            mul1_gate,
-            mcg_up,
-            mul1_up,
-            mcg_down,
-            mul1_down,
-            act_limit,
-            n_active if n_active > 0 else -1,
-            None,  # scratch
-            None,  # tables
-            1, 256, 16  # count_lo, count_hi, m_tile
-        )
-        start += n_routes
-
-    # Increment counter in module
-    if module is not None:
-        module.grouped_launches += n_groups_active
 
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
@@ -421,10 +250,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.n_group = n_group
         self.topk_group = topk_group
-
-        # Counters for grouped dispatch debugging
-        self.grouped_launches = 0
-        self.dense_loop_calls = 0
 
         assert out_dtype in (torch.float, None), \
             f"BlockSparseMLP output dtype must be float"
@@ -689,6 +514,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_mode_buffers = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
+        self.grouped_state = None
+        self.grouped_buffers = None
         self.batch_recon = None
         self._cpu_init_state()
 
@@ -970,32 +797,28 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 )
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
-        # Grouped dispatch for mixed-K expert layers: build group metadata if
-        # EXL3_MOE_GROUPED is enabled and this layer has mixed K
-        self.exl3_k_groups = None
-        self.exl3_k_dispatch = None
-        self.exl3_grouped_temps = None
-        if (self.is_quantized and not self.uniform_expert_q and EXL3_MOE_GROUPED and
-                (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2")):
-            try:
-                self.exl3_k_groups, self.exl3_k_dispatch = build_exl3_grouped_fused_state(
-                    self, self.gates if self.gated else [None] * len(self.ups), self.ups, self.downs
-                )
-                # Create temp buffers for grouped dispatch
-                C = ext.exl3_moe_max_concurrency(torch.device(device).index)
-                R = TEMP_ROWS_FUSED  # Use the same buffer size as for fused paths
-                self.exl3_grouped_temps = FusedBuffers(
-                    temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe3_temp_state_g"),
-                    temp_state_u = g_tensor_cache.get(device, (C, R, H), torch.half, "moe3_temp_state_u"),
-                    temp_intermediate_g = g_tensor_cache.get(device, (C, R, I), torch.half, "moe3_temp_intermediate_g"),
-                    temp_intermediate_u = g_tensor_cache.get(device, (C, R, I), torch.half, "moe3_temp_intermediate_u"),
-                )
-                print(f" -- Mixed-K experts in {self.key}: grouped exl3_moe dispatch")
-            except Exception as e:
-                print(f" !! Failed to build grouped dispatch for {self.key}: {e}, falling back to dense")
-                self.exl3_k_groups = None
-                self.exl3_k_dispatch = None
-                self.exl3_grouped_temps = None
+        # Mixed-K layers: the fused kernel launches once per quantization group for experts up to
+        # fused_rows routes (same activation/bias/trim limits as the fast paths); heavier experts
+        # stay on the per-expert loop
+        if (EXL3_MOE_GROUPED and self.is_quantized and not self.uniform_expert_q and
+                (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
+                all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
+                all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
+                not self.config.infer_params.no_reconstruct):
+            n_local = self.num_local_experts if self.num_local_experts is not None else len(self.ups)
+            gates = self.gates if self.gated else self.ups
+            self.grouped_state = build_grouped_state(gates, self.ups, self.downs, n_local, device)
+            R = self.fused_rows
+            C = ext.exl3_moe_max_concurrency(torch.device(device).index)
+            self.grouped_buffers = FusedBuffers(
+                temp_state_g = g_tensor_cache.get(device, (C, R, H), torch.half, "moe_grp_temp_state_g"),
+                temp_state_u = g_tensor_cache.get(device, (C, R, H), torch.half, "moe_grp_temp_state_u"),
+                temp_intermediate_g = g_tensor_cache.get(device, (C, R, I), torch.half, "moe_grp_temp_intermediate_g"),
+                temp_intermediate_u = g_tensor_cache.get(device, (C, R, I), torch.half, "moe_grp_temp_intermediate_u"),
+            )
+            n_members = sum(n for _, _, n, _ in self.grouped_state["groups"])
+            print(f" -- Mixed-K experts in {self.key}: grouped fused dispatch, "
+                  f"{len(self.grouped_state['groups'])} groups over {n_members} device experts")
 
 
     def load_routing(self, **kwargs):
@@ -1340,241 +1163,223 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     valid = (flat_expert_local >= 0) & (flat_expert_local < E)
                     flat_expert_local = torch.where(valid, flat_expert_local, torch.full_like(flat_expert_local, E))
 
-                # Grouped dispatch for mixed-K: if available and enabled, use grouped exl3_moe
-                grouped_handled = False
-                if self.exl3_k_groups is not None and self.exl3_k_dispatch is not None and self.exl3_grouped_temps is not None:
-                    _launch_grouped_exl3_moe(
-                        y, fhs_ext, flat_expert_local, flat_token, flat_weight,
-                        self.exl3_k_groups, self.exl3_k_dispatch,
-                        self.exl3_grouped_temps,
-                        self.activation_fn_idx,
-                        self.act_limit,
-                        self.mtile_ok if hasattr(self, "mtile_ok") else False,
-                        MTILE_T1, MTILE_T2, FUSED_ROWS_WIDE, TEMP_ROWS_FUSED,
-                        self
-                    )
-                    grouped_handled = True
+                # Group once by local expert id (including sentinel for expert-P mode)
+                order = flat_expert_local.argsort()
+                token_sorted = flat_token[order]
+                weight_sorted = flat_weight[order]
 
-                # Group once by local expert id (including sentinel for expert-P mode) if not already handled
-                if not grouped_handled:
-                    order = flat_expert_local.argsort()
-                    token_sorted = flat_token[order]
-                    weight_sorted = flat_weight[order]
+                # Count how many assignments per expert. With few enough total assignments no
+                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
+                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                    expert_count_list = None
                 else:
-                    # Skip to after the dense loop when grouped dispatch handled it
-                    order = token_sorted = weight_sorted = None
+                    expert_count_list = expert_count.tolist()
 
-                # Skip expert dispatch if grouped dispatch already handled it
-                if not grouped_handled:
-                    # Count how many assignments per expert. With few enough total assignments no
-                    # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                    # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                    if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
-                        expert_count_list = None
-                    else:
-                        expert_count_list = expert_count.tolist()
-
-                        # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
-                        # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
-                        recon = None
-                        groups = []
-                        min_rows = 0
-                        if expert_count_list is None:
-                            fused_total = num_tokens * top_k
-                        else:
-                            fused_total = 0
-                            if self.fused_mode_buffers is not None:
-                                min_rows = self.fused_rows
-                                fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
-                            recon = self._batch_recon_layer(y)
-                            if recon is not None:
-                                lim = max(min_rows, TEMP_ROWS_GRAPH)
-                                heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
-                                if heavy:
-                                    from .moe_batch_recon import plan_groups
-                                    groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
-
-                    # Deterministic accumulation (FUSED_DET): every assignment of the fused and
-                    # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
-                    # weighted by the kernel; batched experts: their group's padded row count each,
-                    # unweighted) and one exl3_moe_gather per layer sums each token's slots in k
-                    # order, so identical inputs give identical outputs. The atomic alternative adds
-                    # contributions in arrival order. Slot tables come from the host-side counts, the
-                    # all-fused fast path builds them on the device. Scratch is prefill-shaped and per
-                    # call. Its traffic (written once by the GEMMs, read once by the gather) matches
-                    # what the atomic index_add_ path moved
-                    scratch = tables = inv_order = None
-                    if FUSED_DET and (fused_total or groups):
-                        A = flat_expert_local.shape[0]
-                        inv_order = torch.empty_like(order).scatter_(
-                            0, order, torch.arange(A, device = order.device))
-                        if expert_count_list is None:
-                            expert_start = torch.cumsum(expert_count, 0) - expert_count
-                            tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
-                            n_slots = fused_total
-                        else:
-                            import numpy as np
-                            E1 = len(expert_count_list)
-                            base = np.zeros(E1, dtype = np.int64)
-                            kind = np.zeros(E1, dtype = np.int64)
-                            starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
-                            n_slots = 0
-                            if self.fused_mode_buffers is not None:
-                                for e in range(num_ex):
-                                    c = expert_count_list[e]
-                                    if 0 < c <= self.fused_rows:
-                                        base[e] = n_slots; kind[e] = 1; n_slots += c
-                            for grp in groups:
-                                cmax = max(expert_count_list[e] for e in grp)
-                                for b, e in enumerate(grp):
-                                    base[e] = n_slots + b * cmax; kind[e] = 2
-                                n_slots += len(grp) * cmax
-                            tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
-                        scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
-
-                    def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
-                        # Gateless: the up module stands in for the gate pointer tables (the kernel
-                        # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
-                        multi_gate = self.multi_gate if self.gated else self.multi_up
-                        ext.exl3_moe(
-                            y,
-                            final_hidden_states,
-                            expert_count,
-                            token_sorted,
-                            weight_sorted,
-                            self.fused_mode_buffers.temp_state_g,
-                            self.fused_mode_buffers.temp_state_u,
-                            self.fused_mode_buffers.temp_intermediate_g,
-                            self.fused_mode_buffers.temp_intermediate_u,
-                            self.activation_fn_idx,
-                            multi_gate.K,
-                            self.multi_up.K,
-                            self.multi_down.K,
-                            multi_gate.ptrs_trellis,
-                            multi_gate.ptrs_suh,
-                            multi_gate.ptrs_svh,
-                            self.multi_up.ptrs_trellis,
-                            self.multi_up.ptrs_suh,
-                            self.multi_up.ptrs_svh,
-                            self.multi_down.ptrs_trellis,
-                            self.multi_down.ptrs_suh,
-                            self.multi_down.ptrs_svh,
-                            multi_gate.mcg,
-                            multi_gate.mul1,
-                            self.multi_up.mcg,
-                            self.multi_up.mul1,
-                            self.multi_down.mcg,
-                            self.multi_down.mul1,
-                            self.act_limit,
-                            num_active,
-                            scratch, tables[0] if tables is not None else None,
-                            count_lo, count_hi, m_tile
-                        )
-
-                    # num_active -1 = unknown (all fused), kernel launches at max concurrency
+                # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
+                # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
+                recon = None
+                groups = []
+                min_rows = 0
+                if expert_count_list is None:
+                    fused_total = num_tokens * top_k
+                else:
+                    fused_total = 0
                     if self.fused_mode_buffers is not None:
-                        if expert_count_list is None:
-                            run_fused(-1)
+                        min_rows = self.fused_rows
+                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
+                    elif self.grouped_state is not None:
+                        # Grouped launches below cover experts up to fused_rows routes (atomic adds)
+                        min_rows = self.fused_rows
+                    recon = self._batch_recon_layer(y)
+                    if recon is not None:
+                        lim = max(min_rows, TEMP_ROWS_GRAPH)
+                        heavy = [e for e in range(num_ex) if lim < expert_count_list[e] <= recon.max_rows]
+                        if heavy:
+                            from .moe_batch_recon import plan_groups
+                            groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
+
+                # Deterministic accumulation (FUSED_DET): every assignment of the fused and
+                # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
+                # weighted by the kernel; batched experts: their group's padded row count each,
+                # unweighted) and one exl3_moe_gather per layer sums each token's slots in k
+                # order, so identical inputs give identical outputs. The atomic alternative adds
+                # contributions in arrival order. Slot tables come from the host-side counts, the
+                # all-fused fast path builds them on the device. Scratch is prefill-shaped and per
+                # call. Its traffic (written once by the GEMMs, read once by the gather) matches
+                # what the atomic index_add_ path moved
+                scratch = tables = inv_order = None
+                if FUSED_DET and (fused_total or groups):
+                    A = flat_expert_local.shape[0]
+                    inv_order = torch.empty_like(order).scatter_(
+                        0, order, torch.arange(A, device = order.device))
+                    if expert_count_list is None:
+                        expert_start = torch.cumsum(expert_count, 0) - expert_count
+                        tables = torch.stack([expert_start, expert_start, (expert_count > 0).long()])
+                        n_slots = fused_total
+                    else:
+                        import numpy as np
+                        E1 = len(expert_count_list)
+                        base = np.zeros(E1, dtype = np.int64)
+                        kind = np.zeros(E1, dtype = np.int64)
+                        starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
+                        n_slots = 0
+                        if self.fused_mode_buffers is not None:
+                            for e in range(num_ex):
+                                c = expert_count_list[e]
+                                if 0 < c <= self.fused_rows:
+                                    base[e] = n_slots; kind[e] = 1; n_slots += c
+                        for grp in groups:
+                            cmax = max(expert_count_list[e] for e in grp)
+                            for b, e in enumerate(grp):
+                                base[e] = n_slots + b * cmax; kind[e] = 2
+                            n_slots += len(grp) * cmax
+                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                    scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
+
+                def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
+                    # Gateless: the up module stands in for the gate pointer tables (the kernel
+                    # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
+                    multi_gate = self.multi_gate if self.gated else self.multi_up
+                    ext.exl3_moe(
+                        y,
+                        final_hidden_states,
+                        expert_count,
+                        token_sorted,
+                        weight_sorted,
+                        self.fused_mode_buffers.temp_state_g,
+                        self.fused_mode_buffers.temp_state_u,
+                        self.fused_mode_buffers.temp_intermediate_g,
+                        self.fused_mode_buffers.temp_intermediate_u,
+                        self.activation_fn_idx,
+                        multi_gate.K,
+                        self.multi_up.K,
+                        self.multi_down.K,
+                        multi_gate.ptrs_trellis,
+                        multi_gate.ptrs_suh,
+                        multi_gate.ptrs_svh,
+                        self.multi_up.ptrs_trellis,
+                        self.multi_up.ptrs_suh,
+                        self.multi_up.ptrs_svh,
+                        self.multi_down.ptrs_trellis,
+                        self.multi_down.ptrs_suh,
+                        self.multi_down.ptrs_svh,
+                        multi_gate.mcg,
+                        multi_gate.mul1,
+                        self.multi_up.mcg,
+                        self.multi_up.mul1,
+                        self.multi_down.mcg,
+                        self.multi_down.mul1,
+                        self.act_limit,
+                        num_active,
+                        scratch, tables[0] if tables is not None else None,
+                        count_lo, count_hi, m_tile
+                    )
+
+                # num_active -1 = unknown (all fused), kernel launches at max concurrency
+                if self.fused_mode_buffers is not None:
+                    if expert_count_list is None:
+                        run_fused(-1)
+                    else:
+                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                        t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
+                        t2 = sum(1 for c in counts if c > MTILE_T2)
+                        if self.mtile_ok and (t1 or t2):
+                            # One launch per row tile over its expert range, largest first
+                            t0 = len(counts) - t1 - t2
+                            if t2:
+                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                            if t1:
+                                run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
+                            if t0:
+                                run_fused(t0, 1, MTILE_T1, 16)
                         else:
-                            counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
-                            t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
-                            t2 = sum(1 for c in counts if c > MTILE_T2)
-                            if self.mtile_ok and (t1 or t2):
-                                # One launch per row tile over its expert range, largest first
-                                t0 = len(counts) - t1 - t2
-                                if t2:
-                                    run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
-                                if t1:
-                                    run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
-                                if t0:
-                                    run_fused(t0, 1, MTILE_T1, 16)
-                            else:
-                                run_fused(len(counts))
+                            run_fused(len(counts))
+                elif self.grouped_state is not None and expert_count_list is not None:
+                    launch_grouped_moe(self, y, final_hidden_states, flat_expert_local, flat_token, flat_weight,
+                                       self.fused_rows)
 
-                    # Batched reconstruct tier (into slots when deterministic, else accumulating)
-                    batched = ()
-                    if groups:
-                        batched = self._run_batch_recon(
-                            recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
-                            scratch, tables)
+                # Batched reconstruct tier (into slots when deterministic, else accumulating)
+                batched = ()
+                if groups:
+                    batched = self._run_batch_recon(
+                        recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
+                        scratch, tables)
 
-                    # One fixed-order gather over every slot
-                    if scratch is not None:
-                        ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
-                                            tables[1], tables[0], tables[2], weight_sorted)
+                # One fixed-order gather over every slot
+                if scratch is not None:
+                    ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
+                                        tables[1], tables[0], tables[2], weight_sorted)
 
-                    out_state = None
-                    interm = None
-                    interm_a = None
-                    max_count = 0
-                    start = 0
+                out_state = None
+                interm = None
+                interm_a = None
+                max_count = 0
+                start = 0
 
-                    # expert_count_list None: everything already handled by the fused kernel above
-                    for expert_idx in range(num_ex if expert_count_list is not None else 0):
-                        count = expert_count_list[expert_idx]
-                        end = start + count
-                        if count <= min_rows or expert_idx in batched:
-                            start = end
-                            continue
-
-                        # Increment dense loop call counter
-                        self.dense_loop_calls += 1
-
-                        top_x = token_sorted[start:end]
-                        w = weight_sorted[start:end].unsqueeze(1)
-
-                        current_state = y.index_select(0, top_x)
-
-                        if self.bc is not None and self.support_quant_paths:
-                            # Graph path
-                            if count <= TEMP_ROWS_GRAPH:
-                                self.bc.run_single_expert(current_state, expert_idx)
-                                current_state = self.experts_cfg.out_d2[:count]
-
-                            # DQ path
-                            else:
-                                if count > max_count:
-                                    out_state = torch.empty((count, self.expert_size), dtype = torch.float, device = self.device)
-                                    interm = torch.empty((count * 2, self.intermediate_size_padded), dtype = self.interm_dtype, device = self.device)
-                                    interm_a = interm[:count] if self.interm_dtype == torch.half else \
-                                        torch.empty_like(interm[:count], dtype = torch.half)
-                                    out_state_ = out_state
-                                    interm_ = interm
-                                    interm_a_ = interm_a
-                                    max_count = count
-                                elif count == max_count:
-                                    out_state_ = out_state
-                                    interm_ = interm
-                                    interm_a_ = interm_a
-                                else:
-                                    out_state_ = out_state[:count]
-                                    interm_ = interm[:count * 2]
-                                    interm_a_ = interm_a[:count]
-
-                                yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
-                                self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
-                                current_state = out_state_
-                        else:
-
-                            # Torch path
-                            def mlp(exp_i, xc):
-                                u = self.ups[exp_i].forward(xc, params)
-                                if self.gated:
-                                    g = self.gates[exp_i].forward(xc, params)
-                                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
-                                    self.activation_fn_call(g, u, a, self.act_limit)
-                                else:
-                                    a = self.gateless_act(u)
-                                    if a.dtype != torch.half:
-                                        a = a.half()
-                                return self.downs[exp_i].forward(a, params)
-
-                            current_state = mlp(expert_idx, current_state)
-
-                        current_state.mul_(w)
-                        final_hidden_states.index_add_(0, top_x, current_state)
+                # expert_count_list None: everything already handled by the fused kernel above
+                for expert_idx in range(num_ex if expert_count_list is not None else 0):
+                    count = expert_count_list[expert_idx]
+                    end = start + count
+                    if count <= min_rows or expert_idx in batched:
                         start = end
+                        continue
+
+                    top_x = token_sorted[start:end]
+                    w = weight_sorted[start:end].unsqueeze(1)
+
+                    current_state = y.index_select(0, top_x)
+
+                    if self.bc is not None and self.support_quant_paths:
+                        # Graph path
+                        if count <= TEMP_ROWS_GRAPH:
+                            self.bc.run_single_expert(current_state, expert_idx)
+                            current_state = self.experts_cfg.out_d2[:count]
+
+                        # DQ path
+                        else:
+                            if count > max_count:
+                                out_state = torch.empty((count, self.expert_size), dtype = torch.float, device = self.device)
+                                interm = torch.empty((count * 2, self.intermediate_size_padded), dtype = self.interm_dtype, device = self.device)
+                                interm_a = interm[:count] if self.interm_dtype == torch.half else \
+                                    torch.empty_like(interm[:count], dtype = torch.half)
+                                out_state_ = out_state
+                                interm_ = interm
+                                interm_a_ = interm_a
+                                max_count = count
+                            elif count == max_count:
+                                out_state_ = out_state
+                                interm_ = interm
+                                interm_a_ = interm_a
+                            else:
+                                out_state_ = out_state[:count]
+                                interm_ = interm[:count * 2]
+                                interm_a_ = interm_a[:count]
+
+                            yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
+                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
+                            current_state = out_state_
+                    else:
+
+                        # Torch path
+                        def mlp(exp_i, xc):
+                            u = self.ups[exp_i].forward(xc, params)
+                            if self.gated:
+                                g = self.gates[exp_i].forward(xc, params)
+                                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                                self.activation_fn_call(g, u, a, self.act_limit)
+                            else:
+                                a = self.gateless_act(u)
+                                if a.dtype != torch.half:
+                                    a = a.half()
+                            return self.downs[exp_i].forward(a, params)
+
+                        current_state = mlp(expert_idx, current_state)
+
+                    current_state.mul_(w)
+                    final_hidden_states.index_add_(0, top_x, current_state)
+                    start = end
 
             final_hidden_states = final_hidden_states.reshape(eshape)
 
@@ -1801,12 +1606,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
-
-        # Print grouped dispatch debug info
-        if os.environ.get("EXL3_MOE_GROUPED_DEBUG") == "1":
-            if self.grouped_launches > 0 or self.dense_loop_calls > 0:
-                print(f" -- {self.key}: grouped_launches={self.grouped_launches}, dense_loop_calls={self.dense_loop_calls}")
-
         return final_hidden_states
 
 
