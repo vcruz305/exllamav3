@@ -228,6 +228,7 @@ class EngramTable:
         self.ats_off = not (getattr(stc, "ats_mmap", False) and self.rows_file_ids is None and
                             os.environ.get("EXL3_ENGRAM_ATS", "1") != "0")
         self.ats_tables = {}
+        self.ats_prefetch = os.environ.get("EXL3_ENGRAM_PREFETCH", "1") != "0"
 
     def _gather(self, handle, ids: list, nbytes: int) -> bytes:
         fd = handle._ensure_open()
@@ -262,6 +263,13 @@ class EngramTable:
         tables = self._ats_aliases(device)
         if tables is not None:
             w_u8, s_u8 = tables
+            if self.ats_prefetch and self.pool is not None and hash_ids.device.type == "cpu":
+                # GPU faults on cold rows are served one page at a time; reading the rows first with
+                # the thread pool brings their pages into the page cache in parallel, so the gather
+                # below finds them present (EXL3_ENGRAM_PREFETCH=0 skips this)
+                needed = torch.unique(hash_ids.reshape(-1)).tolist()
+                self._gather(self.weight, needed, self.weight.row_bytes)
+                self._gather(self.scale, needed, self.scale.row_bytes)
             ids = hash_ids.reshape(-1).to(device, torch.int64)
             n = ids.shape[0]
             w = w_u8.index_select(0, ids).view(torch.float8_e4m3fn).float()
