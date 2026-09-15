@@ -66,7 +66,6 @@ def main():
         model.load(device, progressbar=False, verbose=False)
         print(f"Model loaded in {time.time() - t0_load:.1f}s")
 
-        state = cache.get_new_state()
         ids = ref_tokens[args.seq_idx:args.seq_idx+1].to(device)
 
         # No-cache reference forward
@@ -79,6 +78,11 @@ def main():
 
         # Cached: prefill 0-255, then 64 single-token decodes
         print(f"Cached prefill (0-255)...")
+
+        # Get state INSIDE inference_mode (per test_dsv4_cached.py line 109-110)
+        with torch.inference_mode():
+            state = cache.get_new_state()
+
         t0 = time.time()
         with torch.inference_mode():
             model.forward(
@@ -149,7 +153,9 @@ def main():
         # Cached with 16-token chunks
         print(f"\nCached decode (256-319, 16-token chunks)...")
         state.free()
-        state = cache.get_new_state()
+        with torch.inference_mode():
+            state = cache.get_new_state()
+
         cached_logits_chunks = torch.zeros((N, cfg.vocab_size), dtype=torch.float32)
         cached_logits_chunks[:256] = ref_logits[:256]
 
