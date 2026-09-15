@@ -14,7 +14,7 @@ import torch
 from exllamav3 import Config, Model
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP, MAX_BSZN, _GROUPED_STATS
 
-assert os.environ.get("EXL3_MOE_GROUP_GRAPH") == "1", "set EXL3_MOE_GROUP_GRAPH=1"
+assert os.environ.get("EXL3_MOE_GROUP_GRAPH") in ("1", "2"), "set EXL3_MOE_GROUP_GRAPH=1 or 2"
 M = os.environ["MODEL_DIR"]
 TOL = float(os.environ.get("TOL", "5e-3"))
 LAYERS = int(os.environ.get("LAYERS", "8"))
@@ -23,10 +23,14 @@ config = Config.from_directory(M)
 model = Model.from_config(config)
 model.load("cuda:0", progressbar = False, verbose = False)
 
-mods = sorted((m for m in gc.get_objects() if isinstance(m, BlockSparseMLP) and m.bc_groups is not None),
-              key = lambda m: m.key)
-print(json.dumps({"group_graph_layers": len(mods),
-                  "groups_per_layer": sorted({len(m.bc_groups) for m in mods})}), flush = True)
+def n_groups(m):
+    return len(m.bc_groups) if m.bc_groups is not None else m.bc_mixedk_groups
+
+
+mods = sorted((m for m in gc.get_objects() if isinstance(m, BlockSparseMLP) and
+               (m.bc_groups is not None or m.bc_mixedk is not None)), key = lambda m: m.key)
+print(json.dumps({"group_graph_layers": len(mods), "mode": os.environ["EXL3_MOE_GROUP_GRAPH"],
+                  "groups_per_layer": sorted({n_groups(m) for m in mods})}), flush = True)
 if not mods:
     print("no mixed-K layer built group graphs GROUP_GRAPH_FAIL", flush = True)
     sys.exit(1)
@@ -50,7 +54,7 @@ worst = 0.0
 with torch.inference_mode():
     for m in mods:
         H = m.hidden_size
-        rec = {"layer": m.key, "groups": len(m.bc_groups), "max_rel": 0.0, "not_taken": 0, "nondet": 0, "nonfinite": 0}
+        rec = {"layer": m.key, "groups": n_groups(m), "max_rel": 0.0, "not_taken": 0, "nondet": 0, "nonfinite": 0}
         for bsz in sorted({1, 2, 3, 5, MAX_BSZN}):
             for rep in range(3):
                 x = torch.randn((1, bsz, H), dtype = torch.half, device = m.device)
@@ -63,12 +67,12 @@ with torch.inference_mode():
                     rec["not_taken"] += 1
                 if rep == 2 and not torch.equal(yg, forward(m, x, ids)):
                     rec["nondet"] += 1
-                saved = m.bc_groups
-                m.bc_groups = None
+                saved = (m.bc_groups, m.bc_mixedk)
+                m.bc_groups = m.bc_mixedk = None
                 try:
                     yr = forward(m, x, ids)
                 finally:
-                    m.bc_groups = saved
+                    m.bc_groups, m.bc_mixedk = saved
                 if not bool(torch.isfinite(yg).all()):
                     rec["nonfinite"] += 1
                 rel = float((yg - yr).norm() / (yr.norm() + 1e-9))
