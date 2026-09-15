@@ -1264,13 +1264,17 @@ class MoeCpuHost:
 
     def _stream_recon_layer(self, st, layer_idx, spec, aux, device):
         """Batched reconstruct tier state for a streamed layer, built once per (device,
-        layer); None when disabled or the experts carry biases (a batched add would be needed)"""
+        layer); None when disabled or the experts carry biases (a batched add would be needed)
+        or when experts have mixed K values"""
         if not self.batch_recon or any(aux.get(b) is not None for b in ("bias_g", "bias_u", "bias_d")):
             return None
         recon = st["recon"].get(layer_idx)
         if recon is None:
             from ..modules.moe_batch_recon import BatchReconLayer
             pd = spec["proj_dims"]
+            # Skip batched reconstruct for mixed-K layers (per-expert dims are lists)
+            if any(isinstance(pd.get(k), list) for k in ("g", "u", "d")):
+                return None
             gated = pd.get("g") is not None
             scales = {p: (aux["suh_" + p], aux["svh_" + p])
                       for p in (("g", "u", "d") if gated else ("u", "d"))}
@@ -1282,8 +1286,15 @@ class MoeCpuHost:
 
     def _stream_fused_bufs(self, st, spec, device):
         """Fused-tier temp buffers for a streamed layer's (hidden, intermediate) shape, kept
-        per device (the kernel reads both dims from the buffers, so they must match the layer)"""
-        key = (spec["hi"], spec["proj_dims"]["u"][1])
+        per device (the kernel reads both dims from the buffers, so they must match the layer).
+        For mixed-K layers, use first expert dims as representative."""
+        pd_u = spec["proj_dims"]["u"]
+        # Handle per-expert dims (list) or uniform dims (tuple)
+        if isinstance(pd_u, list):
+            u_dims = pd_u[0]  # Use first expert for buffer sizing
+        else:
+            u_dims = pd_u
+        key = (spec["hi"], u_dims[1])
         fbufs = st["fused_bufs"].get(key)
         if fbufs is None:
             conc = ext.exl3_moe_max_concurrency(torch.device(device).index or 0)
