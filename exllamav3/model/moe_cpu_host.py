@@ -1805,10 +1805,7 @@ class MoeCpuHost:
                 pass
             self.conn = None
         if self.shm is not None:
-            try:
-                cuda_host_unregister(self.base_ptr)
-            except Exception:
-                pass
+            # Only attempt unregister with timeout if there's a chance the GPU is responsive
             # Drop every view over the buffer before closing, or mmap refuses to unmap
             self.slots = None
             self.wviews = None
@@ -1820,24 +1817,39 @@ class MoeCpuHost:
             self._flags_u32 = None
             import gc
             gc.collect()
-        # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
-        # the worker (memfd, no name to unlink)
-        for view in self.arena_views:
+            # Skip unregister if worker died - it may hang indefinitely
             try:
-                cuda_host_unregister(view.data_ptr())
+                if self.base_ptr != 0:
+                    cuda_host_unregister(self.base_ptr)
             except Exception:
                 pass
-        self.arena_views = []
-        self.layer_blocks = []
-        maps, self.arena_maps = self.arena_maps, []
-        if maps:
-            import gc
-            gc.collect()
-            for m in maps:
+        # Pinned arena mappings: unpin, drop the views, unmap. The pages themselves die with
+        # the worker (memfd, no name to unlink). Skip if worker is dead to avoid hanging.
+        if self.proc is None or not self.proc.is_alive():
+            # Worker is dead, skip expensive unregister operations
+            for view in self.arena_views:
+                view = None
+            self.arena_views = []
+            self.layer_blocks = []
+            maps, self.arena_maps = self.arena_maps, []
+            # Don't try to unregister - worker is dead
+        else:
+            for view in self.arena_views:
                 try:
-                    m.close()
+                    cuda_host_unregister(view.data_ptr())
                 except Exception:
                     pass
+            self.arena_views = []
+            self.layer_blocks = []
+            maps, self.arena_maps = self.arena_maps, []
+            if maps:
+                import gc
+                gc.collect()
+                for m in maps:
+                    try:
+                        m.close()
+                    except Exception:
+                        pass
         if self.shm is not None:
             try:
                 self.shm.close()
