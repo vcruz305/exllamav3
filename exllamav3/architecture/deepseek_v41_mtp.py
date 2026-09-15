@@ -6,8 +6,8 @@ import weakref
 
 from ..cache import Cache
 from ..model.model import Model
-from ..modules import RMSNorm, Linear, Embedding, GatedMLP, BlockSparseMLP, TransformerBlock, \
-    HyperConnection, HyperHead
+from ..modules import RMSNorm, Linear, Embedding, GatedMLP, BlockSparseMLP
+from ..modules.dsv41_hc import DSV41HyperConnection, DSV41TransformerBlock, DSV41HyperHead, PRE_MIX_KEY
 from ..modules.arch_specific.dspark_v41 import DSparkV41Attention, DSparkInputLayer, to_dev
 from ..modules.attn import prepare_for_attn
 from ..util.device_copy import to_device
@@ -125,7 +125,7 @@ class DeepseekV41MTPModel(Model):
                 ),
             )
             def _hc(tag: str):
-                return HyperConnection(
+                return DSV41HyperConnection(
                     config = config,
                     key = f"{key}.hc_{tag}",
                     hc_mult = config.hc_mult,
@@ -134,8 +134,10 @@ class DeepseekV41MTPModel(Model):
                     hc_eps = config.hc_eps,
                     rms_norm_eps = config.rms_norm_eps,
                 )
+            # V4.1 wiring (reference DSparkBlock is a V4.1 Block): each site's pre mix collapses the
+            # NEXT site's input, carried in params[PRE_MIX_KEY]
             self.modules += [
-                TransformerBlock(
+                DSV41TransformerBlock(
                     config = config,
                     key = key,
                     layer_idx = idx,
@@ -151,15 +153,15 @@ class DeepseekV41MTPModel(Model):
         self.last_kv_module_idx = len(self.modules) - 1
         last = f"mtp.{config.num_mtp_layers - 1}"
 
-        # Exit: the drafter's own stream collapse + final norm (logits via the trunk's
-        # shared head at runtime). The draft forward runs modules[:fwd_end_idx]
+        # Exit: collapse the streams with the last block's FFN-site pre mix (reference
+        # DSparkBlock.forward_head: hc_pre(x, pre_mix); the pack has no hc_head tensors) + final
+        # norm (logits via the trunk's shared head at runtime). The draft forward runs
+        # modules[:fwd_end_idx]
         self.modules += [
-            HyperHead(
+            DSV41HyperHead(
                 config = config,
                 key = f"{last}.hc_head",
                 hc_mult = config.hc_mult,
-                rms_norm_eps = config.rms_norm_eps,
-                hc_eps = config.hc_eps,
             ),
             RMSNorm(
                 config = config,
@@ -351,6 +353,8 @@ class DeepseekV41MTPModel(Model):
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        # Every draft forward starts from the identity pre mix (reference make_identity_pre_mix)
+        params.pop(PRE_MIX_KEY, None)
         return prepare_for_attn(input_ids, params)
 
 

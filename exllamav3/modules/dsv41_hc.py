@@ -60,6 +60,19 @@ class DSV41TransformerBlock(TransformerBlock):
         H = self.attn_hc.hc_mult
         pre_in = pending_pre_mix(params, x, H)
 
+        # DSpark drafter taps (export_state_layers): V4.1 reads the ATTENTION INPUT of its target layers,
+        # i.e. the stream mean before the block (reference Transformer.forward appends h.mean(dim=2)
+        # before calling the layer), unlike TransformerBlock, which exports its output. Tapping the input
+        # also keeps the prefill early return below from truncating the tap of the last KV layer
+        export = params.get("export_state_layers")
+        if export and self.layer_idx in export and params.get("layer_instance", 0) == 0:
+            states = params.get("export_states")
+            if not states:
+                states = params["export_states"] = []
+            tap = x.mean(dim = 2)
+            tap = tap.clamp_(-65504.0, 65504.0) if tap.dtype == torch.half else tap.clamp(-65504.0, 65504.0).half()
+            states.append(tap)
+
         attn_pre, attn_post, attn_comb = self.attn_hc.mix_full(x)
         y = self.attn_norm.forward(collapse(x, pre_in).half(), params, out_dtype = torch.half)
         y = self.attn.forward(y, params)

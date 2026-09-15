@@ -66,7 +66,15 @@ def main() -> int:
         out, last = [], None
         while generator.num_remaining_jobs():
             for r in generator.iterate():
-                if r.get("stage") != "streaming":
+                stage = r.get("stage")
+                if stage == "error":
+                    info = {k: v for k, v in r.items() if not torch.is_tensor(v) and k != "job"}
+                    print("GENERATOR ERROR:", info, flush = True)
+                    err = r.get("error")
+                    if isinstance(err, BaseException):
+                        print("".join(__import__("traceback").format_exception(err)), flush = True)
+                    raise RuntimeError(f"generator job failed: {info}")
+                if stage != "streaming":
                     continue
                 t = r.get("token_ids")
                 if t is not None and t.numel():
