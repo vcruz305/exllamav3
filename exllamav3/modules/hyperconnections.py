@@ -8,10 +8,10 @@ from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
 import os as _os
-# EXL3_GR_INT8=1: store the fused decode mixer weights (fn_h, upx_h) as int8 + per-row fp32
+# EXL3_GR_INT8 (default on; =0 disables): store the fused decode mixer weights (fn_h, upx_h) as int8 + per-row fp32
 # scales. Halves the ~1.3 GB/round these read on a 96-site model; validated on Qwen3.8-Flash-Next
 # (int8 sim: greedy acceptance 58-63% vs 63% fp16; int4 collapses to 20%, so 8 is the floor)
-_GR_INT8 = _os.environ.get("EXL3_GR_INT8", "0") == "1"
+_GR_INT8 = _os.environ.get("EXL3_GR_INT8", "1") != "0"
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
