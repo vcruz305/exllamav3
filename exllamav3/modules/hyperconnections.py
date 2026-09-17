@@ -7,6 +7,11 @@ from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+import os as _os
+# EXL3_GR_INT8=1: store the fused decode mixer weights (fn_h, upx_h) as int8 + per-row fp32
+# scales. Halves the ~1.3 GB/round these read on a 96-site model; validated on Qwen3.8-Flash-Next
+# (int8 sim: greedy acceptance 58-63% vs 63% fp16; int4 collapses to 20%, so 8 is the floor)
+_GR_INT8 = _os.environ.get("EXL3_GR_INT8", "0") == "1"
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -307,12 +312,34 @@ class GatedResidual(Module):
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
         self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
             .permute(0, 1, 3, 2).contiguous()
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
+        if _GR_INT8:
+            self._quantize_int8(H, Dh)
+
+    def _quantize_int8(self, H: int, Dh: int):
+        """int8 symmetric, per-row scales along the contracted dim.
+        fn_h  (M, H*D): contracted over H*D  -> scale per row j        -> fn_s (M,)
+        upx_h (H, D/4, LR, 4): contracted over LR -> scale per channel (h, d) -> upx_s (H, D)
+        The fp16 fused-path copies are dropped afterwards; fn_h/upx_h become None so any code
+        path that still expects them fails loudly instead of silently reading fp16."""
+        qmax = 127.0
+        f = self.fn_h.float()
+        fs = f.abs().amax(dim = 1).clamp_min(1e-8) / qmax                  # (M,)
+        self.fn_q = torch.round(f / fs[:, None]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.fn_s = fs.contiguous()
+        u = self.upx_h.float()                                              # (H, D/4, LR, 4)
+        us = u.abs().amax(dim = 2).clamp_min(1e-8) / qmax                   # (H, D/4, 4)
+        self.upx_q = torch.round(u / us[:, :, None, :]).clamp_(-128, 127).to(torch.int8).contiguous()
+        self.upx_s = us.reshape(H, Dh).contiguous()                         # (H, D) channel order d = 4*c + k
+        self.fn_h = None
+        self.upx_h = None
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.fn_q = self.fn_s = self.upx_q = self.upx_s = None
 
     @override
     def get_tensors(self):
@@ -371,11 +398,15 @@ class GatedResidual(Module):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            M = (self.fn_q if self.fn_q is not None else self.fn_h).shape[0] + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            if self.fn_q is not None:
+                ext.gr_mix_int8(s3, self.fn_q, self.fn_s, self.upx_q, self.upx_s, self.w_h,
+                                self.rms_eps, dots, post, mixed)
+            else:
+                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None

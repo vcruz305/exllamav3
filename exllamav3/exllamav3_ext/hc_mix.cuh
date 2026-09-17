@@ -54,3 +54,17 @@ void gr_mix
     c10::optional<at::Tensor> post,
     at::Tensor mixed
 );
+
+void gr_mix_int8
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn_q,
+    const at::Tensor& fn_s,
+    const at::Tensor& up_q,
+    const at::Tensor& up_s,
+    const at::Tensor& w,
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
+);
