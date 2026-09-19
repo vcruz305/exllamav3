@@ -122,3 +122,25 @@ class DSV41HyperHead(Module):
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         return collapse(x, pending_pre_mix(params, x, self.hc_mult))
+
+    # ---- tensor-parallel support -------------------------------------------------------
+    # This module holds no tensors (see get_tensors/weights_numel above), so both halves are
+    # kwargs only and every rank builds an identical copy.
+
+    @override
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        return {
+            "cls": DSV41HyperHead,
+            "kwargs": {
+                "key": self.key,
+                "hc_mult": self.hc_mult,
+            },
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        module = DSV41HyperHead(config = None, **exported["kwargs"])
+        module.device = local_context["device"]
+        return module

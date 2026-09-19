@@ -452,6 +452,9 @@ class EngramLayer(Module):
         self.layer_state_cls = EngramLayerState
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
+        # Set True by tp_import. Mirrors DSV4Attention (dsv4.py:409 / :868): under TP
+        # the recurrent states arrive as DSV4ExportedState and .cache is an opaque id.
+        self.tp_mode = False
 
     @override
     def load(self, device: torch.device, **kwargs):
@@ -495,7 +498,13 @@ class EngramLayer(Module):
         rsg = params.get("recurrent_states")
         if rsg:
             layer_instance = (self.layer_idx, params.get("layer_instance", 0))
-            rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
+            # Under TP the cache is shipped as an opaque id (model_tp.py:570-571), so the
+            # rank resolves its own layer state through the id-keyed lookup. Same idiom as
+            # short_conv.py:342, gated_delta_net.py:984, sliding_attn.py:853, mamba2.py:382.
+            if self.tp_mode:
+                rsl = self.tp_recurrent_lookup[rsg[0].cache]
+            else:
+                rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             slots = get_for_device(params, "recurrent_slots", "cpu").tolist()
             assert len(slots) == ids.shape[0] == len(rsg)
             prev = torch.stack([rsl.context(s, int(r.position)) for s, r in zip(slots, rsg)])
@@ -546,3 +555,88 @@ class EngramLayer(Module):
             for i, (s, r) in enumerate(zip(slots, rsg)):
                 rsl.write(s, int(r.position), window[i, ctx:])
         return x + delta
+
+    # ---- tensor-parallel support -------------------------------------------------------
+    # Replicated per rank, matching the KV-side replication the attention allocation uses.
+    # qk is small and is sent. The EngramTable is NOT: it is the disk-backed n-gram store
+    # (~189 GiB) and cannot cross a shared-memory boundary. A TP worker's local_context has
+    # no stc/config/path (measured), so the model directory is carried in the export and each
+    # rank rebuilds its own collection with Config.from_directory, which reads config.json
+    # and safetensors headers only and loads no weights.
+
+    @override
+    def tp_export(self, plan, producer):
+        assert self.device is not None, "Cannot export module for TP before loading."
+        _dir = None
+        for _o in (self.config, getattr(self.config, "stc", None)):
+            if _o is None:
+                continue
+            for _a in ("directory", "model_dir", "path", "dir", "model_directory"):
+                _v = getattr(_o, _a, None)
+                if isinstance(_v, str) and _v:
+                    _dir = _v
+                    break
+            if _dir:
+                break
+        return {
+            "cls": EngramLayer,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "table_index": self.table_index,
+                "hidden_size": self.hidden_size,
+                "hc_mult": self.hc_mult,
+                "rms_norm_eps": self.eps,
+                "gather_threads": self.gather_threads,
+                "out_dtype": self.out_dtype,
+            },
+            "hasher": self.hasher,
+            "wkv": self.wkv.tp_export(plan, producer),
+            "qk": producer.send(self.qk),
+            "recurrent_layers": [rl.tp_export(plan) for rl in self.recurrent_layers],
+            "engram_dir": _dir,
+            "config_attrs": sorted(a for a in dir(self.config) if not a.startswith("_"))[:60],
+            "stc_attrs": sorted(a for a in dir(getattr(self.config, "stc", object())) if not a.startswith("_"))[:60],
+            "device": self.device,
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan):
+        device = local_context["device"]
+        consumer = local_context["consumer"]
+        module = EngramLayer(
+            config = None,
+            hasher = exported["hasher"],
+            **exported["kwargs"],
+        )
+        module.device = device
+        wkv = exported["wkv"]["cls"].tp_import(local_context, exported["wkv"], plan)
+        module.wkv = wkv
+        module.modules = [wkv]
+        module.qk = consumer.recv(exported["qk"], cuda = True)
+        _dir = exported.get("engram_dir")
+        if not _dir:
+            raise NotImplementedError(
+                "EngramLayer.tp_import: could not resolve the model directory from the "
+                "parent config, so the disk-backed table cannot be opened per rank. "
+                "config attrs = %s ; stc attrs = %s"
+                % (exported.get("config_attrs"), exported.get("stc_attrs"))
+            )
+        _cfg = Config.from_directory(_dir)
+        module.table = EngramTable(
+            _cfg.stc, "%s.embed" % module.key, module.hasher.head_dim, module.gather_threads)
+        module._tp_cfg_ref = _cfg   # keep the collection alive for the table's handles
+        for rl in exported["recurrent_layers"]:
+            rli = rl["cls"](module, **rl["args"])
+            # A worker module is built by tp_import and load() is never called on it, so
+            # the per-rank state EngramLayer.load() would allocate (:467-468) must be
+            # allocated here: id_state starts on "meta" (:347) and only alloc() gives it
+            # real storage (:360-363). The peer modules get this from the
+            # module.load_local(device) at the end of their tp_import (dsv4.py:898,
+            # gated_delta_net.py:1334, sliding_attn.py:1256, mamba2.py:719); EngramLayer
+            # has no load_local, so it is explicit.
+            rli.alloc(device)
+            module.recurrent_layers.append(rli)
+            module.tp_recurrent_lookup[rl["args"]["cache_id"]] = rli
+        module.tp_mode = True
+        return module
