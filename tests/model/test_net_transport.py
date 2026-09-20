@@ -372,6 +372,55 @@ def test_shape_dtype_mismatch_gets_new_buffer():
     print("PASS: shape/dtype mismatch causes reallocation")
 
 
+def test_cuda_staging_consecutive_sends():
+    """Two consecutive sends of CUDA tensors over one connection.
+
+    CUDA tensors are staged through a pinned buffer that is over-allocated and never shrunk, so
+    the payload must be taken from the view and not from that buffer's storage. When it is taken
+    from the storage the first send still arrives, because the receiver reads only the length the
+    header declares, but the surplus bytes stay in the stream and the next header read fails. One
+    send therefore cannot catch this; two can.
+    """
+    if not torch.cuda.is_available():
+        print("SKIP: no CUDA device available")
+        return
+
+    port = find_free_port()
+    sent_tensors = [
+        torch.randn(1, 1, 2560, dtype = torch.float16, device = "cuda"),
+        torch.randn(64, dtype = torch.float32, device = "cuda"),
+    ]
+    received_tensors = []
+    server_error = [None]
+
+    def server():
+        try:
+            ep = NetEndpoint.listen("127.0.0.1", port, timeout = 5.0)
+            ep.sock.settimeout(5.0)
+            for _ in sent_tensors:
+                received_tensors.append(ep.recv_tensor())
+            ep.close()
+        except Exception as e:
+            server_error[0] = f"{type(e).__name__}: {e}"
+
+    thread = threading.Thread(target = server, daemon = True)
+    thread.start()
+
+    ep = NetEndpoint.connect("127.0.0.1", port, timeout = 5.0)
+    ep.sock.settimeout(5.0)
+    for t in sent_tensors:
+        ep.send_tensor(t)
+    ep.close()
+
+    thread.join(timeout = 10.0)
+    assert server_error[0] is None, f"receiver failed: {server_error[0]}"
+    assert len(received_tensors) == len(sent_tensors), \
+        f"received {len(received_tensors)} of {len(sent_tensors)} tensors"
+    for i, (s_, r_) in enumerate(zip(sent_tensors, received_tensors)):
+        assert torch.equal(s_.cpu(), r_.cpu()), f"tensor {i} differs after round trip"
+    print("PASS: CUDA staging, consecutive sends")
+
+
 if __name__ == "__main__":
     # Run all tests
     test_dtype_roundtrip_float16()
@@ -387,5 +436,6 @@ if __name__ == "__main__":
     test_control_message_roundtrip()
     test_eof_handling()
     test_shape_dtype_mismatch_gets_new_buffer()
+    test_cuda_staging_consecutive_sends()
 
     print("\nAll tests passed!")
