@@ -496,3 +496,257 @@ void exl3_moe_gather
     );
     cuda_check(cudaPeekAtLastError());
 }
+// ---- Mixed-K entry point: appended to exl3_moe.cu ----
+#include "comp_units/exl3_moe_mixedk_instances.cuh"
+
+std::set<void*> moe_mixedk_kernel_attr_set[MAX_DEVICES] = {};
+
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances[] =
+{
+    // [cb_idx * 2 + N_off]
+    exl3_moe_mixedk_kernel_n128_cb1(), exl3_moe_mixedk_kernel_n256_cb1(),
+    exl3_moe_mixedk_kernel_n128_cb2(), exl3_moe_mixedk_kernel_n256_cb2(),
+};
+
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m32[] =
+{
+    exl3_moe_mixedk_kernel_n128_cb2_m32()
+};
+
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[] =
+{
+    exl3_moe_mixedk_kernel_n128_cb2_m64()
+};
+
+void exl3_moe_mixedk
+(
+    const at::Tensor& hidden_state,
+    const at::Tensor& output_state,
+    const at::Tensor& expert_count,
+    const at::Tensor& token_sorted,
+    const at::Tensor& weight_sorted,
+
+    const at::Tensor& temp_state_g,
+    const at::Tensor& temp_state_u,
+    const at::Tensor& temp_intermediate_g,
+    const at::Tensor& temp_intermediate_u,
+
+    const int act_function,
+
+    const at::Tensor& K_gate_arr,
+    const at::Tensor& K_up_arr,
+    const at::Tensor& K_down_arr,
+
+    const at::Tensor& gate_ptrs_trellis,
+    const at::Tensor& gate_ptrs_suh,
+    const at::Tensor& gate_ptrs_svh,
+    const at::Tensor& up_ptrs_trellis,
+    const at::Tensor& up_ptrs_suh,
+    const at::Tensor& up_ptrs_svh,
+    const at::Tensor& down_ptrs_trellis,
+    const at::Tensor& down_ptrs_suh,
+    const at::Tensor& down_ptrs_svh,
+
+    const bool gate_mcg,
+    const bool gate_mul1,
+    const bool up_mcg,
+    const bool up_mul1,
+    const bool down_mcg,
+    const bool down_mul1,
+
+    const float act_limit,
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (num_active == 0) return;
+    void* _output_scratch = nullptr;
+    void* _fused_base = nullptr;
+    if (output_scratch.has_value())
+    {
+        TORCH_CHECK(fused_base.has_value(), "exl3_moe_mixedk: output_scratch needs fused_base");
+        TORCH_CHECK_DTYPE(output_scratch.value(), kFloat);
+        TORCH_CHECK_DTYPE(fused_base.value(), kLong);
+        TORCH_CHECK(output_scratch.value().is_contiguous() && output_scratch.value().dim() == 2 &&
+                    output_scratch.value().size(1) == hidden_state.size(1), "exl3_moe_mixedk: output_scratch must be [slots, hidden]");
+        _output_scratch = output_scratch.value().data_ptr();
+        _fused_base = fused_base.value().data_ptr();
+    }
+
+    TORCH_CHECK_DTYPE(hidden_state, kHalf);
+    TORCH_CHECK_DIM(hidden_state, 2);
+    size_t bsz = hidden_state.size(0);
+    size_t hidden_dim = hidden_state.size(1);
+
+    TORCH_CHECK_DTYPE(output_state, kFloat);
+    TORCH_CHECK_SHAPES_FULL(output_state, hidden_state);
+
+    TORCH_CHECK_DTYPE(expert_count, kLong);
+    TORCH_CHECK_DIM(expert_count, 1);
+    size_t num_experts = expert_count.size(0) - 1;
+
+    TORCH_CHECK_DTYPE(token_sorted, kLong);
+    TORCH_CHECK_DIM(token_sorted, 1);
+    TORCH_CHECK_SHAPES_FULL(token_sorted, weight_sorted);
+    size_t num_experts_per_tok = token_sorted.size(0) / bsz;
+
+    TORCH_CHECK_DTYPE(temp_state_g, kHalf);
+    TORCH_CHECK_DTYPE(temp_state_u, kHalf);
+    TORCH_CHECK_DIM(temp_state_g, 3);
+    TORCH_CHECK_SHAPES(temp_state_g, 2, hidden_state, 1, 1);
+    TORCH_CHECK_SHAPES_FULL(temp_state_g, temp_state_u);
+    size_t max_tokens_per_expert = temp_state_g.size(1);
+    size_t concurrency = temp_state_g.size(0);
+
+    TORCH_CHECK_DTYPE(temp_intermediate_g, kHalf);
+    TORCH_CHECK_DTYPE(temp_intermediate_u, kHalf);
+    TORCH_CHECK_DIM(temp_intermediate_g, 3);
+    TORCH_CHECK_DIM(temp_intermediate_u, 3);
+    TORCH_CHECK_SHAPES_FULL(temp_intermediate_g, temp_intermediate_u);
+    TORCH_CHECK_SHAPES(temp_intermediate_g, 1, temp_state_g, 1, 1);
+    size_t intermediate_dim = temp_intermediate_g.size(2);
+
+    TORCH_CHECK(gate_mcg == up_mcg && up_mcg == down_mcg && gate_mul1 == up_mul1 && up_mul1 == down_mul1,
+                "MoE mixedk kernel: gate/up/down must share the same codebook");
+    TORCH_CHECK(gate_mcg != gate_mul1, "MoE mixedk kernel: Only mcg and mul1 codebooks are supported");
+    const int cb_idx = gate_mul1 ? 1 : 0;
+
+    // K arrays: int32, shape (num_experts,)
+    TORCH_CHECK_DTYPE(K_gate_arr, kInt);
+    TORCH_CHECK_DTYPE(K_up_arr, kInt);
+    TORCH_CHECK_DTYPE(K_down_arr, kInt);
+    TORCH_CHECK(K_gate_arr.size(0) >= (int64_t) num_experts, "K_gate_arr size mismatch");
+    TORCH_CHECK(K_up_arr.size(0) >= (int64_t) num_experts, "K_up_arr size mismatch");
+    TORCH_CHECK(K_down_arr.size(0) >= (int64_t) num_experts, "K_down_arr size mismatch");
+
+    TORCH_CHECK_DIM(gate_ptrs_trellis, 1);
+    TORCH_CHECK(gate_ptrs_trellis.size(0) == (int64_t) num_experts, "Number of gate tensors doesn't match num_experts");
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, gate_ptrs_suh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, gate_ptrs_svh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, up_ptrs_trellis);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, up_ptrs_suh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, up_ptrs_svh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_trellis);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_suh);
+    TORCH_CHECK_SHAPES_FULL(gate_ptrs_trellis, down_ptrs_svh);
+
+    int device;
+    cudaGetDevice(&device);
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    int cc = DevCtx::instance().get_cc(device);
+    int* locks = DevCtx::instance().get_locks(device);
+
+    int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
+    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= (size_t) num_sms, "Concurrency too high for device num_sms");
+    int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
+    int group_size = MOE_SMS_PER_EXPERT;
+    if (num_active > 0)
+    {
+        num_groups = MIN(num_groups, num_active);
+        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
+    }
+    dim3 grid_dim(group_size, 1, num_groups);
+
+    int N_off = 0;
+    if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
+    fp_exl3_moe_mixedk_kernel kernel;
+    if (m_tile <= 16)
+    {
+        kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
+    }
+    else
+    {
+        TORCH_CHECK(cb_idx == 1, "exl3_moe_mixedk: row tiles above 16 are instantiated for the mul1 codebook only");
+        TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe_mixedk: temp buffers hold fewer rows than the tile");
+        kernel = m_tile >= 64 ? exl3_moe_mixedk_kernel_instances_m64[0] : exl3_moe_mixedk_kernel_instances_m32[0];
+    }
+
+    if (moe_mixedk_kernel_attr_set[device].find((void*) kernel) == moe_mixedk_kernel_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        moe_mixedk_kernel_attr_set[device].insert((void*) kernel);
+        cuda_check(cudaPeekAtLastError());
+    }
+
+    void* _hidden_state = hidden_state.data_ptr();
+    void* _temp_state_g = temp_state_g.data_ptr();
+    void* _temp_state_u = temp_state_u.data_ptr();
+    void* _temp_intermediate_g = temp_intermediate_g.data_ptr();
+    void* _temp_intermediate_u = temp_intermediate_u.data_ptr();
+    void* _output_state = output_state.data_ptr();
+
+    void* _gate_ptrs_trellis = gate_ptrs_trellis.data_ptr();
+    void* _gate_ptrs_suh = gate_ptrs_suh.data_ptr();
+    void* _gate_ptrs_svh = gate_ptrs_svh.data_ptr();
+    void* _up_ptrs_trellis = up_ptrs_trellis.data_ptr();
+    void* _up_ptrs_suh = up_ptrs_suh.data_ptr();
+    void* _up_ptrs_svh = up_ptrs_svh.data_ptr();
+    void* _down_ptrs_trellis = down_ptrs_trellis.data_ptr();
+    void* _down_ptrs_suh = down_ptrs_suh.data_ptr();
+    void* _down_ptrs_svh = down_ptrs_svh.data_ptr();
+
+    void* _expert_count = expert_count.data_ptr();
+    void* _token_sorted = token_sorted.data_ptr();
+    void* _weight_sorted = weight_sorted.data_ptr();
+
+    void* _K_gate_arr = K_gate_arr.data_ptr();
+    void* _K_up_arr = K_up_arr.data_ptr();
+    void* _K_down_arr = K_down_arr.data_ptr();
+
+    void* kernelArgs[] =
+    {
+        &_hidden_state,
+        &_temp_state_g,
+        &_temp_state_u,
+        &_temp_intermediate_g,
+        &_temp_intermediate_u,
+        &_output_state,
+        &_gate_ptrs_trellis,
+        &_gate_ptrs_suh,
+        &_gate_ptrs_svh,
+        &_up_ptrs_trellis,
+        &_up_ptrs_suh,
+        &_up_ptrs_svh,
+        &_down_ptrs_trellis,
+        &_down_ptrs_suh,
+        &_down_ptrs_svh,
+        &_expert_count,
+        &_token_sorted,
+        &_weight_sorted,
+        (void*) &hidden_dim,
+        (void*) &intermediate_dim,
+        (void*) &num_experts,
+        (void*) &num_experts_per_tok,
+        (void*) &max_tokens_per_expert,
+        (void*) &num_groups,
+        (void*) &act_limit,
+        (void*) &act_function,
+        &_K_gate_arr,
+        &_K_up_arr,
+        &_K_down_arr,
+        (void*) &locks,
+        &_output_scratch,
+        &_fused_base,
+        (void*) &count_lo,
+        (void*) &count_hi
+    };
+
+    cudaLaunchKernel
+    (
+        (void*) kernel,
+        grid_dim,
+        block_dim,
+        kernelArgs,
+        SMEM_MAX,
+        stream
+    );
+
+    cuda_check(cudaPeekAtLastError());
+}

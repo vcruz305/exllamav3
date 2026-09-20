@@ -8,6 +8,10 @@ from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.model_tp_alloc import TPAllocation
 
+import os as _os
+_EMBED_GPU = _os.environ.get("EXL3_EMBED_GPU", "1") != "0"
+_EMBED_GPU_MAX_MB = int(_os.environ.get("EXL3_EMBED_GPU_MAX_MB", "4096"))
+
 class Embedding(Module):
 
     def __init__(
@@ -53,6 +57,11 @@ class Embedding(Module):
             device = "meta"
         )
         self.embedding.weight = nn.Parameter(weight)
+        # Optional device mirror of the table so callers with cuda input_ids (the MTP draft
+        # chain) can embed without a host round trip. EXL3_EMBED_GPU=0 disables; default on
+        # for tables up to EXL3_EMBED_GPU_MAX_MB (4096)
+        self._gpu_mirror = None
+        self._gpu_mirror_dev = None
 
     @override
     def unload(self):
@@ -145,7 +154,21 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
-            x = self.embedding.forward(x)
+            if x.device.type == "cuda" and self.device is not None and self.device.type == "cpu":
+                # cuda ids against a CPU-resident table: use (or build) the device mirror
+                if self._gpu_mirror is None or self._gpu_mirror_dev != x.device:
+                    self._gpu_mirror = None
+                    if _EMBED_GPU:
+                        w = self.embedding.weight.data
+                        if w.numel() * w.element_size() <= _EMBED_GPU_MAX_MB << 20:
+                            self._gpu_mirror = w.to(x.device, non_blocking = False)
+                            self._gpu_mirror_dev = x.device
+                if self._gpu_mirror is not None:
+                    x = torch.nn.functional.embedding(x, self._gpu_mirror)
+                else:
+                    x = self.embedding.forward(x.cpu())
+            else:
+                x = self.embedding.forward(x)
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
