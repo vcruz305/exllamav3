@@ -1133,6 +1133,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
+                elif getattr(self, "mixedk_unified", False) and num_tokens * top_k <= getattr(self, "_mkd_fused_rows", TEMP_ROWS_FUSED):
+                    expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
 
@@ -1275,7 +1277,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # === Mixed-K unified fused dispatch (one launch for ALL experts) ===
                 mixedk_handled = set()
-                if getattr(self, "mixedk_unified", False) and expert_count_list is not None:
+                if getattr(self, "mixedk_unified", False):
                     # Allocate fused buffers on first use
                     if not hasattr(self, "_mkd_bufs") or self._mkd_bufs is None:
                         H = self.expert_size
@@ -1299,7 +1301,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         )
                     _mkd_rows = self._mkd_fused_rows
                     # Count active experts within fused row cap
-                    counts_fused = [c for c in expert_count_list[:num_ex] if 0 < c <= _mkd_rows]
+                    if expert_count_list is not None:
+                        counts_fused = [c for c in expert_count_list[:num_ex] if 0 < c <= _mkd_rows]
+                    else:
+                        # GPU fast path — small readback of just the fused count
+                        _ec = expert_count[:num_ex]
+                        _m = (_ec > 0) & (_ec <= _mkd_rows)
+                        counts_fused = _ec[_m].tolist()
                     if counts_fused:
                         def run_mixedk_fused(num_active, count_lo=1, count_hi=_mkd_rows, m_tile=16):
                             ext.exl3_moe_mixedk(
@@ -1349,9 +1357,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         else:
                             run_mixedk_fused(len(counts_fused))
                         # Mark ALL experts with tokens as handled (fused kernel processes them)
-                        for e in range(num_ex):
-                            c = expert_count_list[e]
-                            if 0 < c <= _mkd_rows:
+                        if expert_count_list is not None:
+                            for e in range(num_ex):
+                                c = expert_count_list[e]
+                                if 0 < c <= _mkd_rows:
+                                    mixedk_handled.add(e)
+                        else:
+                            _ec = expert_count[:num_ex]
+                            for e in ((_ec > 0) & (_ec <= _mkd_rows)).nonzero(as_tuple=True)[0].tolist():
                                 mixedk_handled.add(e)
                 # === Legacy Mixed-K per-K-group fused dispatch (atomic accumulation) ===
                 elif hasattr(self, "mixedk_k_groups") and self.mixedk_k_groups and expert_count_list is not None:
