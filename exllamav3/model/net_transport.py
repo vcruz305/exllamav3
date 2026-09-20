@@ -222,12 +222,15 @@ class NetEndpoint:
         )
         self._sendall(header)
 
-        # TODO: this copies the payload once more than necessary. Sending from a memoryview of the
-        # storage needs a dtype-safe way to get those bytes (torch has no public buffer protocol for
-        # bfloat16/bool), so measure before optimizing: at 10 KB per decode hidden state the copy is
-        # noise, and it only matters for prefill-sized chunks
+        # Send exactly the payload. For a CUDA source, send_data is a VIEW into the reused
+        # pinned staging buffer, which _get_pinned_buffer over-allocates (size * 1.5 + 1024)
+        # and never shrinks, so untyped_storage() hands over the whole allocation: the header
+        # declares payload_len while the socket receives more, and the surplus desynchronises
+        # the stream on the next message. A uint8 view is exactly payload_len bytes, and it
+        # also gives numpy a dtype it always supports, which is what made the byte-exact path
+        # awkward for bfloat16 and bool, so this is zero-copy rather than one copy worse.
         if send_data.numel() > 0:
-            self._sendall(bytes(send_data.untyped_storage()))
+            self._sendall(memoryview(send_data.view(torch.uint8).numpy()))
 
     def recv_tensor(self, out: torch.Tensor | None = None) -> torch.Tensor:
         """
