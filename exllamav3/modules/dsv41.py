@@ -104,6 +104,42 @@ class DSV41Compressor:
             comp = kv.sum(dim = 2)
         return self.norm.forward(comp.half(), params)
 
+    # ---- tensor-parallel support -------------------------------------------------------
+    # Headless shared pool entries, fully replicated per rank, same as DSV4Compressor.
+    # Note wgate is None when compress_rate == 1 (ratio-1 layers are a plain projection).
+
+    def make_bc(self, inv_freq):
+        # No-op. This compressor applies no position bias (see the class docstring),
+        # so there is no rope-derived state to precompute; project() and pool() read
+        # none. DSV4Compressor needs this hook, V4.1 does not.
+        return
+
+    def tp_export(self, plan, producer):
+        return {
+            "cls": DSV41Compressor,
+            "args": {
+                "key": self.key,
+                "head_dim": self.head_dim,
+                "compress_rate": self.compress_rate,
+            },
+            "wkv": self.wkv.tp_export(plan, producer),
+            "wgate": self.wgate.tp_export(plan, producer) if self.wgate is not None else None,
+            "norm": self.norm.tp_export(plan, producer),
+        }
+
+    @staticmethod
+    def tp_import(local_context, exported, plan, attn):
+        def _imp(name):
+            e = exported.get(name)
+            return e["cls"].tp_import(local_context, e, plan) if e is not None else None
+        a = exported["args"]
+        comp = DSV41Compressor(
+            attn, a["key"], a["head_dim"], a["compress_rate"], None, 0)
+        comp.wkv = _imp("wkv")
+        comp.wgate = _imp("wgate")
+        comp.norm = _imp("norm")
+        return comp
+
 
 class DSV41LayerState(DSV4LayerState):
     """Ring state of the V4 module plus, for gated kv sources, the projected rows of the
@@ -184,7 +220,12 @@ class DSV41Attention(DSV4Attention):
             for m in self.compressor.modules():
                 self.register_submodule(m)
             self.caps.update({"kv_cache": True})
-        if is_index_source:
+        # `and self.idx_wq_b is None`: under TP the parent has already assigned the
+        # imported projections (dsv4.py:858-859 -> :505-506), and rebuilding them here
+        # with config = None would replace them with empty shells (inner = None) that
+        # only fail later, inside the indexer's forward. Same guard the parent uses for
+        # the identical construction at dsv4.py:527.
+        if is_index_source and self.idx_wq_b is None:
             self.idx_wq_b = Linear(config, f"{key}.indexer.wq_b", self.q_lora_rank_, self.index_n_heads * self.index_head_dim,
                                    qmap = f"{key}.q_b", out_dtype = torch.half, trim_padded_out = True, select_hq_bits = select_hq_bits)
             self.idx_weights = Linear(config, f"{key}.indexer.weights_proj", self.hidden_size, self.index_n_heads,

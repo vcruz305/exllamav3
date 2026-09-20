@@ -428,7 +428,12 @@ class DSV4LayerState:
 
     def tp_export(self, plan):
         return {
-            "cls": DSV4LayerState,
+            # type(self), not the literal: DSV41LayerState subclasses this and does not
+            # override tp_export, so hardcoding the parent made every worker rebuild it
+            # and lose pend_kv / pend_gate (dsv41.py:150-154). Same defect as the
+            # "cls": DSV4Attention hardcode in dsv4.py:748. Constructor signatures match,
+            # so the exported args are unchanged.
+            "cls": type(self),
             "args": {
                 "cache_id": self.cache_id,
                 "max_history": self.max_history,
