@@ -7,6 +7,7 @@ from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
+from collections import defaultdict as _defaultdict
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
@@ -372,6 +373,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     raise ValueError(f"Unknown gateless activation function {activation_fn}")
 
         self.is_quantized = False
+        self.uniform_expert_q = True
         self.support_fused = False
         self.support_quant_paths = False
         self.multi_gate = None
@@ -456,12 +458,20 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
+        # Mixed-K: skip MultiLinear/fused when experts differ in (K, mcg, mul1).
+        def _uniform_q(ls):
+            return not ls or len({(l.inner.K, l.inner.mcg, l.inner.mul1) for l in ls}) <= 1
+        self.uniform_expert_q = self.is_quantized and all(
+            _uniform_q(ls) for ls in ((self.gates if self.gated else []), self.ups, self.downs))
+        if self.is_quantized and not self.uniform_expert_q:
+            print(f" -- Mixed-K experts in {self.key}: dense per-expert path")
+
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
-            self.is_quantized and
+            self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -475,12 +485,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            self.is_quantized and
+            self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
         )
 
+        self.mixedk_k_groups = []
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
@@ -489,17 +500,43 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
 
+        # Mixed-K: build per-K-group MultiLinears for fused dispatch
+        if self.is_quantized and not self.uniform_expert_q and not self.config.infer_params.no_reconstruct:
+            buckets = _defaultdict(list)
+            for i in range(len(self.ups)):
+                gk = self.gates[i].inner.K if self.gated else self.ups[i].inner.K
+                uk = self.ups[i].inner.K
+                dk = self.downs[i].inner.K
+                mcg_v = self.ups[i].inner.mcg
+                mul1_v = self.ups[i].inner.mul1
+                buckets[(gk, uk, dk, mcg_v, mul1_v)].append(i)
+            for (gk, uk, dk, mcg_v, mul1_v), experts in sorted(buckets.items(), key=lambda x: -len(x[1])):
+                if len(experts) < 4:
+                    continue
+                try:
+                    mg = MultiLinear(self.device, [self.gates[e] for e in experts], allow_bias=True) if self.gated else None
+                    mu = MultiLinear(self.device, [self.ups[e] for e in experts], allow_bias=True)
+                    md = MultiLinear(self.device, [self.downs[e] for e in experts], allow_bias=True)
+                except Exception:
+                    continue
+                g2l = {e: j for j, e in enumerate(experts)}
+                self.mixedk_k_groups.append((experts, mg, mu, md, g2l))
+            if self.mixedk_k_groups:
+                n_fused = sum(len(g[0]) for g in self.mixedk_k_groups)
+                print(f" -- Mixed-K fused groups in {self.key}: {len(self.mixedk_k_groups)} groups, {n_fused}/{len(self.ups)} experts fused")
+
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
-            cbs = (
-                self.multi_gate.q_cb() if self.gated else self.multi_up.q_cb(),
-                self.multi_up.q_cb(),
-                self.multi_down.q_cb(),
-            )
-            self.support_fused = (
-                cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
-                self.support_quant_paths
-            )
+            if self.multi_up is not None:
+                cbs = (
+                    self.multi_gate.q_cb() if self.gated else self.multi_up.q_cb(),
+                    self.multi_up.q_cb(),
+                    self.multi_down.q_cb(),
+                )
+                self.support_fused = (
+                    cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
+                    self.support_quant_paths
+                )
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
@@ -1175,6 +1212,76 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
                                         tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
 
+                # === Mixed-K per-K-group fused dispatch (atomic accumulation) ===
+                mixedk_handled = set()
+                if hasattr(self, "mixedk_k_groups") and self.mixedk_k_groups and expert_count_list is not None:
+                    _starts = [0] * (num_ex + 1)
+                    for _e in range(num_ex):
+                        _starts[_e + 1] = _starts[_e] + expert_count_list[_e]
+                    for grp_experts, mg, mu, md, g2l in self.mixedk_k_groups:
+                        grp_count_list = []
+                        grp_token_parts = []
+                        grp_weight_parts = []
+                        for j, e in enumerate(grp_experts):
+                            c = expert_count_list[e] if e < len(expert_count_list) else 0
+                            grp_count_list.append(c)
+                            if c > 0:
+                                s = _starts[e]
+                                grp_token_parts.append(token_sorted[s:s+c])
+                                grp_weight_parts.append(weight_sorted[s:s+c])
+                        grp_total = sum(grp_count_list)
+                        if grp_total == 0:
+                            continue
+                        grp_count_t = torch.tensor(grp_count_list + [0], dtype=torch.long, device=y.device)
+                        grp_token_t = torch.cat(grp_token_parts)
+                        grp_weight_t = torch.cat(grp_weight_parts)
+                        multi_gate = mg if self.gated else mu
+                        if not hasattr(self, "_mkd_bufs") or self._mkd_bufs is None:
+                            H = self.expert_size
+                            I = self.intermediate_size_padded
+                            C_max = ext.exl3_moe_max_concurrency(torch.device(self.device).index)
+                            R = TEMP_ROWS_FUSED
+                            self._mkd_bufs = FusedBuffers(
+                                temp_state_g=g_tensor_cache.get(self.device, (C_max, R, H), torch.half, "mkd_state_g"),
+                                temp_state_u=g_tensor_cache.get(self.device, (C_max, R, H), torch.half, "mkd_state_u"),
+                                temp_intermediate_g=g_tensor_cache.get(self.device, (C_max, R, I), torch.half, "mkd_interm_g"),
+                                temp_intermediate_u=g_tensor_cache.get(self.device, (C_max, R, I), torch.half, "mkd_interm_u"),
+                            )
+                        ext.exl3_moe(
+                            y,
+                            final_hidden_states,
+                            grp_count_t,
+                            grp_token_t,
+                            grp_weight_t,
+                            self._mkd_bufs.temp_state_g,
+                            self._mkd_bufs.temp_state_u,
+                            self._mkd_bufs.temp_intermediate_g,
+                            self._mkd_bufs.temp_intermediate_u,
+                            self.activation_fn_idx,
+                            multi_gate.K,
+                            mu.K,
+                            md.K,
+                            multi_gate.ptrs_trellis,
+                            multi_gate.ptrs_suh,
+                            multi_gate.ptrs_svh,
+                            mu.ptrs_trellis,
+                            mu.ptrs_suh,
+                            mu.ptrs_svh,
+                            md.ptrs_trellis,
+                            md.ptrs_suh,
+                            md.ptrs_svh,
+                            multi_gate.mcg,
+                            multi_gate.mul1,
+                            mu.mcg,
+                            mu.mul1,
+                            md.mcg,
+                            md.mul1,
+                            self.act_limit,
+                            -1,
+                            None, None,
+                            1, TEMP_ROWS_FUSED, 16,
+                        )
+                        mixedk_handled.update(grp_experts)
                 out_state = None
                 interm = None
                 interm_a = None
@@ -1185,7 +1292,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
                     end = start + count
-                    if count <= min_rows or expert_idx in batched:
+                    if count <= min_rows or expert_idx in batched or expert_idx in mixedk_handled:
                         start = end
                         continue
 
