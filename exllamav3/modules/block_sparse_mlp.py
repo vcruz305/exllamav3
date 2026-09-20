@@ -1084,8 +1084,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
-            not (self.support_quant_paths or bszn_eligible or
-                 getattr(self, "mixedk_unified", False))
+            getattr(self, "mixedk_unified", False) or
+            not (self.support_quant_paths or bszn_eligible)
         ):
             # One spare row: the batched reconstruct tier's padding sink (never read back)
             fhs_ext = torch.zeros((y.shape[0] + 1, y.shape[1]), dtype = torch.float, device = y.device)
@@ -1508,6 +1508,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized configuration that reaches this point has self.bc (it is built whenever the
         # quantized paths apply), so this is the last tier
         else:
+            if not bszn_eligible:
+                import sys
+                sys.stderr.write("BSZN_FAIL bsz=%d f_thresh=%d bc=%s quant=%s mixedk=%s support_quant=%s\n" % (
+                    bsz, self.f_threshold, self.bc is not None, self.is_quantized,
+                    getattr(self, "mixedk_unified", False), getattr(self, "support_quant_paths", False)))
+                sys.stderr.flush()
             assert bszn_eligible
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
