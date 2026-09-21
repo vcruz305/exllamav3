@@ -58,6 +58,7 @@ from .solar_open_moe import SolarOpenMoeModel
 from .spark2_5 import Spark2_5Model
 from .step3_5 import Step3_5Model
 from .step3_7 import Step3_7Model
+from .step5_robotics import Step5RoboticsModel
 
 ARCHITECTURES = {
     m.config_class.arch_string: {
@@ -130,6 +131,7 @@ ARCHITECTURES = {
         Spark2_5Model,
         Step3_5Model,
         Step3_7Model,
+        Step5RoboticsModel,
     ]
 }
 
