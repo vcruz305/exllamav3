@@ -42,6 +42,13 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+# Minimum routed row count (tokens * experts-per-token) for the unified mixed-K kernel. That
+# kernel reads K per expert from a device array (exl3_moe_kernel.cuh: K_gate_arr[expert_idx]
+# and siblings) whereas the K-specialized exl3_moe instances take it as a template parameter
+# (exl3_moe.cu: "K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time"), so the unified
+# launch cannot unroll the trellis decode loop. Row tiles amortize that at prefill but not at
+# one token. 0 keeps the current behaviour of using it wherever it is available
+MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -1033,6 +1040,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
         bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
 
+        # One decision for the unified mixed-K path, taken here and applied at every site below
+        # (branch guard, readback suppression, tier plan, slot tables, dispatch) so they cannot
+        # disagree: mixedk_unified decides whether this branch is entered at all, and the row
+        # tests further down assume the same answer. selected_experts is
+        # (tokens, experts-per-token) on every routing path, so this is the row count the
+        # flattened assignments carry, matching the num_tokens * top_k tests below
+        mixedk_unified_ok = getattr(self, "mixedk_unified", False) and \
+            bsz * self.num_experts_per_tok >= MIXEDK_MIN_ROWS
+
         # Routing
         if self.router_pre_norm:
             z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
@@ -1084,7 +1100,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         elif (
             (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
-            getattr(self, "mixedk_unified", False) or
+            mixedk_unified_ok or
             not (self.support_quant_paths or bszn_eligible)
         ):
             # One spare row: the batched reconstruct tier's padding sink (never read back)
@@ -1133,7 +1149,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
-                elif getattr(self, "mixedk_unified", False) and num_tokens * top_k <= getattr(self, "_mkd_fused_rows", TEMP_ROWS_FUSED):
+                elif mixedk_unified_ok and num_tokens * top_k <= getattr(self, "_mkd_fused_rows", TEMP_ROWS_FUSED):
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
@@ -1150,7 +1166,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if self.fused_mode_buffers is not None:
                         min_rows = self.fused_rows
                         fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
-                    elif getattr(self, "mixedk_unified", False):
+                    elif mixedk_unified_ok:
                         _mkd_r = getattr(self, "_mkd_fused_rows", FUSED_ROWS_WIDE if (MTILE and getattr(self, "mixedk_mul1", False)) else TEMP_ROWS_FUSED)
                         min_rows = _mkd_r
                         fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= _mkd_r)
@@ -1195,7 +1211,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 c = expert_count_list[e]
                                 if 0 < c <= self.fused_rows:
                                     base[e] = n_slots; kind[e] = 1; n_slots += c
-                        elif getattr(self, "mixedk_unified", False):
+                        elif mixedk_unified_ok:
                             _mkd_r2 = getattr(self, "_mkd_fused_rows", FUSED_ROWS_WIDE if (MTILE and getattr(self, "mixedk_mul1", False)) else TEMP_ROWS_FUSED)
                             for e in range(num_ex):
                                 c = expert_count_list[e]
@@ -1277,7 +1293,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # === Mixed-K unified fused dispatch (one launch for ALL experts) ===
                 mixedk_handled = set()
-                if getattr(self, "mixedk_unified", False):
+                if mixedk_unified_ok:
                     # Allocate fused buffers on first use
                     if not hasattr(self, "_mkd_bufs") or self._mkd_bufs is None:
                         H = self.expert_size
