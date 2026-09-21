@@ -20,7 +20,11 @@
 // kernel with a runtime tier switch: the tiers' register frames would otherwise share one
 // 128-register budget and the 16-row path pays for tiles it never runs (measured +60-70% on
 // Ada/Ampere for that arrangement)
-template<int t_bits, int cb, int MT, int N_TILE>
+// SH / FS_IN: shared-memory stage ring and fragment-pipeline depth. Defaults reproduce the
+// original shape (MOE_SH_STAGES / MOE_FRAG_STAGES, 2 for the 64-row tile); the mixed-K kernel
+// carries them as template parameters so deeper-pipeline variants can be built and selected at
+// launch without touching the uniform instances.
+template<int t_bits, int cb, int MT, int N_TILE, int SH = MOE_SH_STAGES, int FS_IN = 0>
 __device__ __forceinline__
 void moe_gemm_tile
 (
@@ -35,9 +39,9 @@ void moe_gemm_tile
 )
 {
     // Fragment pipeline depth: the 64-row tile keeps two B stages so its A fragments fit
-    constexpr int FS = (MT >= 64) ? 2 : MOE_FRAG_STAGES;
+    constexpr int FS = (FS_IN > 0) ? FS_IN : ((MT >= 64) ? 2 : MOE_FRAG_STAGES);
     #define ARGS in_addr, trellis, out_addr, MIN(size_m, MT), size_k, size_n, locks, nullptr
-    #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, MOE_SH_STAGES, FS
+    #define SHAPE_ARGS MT, MOE_TILESIZE_K, N_TILE, SH, FS
     if constexpr (t_bits)
         exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
     else switch(K)
@@ -303,7 +307,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
 
 
 // Mixed-K per-expert kernel: K varies per expert, always uses the runtime K dispatch (t_bits=0)
-template<int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M>
+template<int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M,
+         int SH = MOE_SH_STAGES, int FS = 0>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
 {
@@ -401,18 +406,18 @@ void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
                 int tm;
                 if constexpr (M_TILE >= 64)
                 {
-                    if (size_m > 32)      { moe_gemm_tile<0, cb, 64, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
-                    else if (size_m > 16) { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 32)      { moe_gemm_tile<0, cb, 64, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 64; }
+                    else if (size_m > 16) { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else if constexpr (M_TILE == 32)
                 {
-                    if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
-                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
+                    else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
                 else
                 {
-                    moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
+                    moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;
                 }
                 in_addr += tm * size_k;
                 out_addr += tm * size_n;

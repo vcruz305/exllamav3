@@ -67,7 +67,7 @@ def get_temp_buffers(device, K: int, tile_len: int = 256, cb: int = 0):
     # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
     # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
     # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
-    max_batch_size = 2048
+    max_batch_size = 256
     if K >= 4:
         mp_count = torch.cuda.get_device_properties(device).multi_processor_count
         # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)

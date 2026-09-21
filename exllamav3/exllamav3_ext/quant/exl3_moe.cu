@@ -499,6 +499,58 @@ void exl3_moe_gather
 // ---- Mixed-K entry point: appended to exl3_moe.cu ----
 #include "comp_units/exl3_moe_mixedk_instances.cuh"
 
+// ---- Mixed-K launch tuning -------------------------------------------------------------
+// Dynamic shared memory a mixedk instance actually needs, mirroring the layout in
+// exl3_gemm_inner.cuh: SH_STAGES x (A stage + B stage) + the C / cross-block reduction
+// staging. The generic path requests SMEM_MAX (90 KB) for every shape, which on sm_121
+// (100 KB smem/SM, smem/block_optin 99 KB) caps occupancy at ONE 512-thread block per SM;
+// asking for the real footprint admits two blocks per SM and doubles the memory-level
+// parallelism the kernel can keep in flight. K is a runtime value here, so size for the
+// widest case (K = 8). EXL3_MK_SMEM overrides the result for sweeps.
+//
+// sh_c bounds: the reduction buffer (FRAGS_N_PER_WARP * 4 floats per thread, t < 256 ->
+// 2048 floats at TILEBLOCKS_M == 1), the C staging in write_sum_tile_sh and the pre-hadamard
+// input (row * TILESIZE_N + col * 128 + 128 <= 2048 floats). 2x the exact requirement is used.
+static size_t exl3_moe_mixedk_smem_bytes(int m_tile, int n_tile, int bits, int sh_stages)
+{
+    const int tileblocks_m = m_tile / 16;
+    const int tileblocks_k = MOE_TILESIZE_K / 16;
+    const int tileblocks_n = n_tile / 16;
+    const size_t sh_a = (size_t) m_tile * MOE_TILESIZE_K * 2;                                  // halfs -> bytes
+    const size_t sh_b = (size_t) tileblocks_k * tileblocks_n * (256 / 16) * bits * 2;           // uint16s -> bytes
+    const int frags_n_per_warp = 2 * tileblocks_n / (EXL3_GEMM_BASE_THREADS / 32);
+    const size_t sh_c = (size_t) MAX(4 * EXL3_GEMM_BASE_THREADS * frags_n_per_warp * tileblocks_m,
+                                     n_tile * m_tile);                                          // floats
+    return (size_t) sh_stages * (sh_a + sh_b) + 2 * 4 * sh_c;
+}
+
+static int exl3_moe_env_int(const char* name, int def)
+{
+    const char* v = getenv(name);
+    if (!v || !*v) return def;
+    int r = atoi(v);
+    return r;
+}
+
+static int exl3_moe_mixedk_blocks_per_sm()
+{
+    // Default 1: the original geometry (group_size = num_sms / num_groups), which measured
+    // identical to the 2-blocks-per-SM grid on GB10 -- the kernel is not occupancy-limited, and
+    // a grid change perturbs the fp reduction order for nothing. 2 (or more) remains available
+    // for other shapes/configs.
+    return MAX(1, exl3_moe_env_int("EXL3_MK_BPS", 1));
+}
+
+// Group count sanity: each group owns one slice of the temp buffers (so concurrency is the
+// hard upper bound) and occupies MOE_SMS_PER_EXPERT blocks at its narrowest, which must still
+// fit the SM count x blocks-per-SM
+static bool exl3_moe_groups_ok(size_t concurrency, int target_blocks)
+{
+    return concurrency * MOE_SMS_PER_EXPERT <= (size_t) target_blocks;
+}
+
+static bool exl3_moe_mixedk_debug_done = false;
+
 std::set<void*> moe_mixedk_kernel_attr_set[MAX_DEVICES] = {};
 
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances[] =
@@ -507,6 +559,16 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances[] =
     exl3_moe_mixedk_kernel_n128_cb1(), exl3_moe_mixedk_kernel_n256_cb1(),
     exl3_moe_mixedk_kernel_n128_cb2(), exl3_moe_mixedk_kernel_n256_cb2(),
 };
+
+// Deeper-pipeline variants of the m16 / n128 / mul1 instance (the mixed-K decode hot path):
+// SH = smem stage ring depth, FS = fragment pipeline depth. EXL3_MK_SHPIPE selects one at launch
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_sh[] =
+{
+    exl3_moe_mixedk_kernel_n128_cb2_sh4fs3(),   // EXL3_MK_SHPIPE=43 (SH_STAGES=4, MOE_FRAG_STAGES)
+    exl3_moe_mixedk_kernel_n128_cb2_sh6fs5(),   // EXL3_MK_SHPIPE=65 (SH_STAGES=6, FRAG_STAGES=5)
+};
+static const int exl3_moe_mixedk_kernel_sh_stages[] = { 4, 6 };
+static const int exl3_moe_mixedk_kernel_sh_frag[] = { 3, 5 };
 
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m32[] =
 {
@@ -644,19 +706,26 @@ void exl3_moe_mixedk
     int* locks = DevCtx::instance().get_locks(device);
 
     int block_dim = EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16;
-    TORCH_CHECK(concurrency * MOE_SMS_PER_EXPERT <= (size_t) num_sms, "Concurrency too high for device num_sms");
+    // Blocks per SM the kernel can host with the sized-down dynamic smem below (two 512-thread
+    // blocks fit: 2 x 64 regs x 512 threads = the full 64K register file). EXL3_MK_BPS=1
+    // restores the previous one-block-per-SM grid
+    const int blocks_per_sm = exl3_moe_mixedk_blocks_per_sm();
+    const int target_blocks = num_sms * blocks_per_sm;
+    TORCH_CHECK(exl3_moe_groups_ok(concurrency, target_blocks),
+                "Concurrency too high for device num_sms");
     int num_groups = MIN((int) concurrency, MOE_MAX_GROUPS);
     int group_size = MOE_SMS_PER_EXPERT;
     if (num_active > 0)
     {
         num_groups = MIN(num_groups, num_active);
-        group_size = MIN(num_sms / num_groups, MOE_MAX_SMS_PER_EXPERT);
+        group_size = MIN(target_blocks / num_groups, MOE_MAX_SMS_PER_EXPERT);
     }
     dim3 grid_dim(group_size, 1, num_groups);
 
     int N_off = 0;
     if (hidden_dim % 256 == 0 && intermediate_dim % 256 == 0 && moe_tile_n_override() != 128) N_off = 1;
     fp_exl3_moe_mixedk_kernel kernel;
+    const int eff_m_tile = m_tile <= 16 ? 16 : (m_tile >= 64 ? 64 : 32);
     if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
@@ -666,6 +735,37 @@ void exl3_moe_mixedk
         TORCH_CHECK(cb_idx == 1, "exl3_moe_mixedk: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe_mixedk: temp buffers hold fewer rows than the tile");
         kernel = m_tile >= 64 ? exl3_moe_mixedk_kernel_instances_m64[0] : exl3_moe_mixedk_kernel_instances_m32[0];
+    }
+
+    // Deeper-pipeline instance selection (m16 / n128 / mul1 only, EXL3_MK_SHPIPE = 43 or 65)
+    int sh_stages_used = MOE_SH_STAGES;
+    int fs_used = MOE_FRAG_STAGES;
+    int pipe_sel = exl3_moe_env_int("EXL3_MK_SHPIPE", 0);
+    if (pipe_sel != 0 && cb_idx == 1 && N_off == 0 && m_tile <= 16)
+    {
+        int idx = (pipe_sel == 43) ? 0 : (pipe_sel == 65 ? 1 : -1);
+        if (idx >= 0)
+        {
+            kernel = exl3_moe_mixedk_kernel_instances_sh[idx];
+            sh_stages_used = exl3_moe_mixedk_kernel_sh_stages[idx];
+            fs_used = exl3_moe_mixedk_kernel_sh_frag[idx];
+        }
+    }
+
+    // Size the dynamic smem to the shape instead of always reserving SMEM_MAX
+    size_t smem_bytes = exl3_moe_mixedk_smem_bytes(eff_m_tile, N_off ? 256 : 128, 8, sh_stages_used);
+    int smem_override = exl3_moe_env_int("EXL3_MK_SMEM", 0);
+    if (smem_override > 0) smem_bytes = (size_t) smem_override;
+    smem_bytes = MIN(smem_bytes, (size_t) SMEM_MAX);
+    smem_bytes = MAX(smem_bytes, (size_t) 4096);
+
+    if (exl3_moe_env_int("EXL3_MK_DEBUG", 0) && !exl3_moe_mixedk_debug_done)
+    {
+        exl3_moe_mixedk_debug_done = true;
+        printf(" -- mixedk launch: grid=(%d,1,%d) block=%d smem=%zu (SMEM_MAX=%d) bps=%d active=%d mtile=%d N_off=%d SH=%d FS=%d\n",
+               group_size, num_groups, block_dim, smem_bytes, SMEM_MAX, blocks_per_sm,
+               num_active, eff_m_tile, N_off, sh_stages_used, fs_used);
+        fflush(stdout);
     }
 
     if (moe_mixedk_kernel_attr_set[device].find((void*) kernel) == moe_mixedk_kernel_attr_set[device].end())
@@ -744,7 +844,7 @@ void exl3_moe_mixedk
         grid_dim,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem_bytes,
         stream
     );
 

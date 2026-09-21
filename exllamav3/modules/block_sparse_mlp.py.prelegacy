@@ -576,11 +576,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     [self.downs[i].inner.svh.data_ptr() for i in range(_ne)], dtype=_torch.long, device=self.device)
                 self.mixedk_mcg = list(_all_mcg)[0]
                 self.mixedk_mul1 = list(_all_mul1)[0]
-                # EXL3_MIXEDK_LEGACY=1 selects the legacy per-K-group coop dispatch.
-                # Measured +5% on GB10 (sm_121): the grouped coop kernel is ~2.9x
-                # cheaper per call than the unified mixed-K kernel there.
-                _legacy = os.environ.get("EXL3_MIXEDK_LEGACY", "0") != "0"
-                self.mixedk_unified = not _legacy
+                self.mixedk_unified = True
                 # keep mixedk_k_groups populated so the legacy path can be selected at runtime
                 print(f" -- Mixed-K UNIFIED kernel enabled in {self.key}: {_ne} experts, K_up range [{_ku.min().item()},{_ku.max().item()}]")
 
