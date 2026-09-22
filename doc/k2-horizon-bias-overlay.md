@@ -21,8 +21,12 @@ sha256sum /path/outside-repo/k2-biases/k2-routing-bias-overlay.safetensors
 The expected SHA-256 for these pinned revisions is
 `8038de808fb396f4d5d337d373435523f167bfbc8558b5a6af09c1900408f53c`.
 The script checks both indices, relevant shard headers, byte ranges, shapes and
-45 quant `.None` payloads before writing. It uses HTTP ranges rather than
-fetching whole model shards. It produces the overlay and a local JSON manifest
+45 quant `.None` payloads, then verifies the **entire overlay SHA-256 against the
+pinned digest above before writing either file**. It requires a stable ETag on
+each shard range, refuses safetensors headers over 16 MiB before fetching them,
+and disables `requests` environment trust (including implicit `.netrc` auth and
+environment proxies). It uses HTTP ranges rather than fetching whole model
+shards. It produces the overlay and a local JSON manifest
 with revisions, index hashes, per-tensor provenance and hashes, and `.None`
 classifications; reruns overwrite these two files **only in the output dir**.
 Keep the output outside the checkout and do not commit the generated weights
@@ -41,6 +45,8 @@ config = Config.from_directory(
 Do not modify or upload the quant repository; do not rename `.mlp.None` tensors.
 K2 loading fails closed on missing required biases or a missing overlay path.
 The router bias participates in **selection only**, not the projection logits.
-The integrated K2 changes had 29/29 CPU tests passing; the extractor's offline
-checks can be run with `python -m pytest -q tests/test_k2_bias_overlay_extractor.py`.
-No full-model GPU load/generation smoke is claimed until separately verified.
+Run offline regression checks with
+`python -m pytest -q tests/test_k2_bias_overlay_extractor.py tests/test_k2_horizon.py`.
+An earlier Spark2 6.50bpw overlay load and short cached decode (` Paris.`)
+succeeded, but the latest source fixes have **not** been rerun on GPU; this
+limited smoke is not a broad generation validation.

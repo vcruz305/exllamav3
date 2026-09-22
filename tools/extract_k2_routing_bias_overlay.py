@@ -26,6 +26,8 @@ QUANT_SUBDIR = "6.50bpw/"
 PATTERN = re.compile(r"^model\.layers\.(\d+)\.(self_attn\.v_router|mlp\.gate)\.bias$")
 NONE_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.None$")
 SIZES = {"self_attn.v_router": 64, "mlp.gate": 100}
+MAX_HEADER_BYTES = 16 * 1024 * 1024
+EXPECTED_OVERLAY_SHA256 = "8038de808fb396f4d5d337d373435523f167bfbc8558b5a6af09c1900408f53c"
 
 
 def url(repo: str, revision: str, filename: str) -> str:
@@ -34,6 +36,7 @@ def url(repo: str, revision: str, filename: str) -> str:
 
 def session() -> requests.Session:
     client = requests.Session()
+    client.trust_env = False  # Never import .netrc auth (or proxy settings) for public endpoints.
     retry = Retry(total=4, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
     client.mount("https://", HTTPAdapter(max_retries=retry))
     return client
@@ -55,8 +58,8 @@ def range_bytes(client: requests.Session, address: str, start: int, end: int,
         if total is not None and total != size:
             raise ValueError("Shard size changed between range requests")
         got_etag = response.headers.get("ETag")
-        if etag and got_etag and etag != got_etag:
-            raise ValueError("Shard ETag changed between range requests")
+        if etag is not None and etag != got_etag:
+            raise ValueError("Shard ETag missing or changed between range requests")
         raw = response.content
         if len(raw) != end - start + 1:
             raise ValueError(f"Truncated/wrong range {lo}-{hi} for {start}-{end}")
@@ -68,8 +71,10 @@ def range_bytes(client: requests.Session, address: str, start: int, end: int,
 def shard_header(client: requests.Session, address: str) -> tuple[dict, int, int, str | None, str]:
     # Source shard headers fit in 64 KiB; large quant headers use the fallback.
     first, total, etag, resolved = range_bytes(client, address, 0, 65535)
+    if not etag:
+        raise ValueError("Shard ETag missing on initial range request")
     length = struct.unpack("<Q", first[:8])[0]
-    if not 0 < length < total - 8:
+    if not 0 < length <= MAX_HEADER_BYTES or length >= total - 8:
         raise ValueError(f"Invalid safetensors header length: {length}")
     if length + 8 > len(first):
         header, _, _, resolved = range_bytes(client, resolved, 8, 7 + length, total=total, etag=etag)
@@ -192,6 +197,9 @@ def main(argv: list[str] | None = None) -> None:
         status = "source_gate_bias_widened_f32" if raw == expected_f32 else "all_zero" if not any(raw) else "different_nonzero"
         none_classifications[key] = {"classification": status, "sha256": hashlib.sha256(raw).hexdigest()}
     overlay = make_overlay(tensors, details)
+    overlay_sha = hashlib.sha256(overlay).hexdigest()
+    if overlay_sha != EXPECTED_OVERLAY_SHA256:
+        raise ValueError(f"Overlay SHA-256 mismatch: {overlay_sha} != {EXPECTED_OVERLAY_SHA256}")
     manifest = {
         "schema": "k2-routing-bias-overlay-v1", "source_repo": SOURCE_REPO, "source_revision": SOURCE_REV,
         "source_index_sha256": source_sha, "quant_repo": QUANT_REPO, "quant_revision": QUANT_REV,
@@ -200,7 +208,7 @@ def main(argv: list[str] | None = None) -> None:
         "quant_mlp_None": none_classifications,
         "quant_mlp_None_classification_counts": {status: sum(v["classification"] == status for v in none_classifications.values())
                                                    for status in ("source_gate_bias_widened_f32", "all_zero", "different_nonzero")},
-        "overlay_file": overlay_path.name, "overlay_sha256": hashlib.sha256(overlay).hexdigest(),
+        "overlay_file": overlay_path.name, "overlay_sha256": overlay_sha,
         "tensors": {key: details[key] for key in sorted(details)},
         "note": "All 90 bias names are absent from the 6.50bpw quant index and shard headers. 45 quant .mlp.None tensors are F32 and misnamed; their content classification is recorded separately. No equivalent v_router.bias tensor name was found. This overlay is not installed into the quant model."
     }
