@@ -25,10 +25,22 @@ The script checks both indices, relevant shard headers, byte ranges, shapes and
 pinned digest above before writing either file**. It requires a stable ETag on
 each shard range, refuses safetensors headers over 16 MiB before fetching them,
 and disables `requests` environment trust (including implicit `.netrc` auth and
-environment proxies). It uses HTTP ranges rather than fetching whole model
-shards. It produces the overlay and a local JSON manifest
+environment proxies). Redirects are checked **before** each follow-up request:
+only HTTPS on port 443 (or the implicit HTTPS default) to `huggingface.co` / its
+subdomains or `hf.co` / its subdomains is accepted. URL credentials, other hosts,
+HTTP downgrades and more than five redirects are rejected. The observed
+`us.aws.cdn.hf.co` shard redirect is allowed; unrelated HTTPS hosts are not.
+Both index and range responses are streamed with byte limits (32 MiB per index,
+16 MiB maximum requested range), even if a server lies about Content-Length or
+ignores Range; the exact expected range length and ETag are still checked.
+It uses HTTP ranges rather than fetching whole model shards.
+It produces the overlay and a local JSON manifest
 with revisions, index hashes, per-tensor provenance and hashes, and `.None`
-classifications; reruns overwrite these two files **only in the output dir**.
+classifications. Reruns stage both complete files in temporary files **only in
+the output dir**, then replace the existing files; a failure while writing
+either staged file leaves a previously verified overlay/manifest intact and
+cleans up temporary files. The two final replacements are not a filesystem
+transaction if a replace operation itself fails.
 Keep the output outside the checkout and do not commit the generated weights
 or manifest to this repository.
 
@@ -47,6 +59,9 @@ K2 loading fails closed on missing required biases or a missing overlay path.
 The router bias participates in **selection only**, not the projection logits.
 Run offline regression checks with
 `python -m pytest -q tests/test_k2_bias_overlay_extractor.py tests/test_k2_horizon.py`.
-An earlier Spark2 6.50bpw overlay load and short cached decode (` Paris.`)
-succeeded, but the latest source fixes have **not** been rerun on GPU; this
-limited smoke is not a broad generation validation.
+At integrated source `18dd328` on Spark2, the full 6.50bpw model loaded with
+the overlay, produced the cached decode ` Paris. The capital of`, completed a
+2-row CUDA calibration probe, and unloaded. This is a limited verified smoke,
+**not** a BF16 or steady-state performance benchmark; the extractor hardening
+here was separately verified by a pinned-source end-to-end extraction and
+the overlay digest above.

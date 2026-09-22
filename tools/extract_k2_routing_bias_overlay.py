@@ -10,9 +10,12 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import struct
+import tempfile
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -27,6 +30,8 @@ PATTERN = re.compile(r"^model\.layers\.(\d+)\.(self_attn\.v_router|mlp\.gate)\.b
 NONE_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.None$")
 SIZES = {"self_attn.v_router": 64, "mlp.gate": 100}
 MAX_HEADER_BYTES = 16 * 1024 * 1024
+MAX_INDEX_BYTES = 32 * 1024 * 1024
+MAX_REDIRECTS = 5
 EXPECTED_OVERLAY_SHA256 = "8038de808fb396f4d5d337d373435523f167bfbc8558b5a6af09c1900408f53c"
 
 
@@ -42,11 +47,60 @@ def session() -> requests.Session:
     return client
 
 
+def _check_url(address: str) -> None:
+    try:
+        parsed = urlsplit(address)
+        hostname = parsed.hostname
+        allowed = hostname is not None and any(
+            hostname == domain or hostname.endswith("." + domain)
+            for domain in ("huggingface.co", "hf.co")
+        )
+        if (parsed.scheme != "https" or not allowed or parsed.username is not None
+                or parsed.password is not None or parsed.port not in (None, 443)
+                or parsed.fragment):
+            raise ValueError("Unsafe Hugging Face HTTPS URL")
+    except ValueError as exc:
+        raise ValueError("Unsafe Hugging Face HTTPS URL") from exc
+
+
+def _get_pinned(client: requests.Session, address: str, *, headers: dict | None = None) -> requests.Response:
+    for hop in range(MAX_REDIRECTS + 1):
+        _check_url(address)  # Validate BEFORE each network request, including reused resolved URLs.
+        response = client.get(address, headers=headers, timeout=90, stream=True, allow_redirects=False)
+        try:
+            _check_url(response.url)
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location")
+                if not location or hop == MAX_REDIRECTS:
+                    raise ValueError("Missing or excessive Hugging Face redirect")
+                address = urljoin(response.url, location)
+                _check_url(address)
+            else:
+                return response
+        except BaseException:
+            response.close()
+            raise
+        response.close()
+    raise AssertionError("Unreachable redirect loop")
+
+
+def _bounded_body(response: requests.Response, limit: int) -> bytes:
+    chunks = []
+    size = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("HTTP response body exceeds byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def range_bytes(client: requests.Session, address: str, start: int, end: int,
                 *, total: int | None = None, etag: str | None = None) -> tuple[bytes, int, str | None, str]:
     # Inspect status/headers before buffering: a CDN ignoring Range may send a full shard.
-    response = client.get(address, headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
-                          timeout=90, stream=True)
+    if start < 0 or end < start or end - start + 1 > MAX_HEADER_BYTES:
+        raise ValueError("Invalid or oversized range request")
+    response = _get_pinned(client, address, headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"})
     try:
         response.raise_for_status()
         match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
@@ -60,7 +114,7 @@ def range_bytes(client: requests.Session, address: str, start: int, end: int,
         got_etag = response.headers.get("ETag")
         if etag is not None and etag != got_etag:
             raise ValueError("Shard ETag missing or changed between range requests")
-        raw = response.content
+        raw = _bounded_body(response, end - start + 1)
         if len(raw) != end - start + 1:
             raise ValueError(f"Truncated/wrong range {lo}-{hi} for {start}-{end}")
         return raw, size, got_etag, response.url
@@ -87,9 +141,15 @@ def shard_header(client: requests.Session, address: str) -> tuple[dict, int, int
 
 
 def index(client: requests.Session, repo: str, revision: str, filename: str) -> tuple[dict, str]:
-    response = client.get(url(repo, revision, filename), timeout=90)
-    response.raise_for_status()
-    return response.json()["weight_map"], hashlib.sha256(response.content).hexdigest()
+    response = _get_pinned(client, url(repo, revision, filename))
+    try:
+        response.raise_for_status()
+        if int(response.headers.get("Content-Length", 0)) > MAX_INDEX_BYTES:
+            raise ValueError("Index body exceeds byte limit")
+        raw = _bounded_body(response, MAX_INDEX_BYTES)
+        return json.loads(raw)["weight_map"], hashlib.sha256(raw).hexdigest()
+    finally:
+        response.close()
 
 
 def inspect_quant(shard: str, keys: list[str]) -> dict[str, bytes]:
@@ -212,10 +272,24 @@ def main(argv: list[str] | None = None) -> None:
         "tensors": {key: details[key] for key in sorted(details)},
         "note": "All 90 bias names are absent from the 6.50bpw quant index and shard headers. 45 quant .mlp.None tensors are F32 and misnamed; their content classification is recorded separately. No equivalent v_router.bias tensor name was found. This overlay is not installed into the quant model."
     }
-    # Complete all remote checks before writing either local output.
+    # Complete all remote checks and both temporary writes before replacing outputs.
     output_dir.mkdir(parents=True, exist_ok=True)
-    overlay_path.write_bytes(overlay)
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending = []
+    try:
+        for target, payload in (
+            (overlay_path, overlay),
+            (manifest_path, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")),
+        ):
+            fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=output_dir)
+            os.close(fd)
+            staged = Path(name)
+            pending.append((staged, target))
+            staged.write_bytes(payload)
+        for staged, target in pending:
+            os.replace(staged, target)
+    finally:
+        for staged, _ in pending:
+            staged.unlink(missing_ok=True)
     print(json.dumps({"tensor_count": len(tensors), "quant_None_classifications": manifest["quant_mlp_None_classification_counts"],
                       "overlay_sha256": manifest["overlay_sha256"], "overlay": str(overlay_path),
                       "manifest": str(manifest_path)}, indent=2))

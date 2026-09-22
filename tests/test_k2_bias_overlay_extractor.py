@@ -42,6 +42,187 @@ def test_session_disables_implicit_netrc_and_environment_credentials():
         assert client.trust_env is False
 
 
+class RedirectResponse:
+    def __init__(self, address, status, location=None, body=b"abcd"):
+        self.url = address
+        self.status_code = status
+        self.headers = ({"Location": location} if location else {})
+        if status == 206:
+            self.headers.update({"Content-Range": "bytes 0-3/100", "Content-Length": "4", "ETag": '"stable"'})
+        self.body = body
+        self.closed = False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size):
+        yield from (self.body[i:i + chunk_size] for i in range(0, len(self.body), chunk_size))
+
+    @property
+    def content(self):
+        return self.body
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("destination", [
+    "http://127.0.0.1/private", "https://127.0.0.1/private", "https://example.org/private",
+    "https://huggingface.co.evil.test/private", "https://huggingface.co:8443/private",
+    "https://user:password@huggingface.co/private", "//localhost/private",
+])
+def test_range_redirect_rejects_unsafe_destination_before_followup(destination):
+    module = extractor()
+    initial = module.url(module.SOURCE_REPO, module.SOURCE_REV, "shard.safetensors")
+    redirect = RedirectResponse(initial, 302, destination)
+
+    class Client:
+        def get(self, address, **kwargs):
+            assert address == initial
+            assert kwargs["allow_redirects"] is False
+            return redirect
+
+    with pytest.raises(ValueError, match="URL|redirect|host|HTTPS"):
+        module.range_bytes(Client(), initial, 0, 3)
+    assert redirect.closed
+
+
+def test_range_redirect_allows_hf_https_and_reuses_safe_resolved_url():
+    module = extractor()
+    initial = module.url(module.SOURCE_REPO, module.SOURCE_REV, "shard.safetensors")
+    cdn = "https://us.aws.cdn.hf.co/safe-shard"
+    redirect = RedirectResponse(initial, 302, cdn)
+    first = RedirectResponse(cdn, 206)
+    second = RedirectResponse(cdn, 206)
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, address, **kwargs):
+            self.calls.append(address)
+            assert kwargs["allow_redirects"] is False and kwargs["stream"] is True
+            assert kwargs["headers"]["Range"] == "bytes=0-3"
+            assert kwargs["headers"]["Accept-Encoding"] == "identity"
+            return {initial: redirect, cdn: first if self.calls.count(cdn) == 1 else second}[address]
+
+    client = Client()
+    assert module.range_bytes(client, initial, 0, 3)[-1] == cdn
+    assert module.range_bytes(client, cdn, 0, 3, total=100, etag='"stable"')[0] == b"abcd"
+    assert client.calls == [initial, cdn, cdn]
+    assert all(response.closed for response in (redirect, first, second))
+
+
+def test_index_redirect_refuses_unsafe_destination_without_fetching_it():
+    module = extractor()
+    initial = module.url(module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+    redirect = RedirectResponse(initial, 302, "http://127.0.0.1/private")
+
+    class Client:
+        def get(self, address, **kwargs):
+            assert address == initial
+            assert kwargs["allow_redirects"] is False
+            return redirect
+
+    with pytest.raises(ValueError, match="URL|redirect|host|HTTPS"):
+        module.index(Client(), module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+    assert redirect.closed
+
+
+def test_range_redirect_hop_limit_closes_every_response():
+    module = extractor()
+    initial = module.url(module.SOURCE_REPO, module.SOURCE_REV, "shard.safetensors")
+    responses = []
+
+    class Client:
+        def get(self, address, **kwargs):
+            response = RedirectResponse(address, 302, f"https://huggingface.co/next-{len(responses)}")
+            responses.append(response)
+            assert len(responses) < 20
+            return response
+
+    with pytest.raises(ValueError, match="redirect"):
+        module.range_bytes(Client(), initial, 0, 3)
+    assert 1 < len(responses) < 20 and all(response.closed for response in responses)
+
+
+def test_range_body_overflow_stops_stream_even_with_matching_headers():
+    module = extractor()
+    address = "https://us.aws.cdn.hf.co/shard"
+
+    class Response(RedirectResponse):
+        @property
+        def content(self):
+            raise AssertionError("Must not buffer response.content")
+
+        def iter_content(self, chunk_size):
+            yield b"abcd"
+            yield b"extra"
+            raise AssertionError("Must stop reading on overflow")
+
+    response = Response(address, 206)
+
+    class Client:
+        def get(self, address, **kwargs):
+            assert kwargs["stream"] is True
+            return response
+
+    with pytest.raises(ValueError, match="range|large|body"):
+        module.range_bytes(Client(), address, 0, 3)
+    assert response.closed
+
+
+def test_index_body_cap_rejects_stream_without_buffering_or_json_parsing():
+    module = extractor()
+    address = module.url(module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+
+    class Response(RedirectResponse):
+        @property
+        def content(self):
+            raise AssertionError("Must not buffer response.content")
+
+        def json(self):
+            raise AssertionError("Must parse only bounded bytes")
+
+        def iter_content(self, chunk_size):
+            assert chunk_size <= 65536
+            yield b"x" * module.MAX_INDEX_BYTES
+            yield b"x"
+            raise AssertionError("Must stop reading on overflow")
+
+    response = Response(address, 200)
+
+    class Client:
+        def get(self, address, **kwargs):
+            assert kwargs["stream"] is True
+            return response
+
+    with pytest.raises(ValueError, match="index|large|body"):
+        module.index(Client(), module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+    assert response.closed
+
+
+def test_index_bounded_stream_keeps_exact_digest():
+    module = extractor()
+    address = module.url(module.QUANT_REPO, module.QUANT_REV, "model.safetensors.index.json")
+    payload = b'{"weight_map":{"tensor":"shard"}}'
+
+    class Response(RedirectResponse):
+        @property
+        def content(self):
+            raise AssertionError("Must not buffer response.content")
+
+    response = Response(address, 200, body=payload)
+
+    class Client:
+        def get(self, address, **kwargs):
+            return response
+
+    assert module.index(Client(), module.QUANT_REPO, module.QUANT_REV, "model.safetensors.index.json") == (
+        {"tensor": "shard"}, hashlib.sha256(payload).hexdigest())
+    assert response.closed
+
+
 def test_overlay_preserves_exact_bf16_bytes_and_is_deterministic():
     module = extractor()
     tensors = {"model.layers.3.self_attn.v_router.bias": b"\x34\x12\x78\x56",
@@ -66,7 +247,7 @@ def test_range_bytes_rejects_full_response():
         status_code = 200
         headers = {}
         content = b"data"
-        url = "https://example.test/shard"
+        url = "https://huggingface.co/shard"
 
         def raise_for_status(self):
             pass
@@ -81,7 +262,7 @@ def test_range_bytes_rejects_full_response():
 
     client = FakeClient()
     with pytest.raises(ValueError, match="range not honored"):
-        module.range_bytes(client, "https://example.test/shard", 0, 3)
+        module.range_bytes(client, "https://huggingface.co/shard", 0, 3)
     assert client.kwargs["stream"] is True  # never buffer a full shard on ignored Range
 
 
@@ -91,7 +272,7 @@ def test_range_bytes_rejects_missing_or_changed_etag(later_etag):
 
     class FakeResponse:
         status_code = 206
-        url = "https://example.test/shard"
+        url = "https://huggingface.co/shard"
 
         def __init__(self, etag):
             self.headers = {"Content-Range": "bytes 8-11/100", "Content-Length": "4"}
@@ -125,7 +306,7 @@ def test_shard_header_rejects_missing_initial_etag_before_extra_ranges():
 
     class FakeResponse:
         status_code = 206
-        url = "https://example.test/shard"
+        url = "https://huggingface.co/shard"
         headers = {"Content-Range": "bytes 0-65535/100000", "Content-Length": "65536"}
 
         def raise_for_status(self):
@@ -134,6 +315,9 @@ def test_shard_header_rejects_missing_initial_etag_before_extra_ranges():
         @property
         def content(self):
             return struct.pack("<Q", 70000) + b" " * (65536 - 8)
+
+        def iter_content(self, chunk_size):
+            yield self.content
 
         def close(self):
             self.closed = True
@@ -160,7 +344,7 @@ def test_shard_header_refuses_giant_header_before_fetching_it():
 
     class FakeResponse:
         status_code = 206
-        url = "https://example.test/shard"
+        url = "https://huggingface.co/shard"
         headers = {"Content-Range": f"bytes 0-65535/{total}", "Content-Length": "65536", "ETag": '"pinned"'}
 
         def raise_for_status(self):
@@ -169,6 +353,9 @@ def test_shard_header_refuses_giant_header_before_fetching_it():
         @property
         def content(self):
             return struct.pack("<Q", total - 16) + b" " * (65536 - 8)
+
+        def iter_content(self, chunk_size):
+            yield self.content
 
         def close(self):
             self.closed = True
@@ -197,7 +384,7 @@ def test_shard_header_allows_bounded_large_header_with_stable_etag():
 
     class FakeResponse:
         status_code = 206
-        url = "https://example.test/shard"
+        url = "https://huggingface.co/shard"
 
         def __init__(self, start, end):
             self.headers = {"Content-Range": f"bytes {start}-{end}/100000",
@@ -206,6 +393,9 @@ def test_shard_header_allows_bounded_large_header_with_stable_etag():
 
         def raise_for_status(self):
             pass
+
+        def iter_content(self, chunk_size):
+            yield self.content
 
         def close(self):
             self.closed = True
@@ -220,7 +410,7 @@ def test_shard_header_allows_bounded_large_header_with_stable_etag():
             return FakeResponse(start, end)
 
     client = FakeClient()
-    parsed, length, total, etag, _ = module.shard_header(client, "https://example.test/shard")
+    parsed, length, total, etag, _ = module.shard_header(client, "https://huggingface.co/shard")
     assert parsed == {"tensor": {"dtype": "BF16"}}
     assert (length, total, etag) == (70000, 100000, '"stable"')
     assert client.calls == [(0, 65535), (8, 70007)]
@@ -272,3 +462,34 @@ def test_matching_final_digest_writes_overlay_and_manifest(tmp_path, monkeypatch
     manifest = tmp_path / "k2-routing-bias-overlay.manifest.json"
     assert hashlib.sha256(overlay.read_bytes()).hexdigest() == expected
     assert json.loads(manifest.read_text(encoding="utf-8"))["overlay_sha256"] == expected
+
+
+@pytest.mark.parametrize("failed_artifact", ["safetensors", "manifest.json"])
+def test_mid_write_failure_preserves_verified_pair_and_cleans_temps(tmp_path, monkeypatch, failed_artifact):
+    module = extractor()
+    expected = stub_offline_extraction(module, monkeypatch)
+    monkeypatch.setattr(module, "EXPECTED_OVERLAY_SHA256", expected)
+    module.main(["--output-dir", str(tmp_path)])
+    originals = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    original_write_bytes = Path.write_bytes
+    original_write_text = Path.write_text
+
+    def fail_partway(path, data):
+        if failed_artifact in path.name:
+            with path.open("wb") as output:
+                output.write(data[:8])
+            raise OSError("injected mid-write disk failure")
+        return original_write_bytes(path, data)
+
+    def fail_text(path, data, **kwargs):
+        if failed_artifact in path.name:
+            with path.open("wb") as output:
+                output.write(data.encode("utf-8")[:8])
+            raise OSError("injected mid-write disk failure")
+        return original_write_text(path, data, **kwargs)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_partway)
+    monkeypatch.setattr(Path, "write_text", fail_text)
+    with pytest.raises(OSError, match="injected mid-write"):
+        module.main(["--output-dir", str(tmp_path)])
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == originals
