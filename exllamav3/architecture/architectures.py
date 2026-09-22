@@ -7,6 +7,7 @@ from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -27,6 +28,8 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
+from .k2_horizon import K2HorizonModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
@@ -75,6 +78,7 @@ ARCHITECTURES = {
         DeepseekV3Model,
         DeepseekV4Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
@@ -92,6 +96,8 @@ ARCHITECTURES = {
         Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
+        KimiLinearModel,
+        K2HorizonModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,

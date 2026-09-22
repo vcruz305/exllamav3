@@ -16,6 +16,7 @@
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
+#include "dflash2.cuh"
 
 #include "quant/quantize.cuh"
 #include "quant/pack.cuh"
@@ -24,6 +25,7 @@
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
 #include "quant/exl3_gemv_int8.cuh"
+#include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
 #include "cpu/moe_handoff.h"
 #include "quant/exl3_kernel_map.cuh"
@@ -119,7 +121,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("hc_apply", &hc_apply, "hc_apply");
     m.def("gr_mix", &gr_mix, "gr_mix");
     m.def("gr_mix_int8", &gr_mix_int8, "gr_mix_int8");
+    m.def("gr_mix_tiled", &gr_mix_tiled, "gr_mix_tiled");
+    m.def("gr_mix_tiled_slices", &gr_mix_tiled_slices, "gr_mix_tiled_slices");
     m.def("routing_std", &routing_std, "routing_std");
+    m.def("routing_gemm_det", &routing_gemm_det, "routing_gemm_det");
+    m.def("det_quant_weight", &det_quant_weight, "det_quant_weight");
+    m.def("det_math_test", &det_math_test, "det_math_test");
     m.def("routing_std_logits", &routing_std_logits, "routing_std_logits");
 
     m.def("had_paley", &had_paley, "had_paley");
@@ -138,10 +145,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("quantize_tiles", &quantize_tiles, "quantize_tiles");
     m.def("quantize_tiles_scratch", &quantize_tiles_scratch, "quantize_tiles_scratch");
+    m.def("quantize_tiles_frac", &quantize_tiles_frac, "quantize_tiles_frac");
     m.def("test_distribution", &test_distribution, "test_distribution");
     m.def("decode", &decode, "decode");
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
+    m.def("pack_trellis_frac", &pack_trellis_frac, "pack_trellis_frac");
+    m.def("unpack_trellis_frac", &unpack_trellis_frac, "unpack_trellis_frac");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("reconstruct_had_slice", &reconstruct_had_slice, "reconstruct_had_slice");
@@ -237,6 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
     m.def("adaptivep_gumbel_noise_f32", &adaptivep_gumbel_noise_f32, "adaptivep_gumbel_noise_f32");
 
+    m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
+    m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
+    m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
     m.def("cache_rotate", &cache_rotate, "cache_rotate");
     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
     m.def("paged_kv_cache_update", &paged_kv_cache_update, "paged_kv_cache_update");

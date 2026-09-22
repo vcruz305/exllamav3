@@ -207,6 +207,7 @@ python examples/chat.py -h
 | **HyperCLOVAX**                                  | `HyperCLOVAXForCausalLM`<br>`HCXVisionV2ForCausalLM` | ✓ |  |
 | **Hy3**                                          | `HYV3ForCausalLM` |  |  |
 | **IQuest-Coder**                                 | `IQuestCoderForCausalLM` |  |  |
+| **Kimi Linear**                                  | `KimiLinearForCausalLM` |  |  |
 | **Laguna 2.1**                                   | `LagunaForCausalLM` |  |  |
 | **LFM 2.5**                                      | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM` |  |  |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.            | `LlamaForCausalLM` |  |  |
@@ -233,6 +234,10 @@ python examples/chat.py -h
 | **Step 3.7 Flash**                               | `Step3p7ForConditionalGeneration` | ✓ |  |
 
 Always adding more, stay tuned.
+
+For the **K2-Horizon MoVA 6.50bpw** checkpoint at its pinned revision, see the
+[missing routing-bias recovery guide](doc/k2-horizon-bias-overlay.md). This is
+not a blanket claim of support for other K2 quant revisions.
 
 ## Conversion
 
