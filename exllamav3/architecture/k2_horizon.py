@@ -24,6 +24,12 @@ class K2HorizonConfig(Config):
             if not os.path.isfile(overlay):
                 raise ValueError(f"routing_bias_overlay does not exist: {overlay}")
             self.stc.add_tensor_files(overlay)
+        use_sliding_window = self.read_cfg(bool, "use_sliding_window", False)
+        sliding_window = self.read_cfg(int, "sliding_window", None)
+        # A finite window is ambiguous even if the flag is false/absent. Do not
+        # silently run global attention until K2's mask semantics are supported.
+        if use_sliding_window or sliding_window is not None:
+            raise ValueError("K2 Horizon sliding-window attention is not supported")
         self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
         self.head_dim = self.read_cfg(int, "head_dim", self.hidden_size // self.read_cfg(int, "num_attention_heads", no_default))
         self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)

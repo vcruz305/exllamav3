@@ -251,6 +251,38 @@ def test_rejects_unsupported_partial_rope(model_config):
         Config.from_directory(str(model_config))
 
 
+@pytest.mark.parametrize("window_config", [
+    {"use_sliding_window": True, "sliding_window": 4096},
+    {"use_sliding_window": True, "sliding_window": None},
+    {"use_sliding_window": True},
+    {"use_sliding_window": False, "sliding_window": 4096},
+    {"sliding_window": 4096},
+])
+def test_rejects_unsupported_sliding_window_before_model_creation(model_config, window_config):
+    config_file = model_config / "config.json"
+    data = json.loads(config_file.read_text())
+    data.update(window_config)
+    config_file.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="K2 Horizon.*sliding.window"):
+        Config.from_directory(str(model_config))
+
+
+@pytest.mark.parametrize("window_config", [
+    {"use_sliding_window": False, "sliding_window": None},
+    {"sliding_window": None},
+    {"use_sliding_window": False},
+    {},
+])
+def test_global_attention_config_stays_accepted(model_config, window_config):
+    from exllamav3.architecture.k2_horizon import K2HorizonModel
+    config_file = model_config / "config.json"
+    data = json.loads(config_file.read_text())
+    data.update(window_config)
+    config_file.write_text(json.dumps(data))
+    model = K2HorizonModel(Config.from_directory(str(model_config)))
+    assert model.modules[1].attn.sliding_window == -1
+
+
 def test_missing_learned_router_biases_fail_before_weight_load(model_config):
     from exllamav3.architecture.k2_horizon import K2HorizonModel
     model = K2HorizonModel(Config.from_directory(str(model_config)))
