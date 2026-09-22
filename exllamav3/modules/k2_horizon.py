@@ -99,8 +99,9 @@ class MoVAValueProjection(Module):
         # A routed projection is never an individual fusible Linear.
         self.quant_type = None
         # The bias is stored at router.bias but MUST NOT enter the linear's logits.
+        # EXL3 packs 64 logical experts into 128 physical output columns.
         self.router = Linear(config, key.replace(".v_proj", ".v_router"),
-                             hidden_size, num_experts, pad_to=1, trim_padded_out=True,
+                             hidden_size, num_experts, pad_to=128, trim_padded_out=True,
                              load_bias=False, out_dtype=torch.half)
         prefix = key.replace(".v_proj", ".v_experts")
         self.experts = [Linear(config, f"{prefix}.{idx}", hidden_size, out_features,

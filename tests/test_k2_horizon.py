@@ -275,6 +275,61 @@ def test_mova_loaded_projection_matches_independent_cpu_oracle(tmp_path):
     assert projection.bias is None and projection.get_tensors() == {}
 
 
+def test_mova_exl3_router_uses_physical_128_columns_but_routes_64_experts(tmp_path, monkeypatch):
+    """CPU stand-in for the EXL3 C/B check on the 2560 -> 64 Spark router."""
+    from safetensors.torch import save_file
+    from exllamav3.ext import exllamav3_ext as ext
+    from exllamav3.loader import SafetensorsCollection
+    from exllamav3.modules.k2_horizon import MoVAValueProjection
+
+    key = "model.layers.3.self_attn"
+    router = key + ".v_router"
+    bias = torch.zeros(64)
+    bias[1], bias[2] = .45, .4
+    tensors = {
+        router + ".suh": torch.ones(2560, dtype=torch.half),
+        router + ".svh": torch.ones(128, dtype=torch.half),
+        router + ".trellis": torch.zeros((160, 8, 128), dtype=torch.int16),
+        router + ".bias": bias,
+    }
+    for idx in range(64):
+        weight = torch.zeros((1, 2560), dtype=torch.half)
+        if idx == 1:
+            weight[0, 0] = 1
+        tensors[f"{key}.v_experts.{idx}.weight"] = weight
+    save_file(tensors, str(tmp_path / "router.safetensors"))
+
+    class RouterBC:
+        def __init__(self, trellis, suh, svh, K, bias, mcg, mul1, cache):
+            assert bias is None  # learned bias must not enter EXL3 logits
+            self.k, self.n = suh.numel(), svh.numel()
+            assert trellis.shape[:2] == (self.k // 16, self.n // 16)
+
+        def run_alloc(self, x, out_features, out_float):
+            if x.shape[-1] != self.k or out_features != self.n:
+                raise RuntimeError("C and B have incompatible shapes")
+            logits = x.new_full((x.shape[0], self.n), 30)
+            logits[:, :64] = -10
+            logits[:, 0], logits[:, 1], logits[:, 2] = 2, 0, -2
+            return logits
+
+    monkeypatch.setattr(ext, "BC_LinearEXL3", RouterBC, raising=False)
+
+    class LocalConfig:
+        stc = SafetensorsCollection(str(tmp_path), load_method="python")
+
+    projection = MoVAValueProjection(LocalConfig(), key + ".v_proj", 2560, 1, 64, 1, 2.5)
+    projection.load(torch.device("cpu"))
+    x = torch.ones((6, 2560), dtype=torch.half)
+    values = projection.forward(x, {})
+    assert projection.router.out_features == projection.router.inner.out_features == 128
+    assert projection.router.out_features_unpadded == 64
+    assert projection.router.trim_padded_out and not projection.router.load_bias
+    assert values.shape == (6, 1)
+    torch.testing.assert_close(values.float(), torch.full((6, 1), F.silu(torch.tensor(1.)).item() * 1.25),
+                               rtol=0, atol=.002)
+
+
 def test_mova_tp_allocation_never_silently_claims_expert_parallelism():
     from exllamav3.modules.k2_horizon import MoVAValueProjection
 
