@@ -92,8 +92,8 @@ class Generator:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
 
         :param dynamic_draft_tokens:
-            Adapt the per-round draft length to the workload. The draft is cut using drafter confidence
-            (argmax logit), calibrated online against observed acceptance rates (see draft_confidence). A
+            Adapt the per-round draft length to the workload. The draft is cut using a drafter-provided
+            confidence score, calibrated online against observed acceptance rates (see draft_confidence). A
             DFlash drafter still runs at its fixed diffusion block size and only the verified window shrinks;
             AR and MTP drafters stop the drafting loop itself early, saving one drafter forward per pruned
             position. The acceptance behavior of the surviving positions is unchanged. Has no effect on n-gram
@@ -101,7 +101,7 @@ class Generator:
 
         :param draft_confidence:
             Used with dynamic_draft_tokens and a draft model: target acceptance probability for drafted
-            positions, evaluated against an online mapping from drafter confidence (argmax logit) to observed
+            positions, evaluated against an online mapping from drafter confidence scores to observed
             acceptance rates. Scale-free and portable across model pairs. For DFlash (block produced at fixed
             cost) the block is cut at the first position whose estimated conditional acceptance drops below
             the target. For AR and MTP drafters (one forward per position, and a position only pays off if
@@ -196,17 +196,19 @@ class Generator:
         self.sample_pinned = None
         self.staging_buffers = {}
 
-        # Buffers
+        # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
+        # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
+        # into draft_ids_pinned
         if draft_model or ngram_match_min:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = False
+                pin_memory = True
             )
 
         # CPU page cache tier
@@ -618,8 +620,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -712,13 +718,15 @@ class Generator:
         if batch_size == 0:
             return None
 
-        # Create block index table for batch (pinned staging, like iterate_gen: a pageable
-        # source makes every per-draft-step upload a blocking cudaMemcpy)
+        # Create block index table for batch. Keep draft staging separate from the target's
+        # in-flight buffers; pageable uploads would block each draft step.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
         max_pages_batch = (max_pages_batch + 15) // 16 * 16
-        block_index = self._staging("mtp_block_index", batch_size, max_pages_batch)
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
         block_index.zero_()
-        cache_seqlens = self._staging("mtp_cache_seqlens", batch_size)
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
@@ -835,8 +843,12 @@ class Generator:
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
-        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        # Pinned staging (as iterate_gen), so the uploads are stream-ordered instead of blocking
+        # pageable copies; the draft's own buffers, since the target's are still in flight
+        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
         batch = 0
         for job in self.active_jobs:
             if not job.is_prefill_done(): continue
