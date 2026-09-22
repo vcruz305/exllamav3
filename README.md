@@ -235,6 +235,10 @@ python examples/chat.py -h
 
 Always adding more, stay tuned.
 
+For the **K2-Horizon MoVA 6.50bpw** checkpoint at its pinned revision, see the
+[missing routing-bias recovery guide](doc/k2-horizon-bias-overlay.md). This is
+not a blanket claim of support for other K2 quant revisions.
+
 ## Conversion
 
 To convert a model to EXL3 format, use:
