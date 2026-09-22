@@ -518,24 +518,44 @@ def test_swapped_temp_symlink_cannot_modify_victim_or_replace_verified_pair(tmp_
     victim = tmp_path / "victim.bin"
     victim.write_bytes(b"keep this file untouched")
     real_mkstemp = module.tempfile.mkstemp
-    real_close = module.os.close
+    real_fdopen = module.os.fdopen
     staged_fds = {}
+    swaps = []
 
     def track_temp(*args, **kwargs):
         fd, name = real_mkstemp(*args, **kwargs)
         staged_fds[fd] = Path(name)
         return fd, name
 
-    def swap_after_close(fd):
-        real_close(fd)
-        if fd in staged_fds:
-            path = staged_fds.pop(fd)
-            path.unlink()
-            path.symlink_to(victim)
+    class SwapOnClose:
+        def __init__(self, fd, stream):
+            self.fd = fd
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def write(self, payload):
+            return self.stream.write(payload)
+
+        def __exit__(self, *exc):
+            result = self.stream.__exit__(*exc)
+            if self.fd in staged_fds:
+                path = staged_fds.pop(self.fd)
+                path.unlink()
+                path.symlink_to(victim)
+                swaps.append(path)
+            return result
+
+    def swap_after_stream_close(fd, *args, **kwargs):
+        return SwapOnClose(fd, real_fdopen(fd, *args, **kwargs))
 
     monkeypatch.setattr(module.tempfile, "mkstemp", track_temp)
-    monkeypatch.setattr(module.os, "close", swap_after_close)
-    module.main(["--output-dir", str(output)])
+    monkeypatch.setattr(module.os, "fdopen", swap_after_stream_close)
+    with pytest.raises(ValueError, match="not a regular file"):
+        module.main(["--output-dir", str(output)])
+    assert swaps
     assert victim.read_bytes() == b"keep this file untouched"
     assert {path.name: path.read_bytes() for path in output.iterdir()} == originals
 
