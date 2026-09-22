@@ -168,6 +168,7 @@ class Attention(Module):
         qmap: str | None = None,
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
+        window_right: int = 0,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -212,6 +213,9 @@ class Attention(Module):
         self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
+        # Keys after the query position that a sliding window admits (0 = causal-shaped). Lets a
+        # block of queries attend to each other while staying bounded on the left
+        self.window_right = window_right
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -924,7 +928,7 @@ class Attention(Module):
                 max_seqlen = max_seqlen,
                 causal = causal,
                 sm_scale = self.sm_scale,
-                window_size = self.sliding_window,
+                window_size = self.window_arg(),
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
@@ -1136,7 +1140,7 @@ class Attention(Module):
                 cache_seqlens = cache_seqlens,
                 causal = causal,
                 sm_scale = self.sm_scale,
-                window_size = self.sliding_window,
+                window_size = self.window_arg(),
                 softcap = self.logit_softcapping,
                 non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
@@ -1152,6 +1156,13 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def window_arg(self):
+        """window_size for attn_dispatch: an int, or (left, right) when window_right is set"""
+        if self.window_right:
+            return (self.sliding_window, self.window_right)
+        return self.sliding_window
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
