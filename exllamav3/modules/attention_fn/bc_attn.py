@@ -630,6 +630,8 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        # The fused block only softpluses headwise gates; full gates use sigmoid.
+        not (m.full_gate and getattr(m, "gate_softplus", False)) and
         _qsa_module_eligible(m) and
         # NoPE is supported (the rope stage is skipped), but the head norms run inside the rope
         # kernel, so a norm-only module without rope has nowhere to apply them
