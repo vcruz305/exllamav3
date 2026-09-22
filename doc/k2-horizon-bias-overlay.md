@@ -30,17 +30,23 @@ only HTTPS on port 443 (or the implicit HTTPS default) to `huggingface.co` / its
 subdomains or `hf.co` / its subdomains is accepted. URL credentials, other hosts,
 HTTP downgrades and more than five redirects are rejected. The observed
 `us.aws.cdn.hf.co` shard redirect is allowed; unrelated HTTPS hosts are not.
-Both index and range responses are streamed with byte limits (32 MiB per index,
-16 MiB maximum requested range), even if a server lies about Content-Length or
-ignores Range; the exact expected range length and ETag are still checked.
+Both index and range requests require identity encoding; responses declaring
+another Content-Encoding are rejected before streaming to prevent a compressed
+chunk from inflating past the byte cap. Uncompressed index and range responses
+are streamed with byte limits (32 MiB per index, 16 MiB maximum requested range),
+even if a server lies about Content-Length or ignores Range; the exact expected
+range length and ETag are still checked.
 It uses HTTP ranges rather than fetching whole model shards.
 It produces the overlay and a local JSON manifest
 with revisions, index hashes, per-tensor provenance and hashes, and `.None`
 classifications. Reruns stage both complete files in temporary files **only in
-the output dir**, then replace the existing files; a failure while writing
-either staged file leaves a previously verified overlay/manifest intact and
-cleans up temporary files. The two final replacements are not a filesystem
-transaction if a replace operation itself fails.
+the output dir**, writing through the original open file descriptors rather than
+reopening their paths. A non-regular staged path is rejected before replacement.
+A failure while writing either staged file leaves a previously verified
+overlay/manifest intact and cleans up temporary files. The two final replacements
+are not a filesystem transaction if a replace operation itself fails. The
+pre-replacement path check is not a guarantee against concurrent swaps in an
+output directory writable by another actor.
 Keep the output outside the checkout and do not commit the generated weights
 or manifest to this repository.
 

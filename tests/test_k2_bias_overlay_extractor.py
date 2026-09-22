@@ -202,6 +202,50 @@ def test_index_body_cap_rejects_stream_without_buffering_or_json_parsing():
     assert response.closed
 
 
+def test_index_requests_identity_encoding():
+    module = extractor()
+    address = module.url(module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+    body = b'{"weight_map": {}}'
+    response = RedirectResponse(address, 200, body=body)
+
+    class Client:
+        def get(self, address, **kwargs):
+            self.headers = kwargs.get("headers")
+            return response
+
+    client = Client()
+    assert module.index(client, module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")[0] == {}
+    assert client.headers == {"Accept-Encoding": "identity"}
+    assert response.closed
+
+
+@pytest.mark.parametrize("operation", ["index", "range"])
+@pytest.mark.parametrize("encoding", ["gzip", "br"])
+def test_encoded_response_is_rejected_before_streaming(operation, encoding):
+    module = extractor()
+    address = module.url(module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+
+    class EncodedResponse(RedirectResponse):
+        def iter_content(self, chunk_size):
+            raise AssertionError("Must reject encoded response before decompressing a chunk")
+
+    response = EncodedResponse(address, 200 if operation == "index" else 206)
+    response.headers["Content-Encoding"] = encoding
+
+    class Client:
+        def get(self, address, **kwargs):
+            assert kwargs["headers"]["Accept-Encoding"] == "identity"
+            return response
+
+    client = Client()
+    with pytest.raises(ValueError, match="Content-Encoding"):
+        if operation == "index":
+            module.index(client, module.SOURCE_REPO, module.SOURCE_REV, "model.safetensors.index.json")
+        else:
+            module.range_bytes(client, address, 0, 3)
+    assert response.closed
+
+
 def test_index_bounded_stream_keeps_exact_digest():
     module = extractor()
     address = module.url(module.QUANT_REPO, module.QUANT_REV, "model.safetensors.index.json")
@@ -464,6 +508,93 @@ def test_matching_final_digest_writes_overlay_and_manifest(tmp_path, monkeypatch
     assert json.loads(manifest.read_text(encoding="utf-8"))["overlay_sha256"] == expected
 
 
+def test_swapped_temp_symlink_cannot_modify_victim_or_replace_verified_pair(tmp_path, monkeypatch):
+    module = extractor()
+    expected = stub_offline_extraction(module, monkeypatch)
+    monkeypatch.setattr(module, "EXPECTED_OVERLAY_SHA256", expected)
+    output = tmp_path / "output"
+    module.main(["--output-dir", str(output)])
+    originals = {path.name: path.read_bytes() for path in output.iterdir()}
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"keep this file untouched")
+    real_mkstemp = module.tempfile.mkstemp
+    real_close = module.os.close
+    staged_fds = {}
+
+    def track_temp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        staged_fds[fd] = Path(name)
+        return fd, name
+
+    def swap_after_close(fd):
+        real_close(fd)
+        if fd in staged_fds:
+            path = staged_fds.pop(fd)
+            path.unlink()
+            path.symlink_to(victim)
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", track_temp)
+    monkeypatch.setattr(module.os, "close", swap_after_close)
+    module.main(["--output-dir", str(output)])
+    assert victim.read_bytes() == b"keep this file untouched"
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == originals
+
+
+def test_staged_symlink_before_publication_fails_closed(tmp_path, monkeypatch):
+    module = extractor()
+    expected = stub_offline_extraction(module, monkeypatch)
+    monkeypatch.setattr(module, "EXPECTED_OVERLAY_SHA256", expected)
+    output = tmp_path / "output"
+    module.main(["--output-dir", str(output)])
+    originals = {path.name: path.read_bytes() for path in output.iterdir()}
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"untouched")
+    real_lstat = Path.lstat
+    swapped = False
+
+    def swap_before_check(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and path.name.endswith(".tmp"):
+            swapped = True
+            path.unlink()
+            path.symlink_to(victim)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", swap_before_check)
+    with pytest.raises(ValueError, match="not a regular file"):
+        module.main(["--output-dir", str(output)])
+    assert swapped
+    assert victim.read_bytes() == b"untouched"
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == originals
+
+
+def test_fdopen_failure_closes_temp_fd_and_preserves_existing_files(tmp_path, monkeypatch):
+    module = extractor()
+    expected = stub_offline_extraction(module, monkeypatch)
+    monkeypatch.setattr(module, "EXPECTED_OVERLAY_SHA256", expected)
+    module.main(["--output-dir", str(tmp_path)])
+    originals = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    real_mkstemp = module.tempfile.mkstemp
+    created_fds = []
+
+    def track_temp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        created_fds.append(fd)
+        return fd, name
+
+    def fail_fdopen(fd, *args, **kwargs):
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", track_temp)
+    monkeypatch.setattr(module.os, "fdopen", fail_fdopen)
+    with pytest.raises(OSError, match="injected fdopen failure"):
+        module.main(["--output-dir", str(tmp_path)])
+    assert len(created_fds) == 1
+    with pytest.raises(OSError):
+        module.os.fstat(created_fds[0])
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == originals
+
+
 @pytest.mark.parametrize("failed_artifact", ["safetensors", "manifest.json"])
 def test_mid_write_failure_preserves_verified_pair_and_cleans_temps(tmp_path, monkeypatch, failed_artifact):
     module = extractor()
@@ -471,25 +602,35 @@ def test_mid_write_failure_preserves_verified_pair_and_cleans_temps(tmp_path, mo
     monkeypatch.setattr(module, "EXPECTED_OVERLAY_SHA256", expected)
     module.main(["--output-dir", str(tmp_path)])
     originals = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
-    original_write_bytes = Path.write_bytes
-    original_write_text = Path.write_text
+    real_mkstemp = module.tempfile.mkstemp
+    real_fdopen = module.os.fdopen
+    staged_fds = {}
 
-    def fail_partway(path, data):
-        if failed_artifact in path.name:
-            with path.open("wb") as output:
-                output.write(data[:8])
+    def track_temp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        staged_fds[fd] = Path(name)
+        return fd, name
+
+    class FailPartway:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def write(self, data):
+            self.stream.write(data[:8])
             raise OSError("injected mid-write disk failure")
-        return original_write_bytes(path, data)
 
-    def fail_text(path, data, **kwargs):
-        if failed_artifact in path.name:
-            with path.open("wb") as output:
-                output.write(data.encode("utf-8")[:8])
-            raise OSError("injected mid-write disk failure")
-        return original_write_text(path, data, **kwargs)
+    def fdopen_with_failure(fd, *args, **kwargs):
+        stream = real_fdopen(fd, *args, **kwargs)
+        return FailPartway(stream) if failed_artifact in staged_fds[fd].name else stream
 
-    monkeypatch.setattr(Path, "write_bytes", fail_partway)
-    monkeypatch.setattr(Path, "write_text", fail_text)
+    monkeypatch.setattr(module.tempfile, "mkstemp", track_temp)
+    monkeypatch.setattr(module.os, "fdopen", fdopen_with_failure)
     with pytest.raises(OSError, match="injected mid-write"):
         module.main(["--output-dir", str(tmp_path)])
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == originals

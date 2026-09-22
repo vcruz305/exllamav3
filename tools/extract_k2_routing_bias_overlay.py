@@ -13,6 +13,7 @@ import json
 import os
 import re
 import struct
+import stat
 import tempfile
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -85,6 +86,8 @@ def _get_pinned(client: requests.Session, address: str, *, headers: dict | None 
 
 
 def _bounded_body(response: requests.Response, limit: int) -> bytes:
+    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+        raise ValueError("Unsupported Content-Encoding on bounded HTTP response")
     chunks = []
     size = 0
     for chunk in response.iter_content(chunk_size=65536):
@@ -141,7 +144,7 @@ def shard_header(client: requests.Session, address: str) -> tuple[dict, int, int
 
 
 def index(client: requests.Session, repo: str, revision: str, filename: str) -> tuple[dict, str]:
-    response = _get_pinned(client, url(repo, revision, filename))
+    response = _get_pinned(client, url(repo, revision, filename), headers={"Accept-Encoding": "identity"})
     try:
         response.raise_for_status()
         if int(response.headers.get("Content-Length", 0)) > MAX_INDEX_BYTES:
@@ -281,11 +284,18 @@ def main(argv: list[str] | None = None) -> None:
             (manifest_path, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")),
         ):
             fd, name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=output_dir)
-            os.close(fd)
             staged = Path(name)
             pending.append((staged, target))
-            staged.write_bytes(payload)
+            try:
+                output = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with output:
+                output.write(payload)
         for staged, target in pending:
+            if not stat.S_ISREG(staged.lstat().st_mode):
+                raise ValueError(f"Staged output is not a regular file: {staged}")
             os.replace(staged, target)
     finally:
         for staged, _ in pending:
