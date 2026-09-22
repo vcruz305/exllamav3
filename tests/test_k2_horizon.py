@@ -110,6 +110,26 @@ def test_registry_config_and_tensor_names(model_config):
     assert model.modules[-1].key == "lm_head"
 
 
+def test_all_expert_dots_calibration_ignores_selection_bias():
+    from exllamav3.modules.block_sparse_mlp_routing import routing_dots
+
+    logits = torch.tensor([[2., 0., -2.], [-2., 0., 2.]], dtype=torch.half)
+    bias = torch.tensor([0., .9, -.4])
+    cfg = types.SimpleNamespace(
+        gate_tensor=torch.eye(3, dtype=torch.half), num_experts=3,
+        e_score_correction_bias=bias, routed_scaling_factor=2.5,
+    )
+    selected, weights = routing_dots(2, cfg, logits, {"activate_all_experts": True})
+    assert selected.tolist() == [[0, 1, 2], [0, 1, 2]]
+    scores = logits.sigmoid().float()
+    expected = (scores * (2.5 / scores.sum(dim=-1, keepdim=True))).half()
+    torch.testing.assert_close(weights, expected, rtol=0, atol=0)
+    # Selection bias would produce substantially different contribution weights.
+    biased = scores + bias
+    biased_weights = (biased * (2.5 / biased.sum(dim=-1, keepdim=True))).half()
+    assert not torch.allclose(weights, biased_weights, atol=.1)
+
+
 def test_value_router_bias_selects_but_does_not_weight():
     from exllamav3.modules.k2_horizon import mova_routes
 
