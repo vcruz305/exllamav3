@@ -52,10 +52,10 @@ def k2_attention_gate(output, gate):
 
 
 class K2GroupedRMSNorm(Module):
-    def __init__(self, config, key: str, groups: int, eps: float):
+    def __init__(self, config, key: str, groups: int, eps: float, out_dtype: torch.dtype | None = None):
         super().__init__(config, key, None)
         self.groups = groups
-        self.norm = RMSNorm(config, key, eps, groups=groups)
+        self.norm = RMSNorm(config, key, eps, groups=groups, out_dtype=out_dtype)
         self.register_submodule(self.norm)
 
     def optimizer_targets(self):
@@ -80,7 +80,8 @@ class K2GroupedRMSNorm(Module):
     @staticmethod
     def tp_import(local_context, exported, plan):
         norm = RMSNorm.tp_import(local_context, exported["norm"], plan)
-        module = K2GroupedRMSNorm(None, norm.key, exported["groups"], norm.rms_norm_eps)
+        module = K2GroupedRMSNorm(None, norm.key, exported["groups"], norm.rms_norm_eps,
+                                  out_dtype=norm.out_dtype)
         module.norm = norm
         module.modules = [norm]
         module.device = local_context["device"]

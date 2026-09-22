@@ -144,7 +144,8 @@ class K2HorizonModel(Model):
             ))
         self.last_kv_module_idx = len(self.modules) - 1
         self.modules.extend([
-            K2GroupedRMSNorm(config, "model.norm", config.layernorm_num_groups, config.rms_norm_eps),
+            K2GroupedRMSNorm(config, "model.norm", config.layernorm_num_groups,
+                             config.rms_norm_eps, out_dtype=torch.half),
             Linear(config, "lm_head", config.hidden_size, config.vocab_size,
                    alt_key="model.embed_tokens" if config.tie_word_embeddings and
                    not config.stc.has_tensor("lm_head") else None,

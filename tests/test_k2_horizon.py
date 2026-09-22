@@ -148,6 +148,60 @@ def test_value_expert_silu_before_weighted_sum():
     torch.testing.assert_close(actual, expected)
 
 
+def test_final_grouped_norm_emits_half_for_quantized_lm_head(model_config, monkeypatch):
+    from exllamav3.architecture.k2_horizon import K2HorizonModel
+    from exllamav3.modules.rmsnorm import ext
+
+    model = K2HorizonModel(Config.from_directory(str(model_config)))
+    final_norm = model.modules[-2]
+    block_norm = model.modules[1].attn_norm
+    for norm in (final_norm, block_norm):
+        norm.norm.weight = torch.nn.Parameter(torch.ones(128, dtype=torch.half), requires_grad=False)
+
+    residual = torch.randn(2, 128, dtype=torch.float)
+    assert block_norm.forward_torch(residual, {}).dtype == torch.float
+    assert final_norm.forward_torch(residual, {}).dtype == torch.half
+    assert final_norm.norm.out_dtype == torch.half
+    assert model.modules[-1].key == "lm_head"
+
+    # CPU stand-in for the CUDA kernel: check the real forward allocation and
+    # grouped reshape on the FP32-residual -> half-precision-head boundary.
+    def cpu_rms_norm(x, weight, y, eps, bias, scale, span_heads, residual_out, groups):
+        assert not span_heads and not residual_out and bias == 0.0 and scale == 1.0
+        grouped = x.float().reshape(-1, groups, x.shape[-1])
+        normalized = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + eps)
+        y.copy_((normalized * weight.reshape(groups, -1)).reshape_as(y))
+
+    monkeypatch.setattr(ext, "rms_norm", cpu_rms_norm, raising=False)
+    torch.testing.assert_close(final_norm.forward(residual, {}), final_norm.forward_torch(residual, {}))
+    assert final_norm.forward(residual, {}).dtype == torch.half
+    assert block_norm.forward(residual, {}).dtype == torch.float
+
+
+@pytest.mark.parametrize("out_dtype", [None, torch.half])
+def test_grouped_norm_tp_roundtrip_preserves_output_dtype(out_dtype, monkeypatch):
+    from exllamav3.modules.k2_horizon import K2GroupedRMSNorm
+
+    norm = K2GroupedRMSNorm(None, "model.norm", 2, 1e-6, out_dtype=out_dtype)
+    norm.norm.weight = torch.nn.Parameter(torch.ones(4, dtype=torch.half), requires_grad=False)
+    norm.norm.device = torch.device("cpu")
+
+    class Pipe:
+        def send(self, tensor):
+            return tensor
+        def recv(self, tensor, cuda):
+            return tensor
+
+    exported = norm.tp_export({}, Pipe())
+    assert exported["norm"]["kwargs"]["out_dtype"] == out_dtype
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    imported = K2GroupedRMSNorm.tp_import(
+        {"device": torch.device("cpu"), "consumer": Pipe()}, exported, {})
+    assert imported.norm.out_dtype == out_dtype
+    assert imported.groups == 2
+    assert imported.forward_torch(torch.ones(1, 4, dtype=torch.float), {}).dtype == (out_dtype or torch.float)
+
+
 def test_group_norm_normalizes_each_half_not_full_vector():
     from exllamav3.modules.k2_horizon import K2GroupedRMSNorm
 
