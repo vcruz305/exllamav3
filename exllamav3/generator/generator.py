@@ -48,7 +48,7 @@ class Generator:
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
-        draft_confidence: float = 0.4,
+        draft_confidence: float | None = None,
         record_draft_stats: bool = False,
         **kwargs
     ):
@@ -108,7 +108,8 @@ class Generator:
             everything before it is accepted too) drafting stops when the running product of conditional
             estimates - the probability that the next position actually contributes a token - falls below the
             target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
-            n-gram drafting.
+            n-gram drafting. None (default) reads EXL3_DRAFT_CONFIDENCE from the environment, else 0.4, so
+            API servers that do not expose this knob (e.g. TabbyAPI) can still be tuned per deployment.
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
@@ -263,6 +264,9 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        if draft_confidence is None:
+            draft_confidence = float(_os.environ.get("EXL3_DRAFT_CONFIDENCE", "0.4"))
+        self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
 
