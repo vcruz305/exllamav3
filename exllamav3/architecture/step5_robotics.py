@@ -6,6 +6,7 @@ from ..model.config import Config, no_default
 from ..util.rope import RopeStyle
 from .step3_5 import Step3_5Model
 from .step3_7 import Step3_7Config
+from .step5_robotics_mtp import Step5RoboticsMTPModel
 
 """
 Step-5-Preview -- MMGPTStepRoboticsForCausalLM (model_type "step3p5v").
@@ -17,13 +18,16 @@ path, shared expert, embed/lm_head/norm). Config contract mirrors Step3_7Config,
 already reads everything under "text_config".
 
 SCOPE OF THIS PORT (explicit, fail-closed):
-  * text body only: layers 0..num_hidden_layers-1 (92). MTP layers 92..94 exist in the
-    checkpoint and are NOT part of this model (SAGE accounts MTP separately).
+  * text body: layers 0..num_hidden_layers-1 (92) via Step3_5Model.
+  * MTP depths 92..94 via Step5RoboticsMTPModel (this commit): per-depth fusion
+    (hnorm/enorm/eh_proj), dense sliding-attention decoder block, and a per-depth
+    transformer.shared_head. Budgeted on qbits_key "mtp_bits".
   * the sparse (CSA) indexer on the 23 "full_attention" layers is DESCRIBED here
     (attributes below) but its tensors are not yet loadable by this module set: until the
     indexer is implemented, those layers run DENSE full attention. That is an
     approximation on the attention path only; it must be stated in any report derived
-    from a capture made with this port.
+    from a capture made with this port. NOTE: no public runtime (NeMo, vLLM, StepFun
+    Step-3.7-Flash) implements this CSA indexer -- see work/plans/PORT_SPEC.md §3.
   * the vision tower is excluded.
 """
 
@@ -39,8 +43,9 @@ class Step5RoboticsConfig(Step3_7Config):
     ):
         super().__init__(directory, **kwargs)
 
-        # Text body only: drop the vision model from the class mapping
-        self.model_classes = {"text": Step5RoboticsModel}
+        # Text body + MTP depths. The vision model is deliberately dropped from the
+        # class mapping (vision stays out of scope for these packs).
+        self.model_classes = {"text": Step5RoboticsModel, "mtp": Step5RoboticsMTPModel}
 
         # ---- sparse (CSA) indexer descriptor -------------------------------------
         sc = self.read_cfg(dict, "text_config->sparse_config", None) or {}
@@ -67,9 +72,19 @@ class Step5RoboticsConfig(Step3_7Config):
             if self.layer_types[idx] in self.sparse_apply_to_layer_types
         ]
 
-        # MTP / nextn layers present in the checkpoint but outside this body model
+        # MTP / nextn layers (model.layers.{92,93,94}). Per-layer rope_theta,
+        # partial_rotary_factors, swiglu_limits, swiglu_limits_shared and layer_types are all
+        # 95-long in this checkpoint, so the MTP depths already have config values at
+        # indices 92..94 (sliding_attention + dense MLP, rope_theta 10000, prf 1.0).
         self.mtp_num_layers = self.read_cfg(int, "text_config->num_nextn_predict_layers", 0)
         self.mtp_base_layer_idx = self.num_hidden_layers
+
+        # The component only exists when the checkpoint actually carries the tensors.
+        mtp_key = f"model.layers.{self.mtp_base_layer_idx}.eh_proj"
+        if self.mtp_num_layers == 0 or not any(
+            self.stc.has_tensor(f"{mtp_key}.{t}") for t in ("weight", "trellis")
+        ):
+            self.model_classes.pop("mtp", None)
 
 
 class Step5RoboticsModel(Step3_5Model):
