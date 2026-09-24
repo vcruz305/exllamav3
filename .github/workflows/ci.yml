@@ -81,8 +81,11 @@ jobs:
           python -m pip show exllamav3
 
       - name: Import smoke test
-        # exllamav3/__init__.py does not re-export __version__, so read it from the module the
-        # packaging metadata is generated from, and check the installed dist metadata too
+        # From a neutral directory: run from the repo root and `import exllamav3` resolves to the
+        # source tree instead of the wheel that was just installed, which is the thing this gate
+        # is meant to prove. exllamav3/__init__.py does not re-export __version__, so read it
+        # from the module the packaging metadata is generated from, and check the dist metadata.
+        working-directory: ${{ runner.temp }}
         run: |
           python -c "import exllamav3; print('import ok:', exllamav3.__file__)"
           python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
