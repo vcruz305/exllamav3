@@ -32,6 +32,37 @@ Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3
 pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
 ```
 
+### Prebuilt wheels from this fork
+
+This fork publishes wheels for every release tag on its own [releases page](https://github.com/vcruz305/exllamav3/releases) - no CUDA toolkit, compiler or arch list on your side. Assets are named
+
+```
+exllamav3-<version>+cu<CUDA>.torch<torch>-cp<py>-cp<py>-<platform>.whl
+```
+
+so `exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl` is the CUDA 12.8 build for Python 3.12 with torch 2.11.0, and the same row on Windows ends in `win_amd64`. Pick the row matching the `torch`/CUDA pair you want; the wheel requires that exact `torch` version (see the caveat below).
+
+Linux/macOS:
+
+```sh
+pip install https://github.com/vcruz305/exllamav3/releases/download/v1.5.1.post1/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl
+```
+
+Windows (quote the URL - PowerShell treats `+` and `&` specially):
+
+```powershell
+pip install "https://github.com/vcruz305/exllamav3/releases/download/v1.5.1.post1/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-win_amd64.whl"
+```
+
+Rows built per release: Python 3.10-3.14 x torch 2.8.0-2.13.0 x CUDA 12.8 (`cu128`) and 13.2 (`cu132`), for Linux and Windows. Not every cell exists - torch 2.12/2.13 only ship on the CUDA 13.2 row, and torch 2.11 has no Python 3.10/3.11 wheels - so the release page is the list of what is actually available.
+
+- **No local build, no arch guessing.** Every wheel carries the fat CUDA arch list `8.0 8.6 8.9 9.0 10.0 12.0+PTX`: Ampere through Blackwell, including `sm_120` natively and newer parts such as GB10 (`sm_121`) through the `12.0+PTX` JIT entry. At runtime a wheel only needs a CUDA *driver*; the toolkit it was built against does not have to be installed locally.
+- **Nightly channel.** The rolling pre-release tagged [`nightly`](https://github.com/vcruz305/exllamav3/releases/tag/nightly) holds one Linux/CUDA 12.8 wheel built from the tip of `master`, with the same fat arch list. Its single asset is replaced on every push, so install from the URL rather than a saved copy:
+  ```sh
+  pip install --force-reinstall https://github.com/vcruz305/exllamav3/releases/download/nightly/exllamav3-1.5.1.post1+cu128.torch2.11.0-cp312-cp312-linux_x86_64.whl
+  ```
+- **Caveat - the package name is `exllamav3`.** These wheels are not a separate distribution, so installing one *replaces* an upstream `exllamav3` (PyPI or source) install in that environment instead of sitting next to it. Each wheel also pins its exact `torch` version as a requirement, so pip will install or downgrade `torch` to match it; to keep the torch you already have, install torch first and then the wheel with `--no-deps`. A virtualenv per fork build is the simple way to avoid surprises.
+
 ### Install from PyPI
 
 ```sh
