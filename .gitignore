@@ -10,3 +10,11 @@ dist
 
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
+
+# Editor and tooling backups, which have been committed by accident before
+*.bak
+*.orig
+*.rej
+*.prelegacy
+*.save
+*~
