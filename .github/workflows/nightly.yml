@@ -77,7 +77,7 @@ jobs:
         run: |
           ls -l dist
           python -m pip install --no-deps --force-reinstall dist/*.whl
-          python -c "import exllamav3; print('exllamav3', exllamav3.__version__)"
+          python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
 
       - name: Publish to the rolling nightly pre-release
         env:

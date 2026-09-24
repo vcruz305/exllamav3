@@ -81,7 +81,12 @@ jobs:
           python -m pip show exllamav3
 
       - name: Import smoke test
-        run: python -c "import exllamav3, sys; print('exllamav3', exllamav3.__version__); print(sys.version)"
+        # exllamav3/__init__.py does not re-export __version__, so read it from the module the
+        # packaging metadata is generated from, and check the installed dist metadata too
+        run: |
+          python -c "import exllamav3; print('import ok:', exllamav3.__file__)"
+          python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
+          python -c "from importlib.metadata import version; print('installed dist version:', version('exllamav3'))"
 
       - name: Run the CPU-only tests
         # tests/ has 55 modules and most need a CUDA device and the compiled extension to be
