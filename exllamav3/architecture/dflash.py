@@ -72,6 +72,35 @@ class DFlashConfig(Config):
             "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
 
+        # Variant switches for drafters other than the original z-lab ones (e.g. MiMo-V2.6's).
+        # Each defaults to the previous behaviour.
+
+        # Learned per-head attention sinks
+        self.attention_sink_bias = self.read_cfg(
+            bool,
+            ["dflash_config->attention_sink_bias", "attention_sink_bias", "add_swa_attention_sink_bias"],
+            None,
+        )
+        if self.attention_sink_bias is None:
+            self.attention_sink_bias = self.stc.has_tensor("layers.0.self_attn.attention_sink_bias")
+
+        # Scale on V, folded into o_proj
+        self.attention_value_scale = self.read_cfg(
+            float, ["dflash_config->attention_value_scale", "attention_value_scale"], None
+        ) or 1.0
+
+        # `is_causal: false`. With a sliding window this needs an explicit right bound, since a
+        # bare int window means (left, 0) and makes the drafted block causal again
+        self.bidirectional_block = self.read_cfg(
+            bool, ["dflash_config->bidirectional_block", "bidirectional_block"], None
+        )
+        if self.bidirectional_block is None:
+            self.bidirectional_block = not self.read_cfg(bool, "is_causal", True)
+
+        # Learned mask embedding shipped with the drafter, used instead of the target's
+        # embedding row for mask_token_id
+        self.key_mask_embedding = "mask_embedding" if self.stc.has_tensor("mask_embedding") else None
+
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
@@ -176,6 +205,7 @@ class DFlashModel(Model):
             mask_token_id = config.mask_token_id,
             rms_norm_eps = config.rms_norm_eps,
             native_draft_len = config.block_size,
+            key_mask_embedding = config.key_mask_embedding,
             qmap = "target_hidden",
         )
         self.modules += [self.input_layer]
@@ -201,6 +231,8 @@ class DFlashModel(Model):
                 key_o = "o_proj",
                 qmap = "block.attn",
                 sliding_window = config.sliding_window if is_swa else -1,
+                window_right = (config.block_size - 1) if (is_swa and config.bidirectional_block) else 0,
+                key_sinks = "attention_sink_bias" if config.attention_sink_bias else None,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -213,6 +245,7 @@ class DFlashModel(Model):
                 ),
                 out_dtype = torch.float,
             )
+            attn.o_proj.weight_scale = config.attention_value_scale
             self.attn_modules.append(attn)
 
             self.modules += [
@@ -340,5 +373,7 @@ class DFlashModel(Model):
     @override
     def get_additional_compiled_tensors(cls, config: DFlashConfig) -> dict:
         # The fc norm is stored in DFlashInputLayer but doesn't match the fc module-key prefix
-        norm_weight = config.stc.list_tensors(prefix = cls.key_fc_norm)
-        return norm_weight
+        tensors = dict(config.stc.list_tensors(prefix = cls.key_fc_norm))
+        if config.key_mask_embedding:
+            tensors.update(config.stc.list_tensors(prefix = config.key_mask_embedding))
+        return tensors
