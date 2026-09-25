@@ -64,7 +64,9 @@ jobs:
       - name: Install torch and the build/runtime dependencies
         run: |
           uv pip install torch==${{ env.TORCH_VERSION }} --index-url https://download.pytorch.org/whl/cu128
-          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja \
+          # pip itself has to be installed explicitly: setup-uv provides the interpreter, not pip,
+          # and the steps below run `python -m pip`
+          uv pip install --upgrade pip build "setuptools==84.0.0" wheel packaging ninja \
             "safetensors>=0.3.2" tokenizers "numpy>=2.1.0" rich typing_extensions pillow pyyaml \
             marisa_trie pydantic "llguidance>=1.7.0"
 
@@ -77,6 +79,14 @@ jobs:
         run: |
           ls -l dist
           python -m pip install --no-deps --force-reinstall dist/*.whl
+          python -m pip show exllamav3
+
+      - name: Import smoke test
+        # From a neutral directory so `import exllamav3` resolves to the installed wheel rather
+        # than to the source tree checked out in the working directory
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "import exllamav3; print('import ok:', exllamav3.__file__)"
           python -c "from exllamav3.version import __version__; print('exllamav3', __version__)"
 
       - name: Publish to the rolling nightly pre-release
