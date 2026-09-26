@@ -1195,14 +1195,16 @@ class Generator:
                 # window in one sampler call and compare against the draft on-device, so the
                 # round pays one launch->readback sync instead of one per position. Only for
                 # samplers whose per-position result does not depend on earlier positions in the
-                # same window (no past-id penalties, filters, forced tokens or prob exports)
+                # same window (no past-id penalties, filters, forced tokens or prob exports),
+                # and which explicitly opt in to position-independent verification.
                 pre_tokens = None
                 pre_match = None
                 if (
                     _BATCH_VERIFY and draft_tokens is not None and batch_logits.shape[1] > 1 and
                     len(job.sequences) == 1 and not job.filters and job.forced_ids is None and
                     not job.return_probs and job.return_top_tokens == 0 and job.new_tokens >= 0 and
-                    not getattr(job.sampler, "reqs_past_ids", False) and job.device_logit_mask is None
+                    not getattr(job.sampler, "reqs_past_ids", False) and job.device_logit_mask is None and
+                    getattr(job.sampler, "supports_batch_verify", False)
                 ):
                     q_ = batch_logits.shape[1]
                     all_tokens = job.sampler.forward(
