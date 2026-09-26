@@ -630,7 +630,7 @@ class Job:
 
         # Accept token
         self.new_tokens += 1
-        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.num_draft_tokens
+        requeue_now = self.new_tokens > self.max_rq_tokens - self.generator.draft_reserve_tokens
 
         for seq in self.sequences:
 
@@ -1105,10 +1105,13 @@ class Job:
         # requeue budget's headroom below so that budget still fits the cache exactly
         if self.max_new_tokens is None:
             self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.num_draft_tokens)
+                                      - 1 - self.generator.draft_reserve_tokens)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
+            if self.generator.dflash_draft:
+                # Even the first forward must fit before receive_sample can requeue.
+                self.max_rq_tokens = max(self.max_rq_tokens, self.generator.draft_reserve_tokens + 1)
             if len(self.sequences) == 1:
                 boundary = self.generator.recurrent_checkpoint_interval \
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
@@ -1116,8 +1119,8 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
         else:
-            # Default budget: the whole response plus one speculative window past the limit
-            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
+            # Default budget: the whole response plus the full draft write window past the limit
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.draft_reserve_tokens
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:

@@ -102,3 +102,15 @@ jobs:
             tests/test_optimizer_targets.py \
             tests/test_draft_confidence_env_.py \
             tests/test_attn_fullgate_cpu.py
+
+      - name: Run the CPU source tests for the unified-memory budget, draft-block reserve and batch-verification gate
+        # Separate step on purpose: these three read sources and execute them against stub
+        # devices and a fake procfs, so they need no GPU, no torch and no built extension,
+        # and running them in their own process keeps their stub modules out of the step
+        # above. tests/cpu_dflash_source_harness.py and tests/cpu_requirements_harness.py
+        # are the source readers they import.
+        run: |
+          python -m pytest -q \
+            tests/test_uma_budget_cpu.py \
+            tests/test_dflash_page_reserve_cpu.py \
+            tests/test_sampler_batch_verify_cpu.py
