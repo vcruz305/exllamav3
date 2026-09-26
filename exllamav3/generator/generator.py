@@ -256,6 +256,10 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        # DFlash writes its full native block even when verification is shortened.
+        self.draft_reserve_tokens = self.num_draft_tokens
+        if self.dflash_draft:
+            self.draft_reserve_tokens = max(self.num_draft_tokens, self.draft_model.config.block_size - 1)
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
