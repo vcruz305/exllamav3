@@ -2,7 +2,8 @@
 import ast,importlib.util,sys,unittest
 from pathlib import Path
 from types import SimpleNamespace
-SOURCE=Path(sys.argv.pop(1)) if len(sys.argv)>1 else Path(__file__).resolve().parents[1]
+_arg=Path(sys.argv[1]) if len(sys.argv)>1 else None
+SOURCE=_arg.resolve() if _arg is not None and (_arg/'exllamav3/generator/sampler').is_dir() else Path(__file__).resolve().parents[1]
 saved=sys.argv[:]
 sys.argv=[__file__,str(SOURCE/'exllamav3/generator/sampler')]
 spec=importlib.util.spec_from_file_location('requirements_harness',Path(__file__).parent/'cpu_requirements_harness.py')
@@ -105,4 +106,4 @@ class BatchGateTests(unittest.TestCase):
    self.assertTrue(s.reqs_torch_seed)
    self.assertFalse(gate(s))
 
-if __name__=='__main__':unittest.main(verbosity=2)
+if __name__=='__main__':unittest.main(verbosity=2,argv=[sys.argv[0]])
