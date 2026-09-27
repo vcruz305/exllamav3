@@ -1,0 +1,25 @@
+{
+  "attest_same_round8_weights_and_runtime": false,
+  "context": {
+    "source_revision": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+    "model_directory": "/workspace/MiMo-V2.6-Flash-RL-EXL3/2.50bpw",
+    "model_pack": "MiMo-V2.6-Flash-RL-EXL3/2.50bpw",
+    "drafter_directory": "/workspace/mimo-exl3/models/MiMo-V2.6-Flash-RL-dflash-EXL3-4.0bpw",
+    "drafter_revision": "d50ead3c6a3dec221e9a595fbdc103ef60db594e",
+    "drafter_bpw": 4.0,
+    "native_block": 8,
+    "cache_bits": 4,
+    "context_tokens": 4096,
+    "chunk_size": 4096,
+    "batch_size": 1,
+    "gpu_split": 106,
+    "reserve_mb": 8192,
+    "dynamic_confidence": 0.6,
+    "batch_verify": 0,
+    "handled_elision": 1,
+    "counts_elision": 0,
+    "kernel": "original-CUDA",
+    "hardware": "France-GB10",
+    "target_weight_identity": "owner-attested unchanged round8 2.50bpw pack"
+  }
+}

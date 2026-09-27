@@ -1,0 +1,31 @@
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... FAIL
+
+======================================================================
+FAIL: test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_recurrent.py", line 7, in test_retained_config_enabled
+    try:g=h.construct()
+          ^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\retained_harness.py", line 128, in construct
+    return n.h.Generator(**kw)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-candidate\candidate\exllamav3\generator\generator.py", line 284, in __init__
+    self.dflash_cost_policy = DFlashCostPolicy.from_environment(self, _BATCH_VERIFY)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-candidate\candidate\exllamav3\generator\draft_cost.py", line 112, in from_environment
+    raise ValueError("Unsupported cost-aware DFlash generator configuration")
+ValueError: Unsupported cost-aware DFlash generator configuration
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_recurrent.py", line 8, in test_retained_config_enabled
+    except ValueError as e:self.fail('retained recurrent-SWA must initialize: '+str(e))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: retained recurrent-SWA must initialize: Unsupported cost-aware DFlash generator configuration
+
+----------------------------------------------------------------------
+Ran 1 test in 0.037s
+
+FAILED (failures=1)

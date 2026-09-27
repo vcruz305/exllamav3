@@ -1,0 +1,17 @@
+test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer) ... FAIL
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+
+======================================================================
+FAIL: test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_recurrent.py", line 47, in test_ordinary_retained_round_reaches_policy_and_native_producer
+    self.assertEqual(g.dflash_cost_policy.select(g,h.scores(),7),expected,
+AssertionError: None != 7 : ordinary retained-profile round must select, not always fall back
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.232s
+
+FAILED (failures=1)

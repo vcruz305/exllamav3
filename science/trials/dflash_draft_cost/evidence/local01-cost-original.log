@@ -1,0 +1,28 @@
+test_additional_malformed_profile_contract (__main__.Configuration.test_additional_malformed_profile_contract) ... ok
+test_default_off_constructor_does_not_read_profile (__main__.Configuration.test_default_off_constructor_does_not_read_profile) ... ok
+test_full_constructor_opt_in_and_runtime_matrix (__main__.Configuration.test_full_constructor_opt_in_and_runtime_matrix) ... ok
+test_opt_in_init_requires_profile_and_attestation (__main__.Configuration.test_opt_in_init_requires_profile_and_attestation) ... ok
+test_profile_validation_and_context_binding (__main__.Configuration.test_profile_validation_and_context_binding) ... ok
+test_confidence_hard_cap_and_truncated_bonus_label (__main__.Guards.test_confidence_hard_cap_and_truncated_bonus_label) ... ok
+test_policy_guard_and_feedback (__main__.Guards.test_policy_guard_and_feedback) ... ok
+test_unsupported_and_boundary_fallback_matrix (__main__.Guards.test_unsupported_and_boundary_fallback_matrix) ... ok
+test_default_off_dds_preserved (__main__.Integration.test_default_off_dds_preserved) ... ok
+test_opt_in_selector_reaches_complete_producer (__main__.Integration.test_opt_in_selector_reaches_complete_producer) ... ok
+test_modeled_argmax_known_probabilities (__main__.Objective.test_modeled_argmax_known_probabilities) ... ok
+test_nonmonotone_probability_exhaustive_oracle (__main__.Objective.test_nonmonotone_probability_exhaustive_oracle) ... ok
+test_trust_requires_burnin_and_same_populated_bins (__main__.Objective.test_trust_requires_burnin_and_same_populated_bins) ... ok
+test_actual_combo_sampler_constructor_capability (__main__.Preservation.test_actual_combo_sampler_constructor_capability) ... ok
+test_disabled_untrusted_and_no_confidence_paths (__main__.Preservation.test_disabled_untrusted_and_no_confidence_paths) ... ok
+test_invalid_probability_fails_back_and_does_not_mutate_calibrator (__main__.Preservation.test_invalid_probability_fails_back_and_does_not_mutate_calibrator) ... ok
+test_no_extra_tensor_readbacks_for_policy (__main__.Preservation.test_no_extra_tensor_readbacks_for_policy) ... ok
+test_policy_rounds_requeue_refill_and_keep_native_pages (__main__.Preservation.test_policy_rounds_requeue_refill_and_keep_native_pages) ... ok
+test_reused_calibrator_default_dds_until_refilled (__main__.Preservation.test_reused_calibrator_default_dds_until_refilled) ... ok
+test_rewound_job_skips_all_labels_in_real_update_slice (__main__.Preservation.test_rewound_job_skips_all_labels_in_real_update_slice) ... ok
+test_source_calibration_slice_exact_labels_not_unverified_negatives (__main__.Preservation.test_source_calibration_slice_exact_labels_not_unverified_negatives) ... ok
+test_target_verifier_job_calibrator_cache_bytes_unchanged (__main__.Preservation.test_target_verifier_job_calibrator_cache_bytes_unchanged) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 0.374s
+
+OK
+

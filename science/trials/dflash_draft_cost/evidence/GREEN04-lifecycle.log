@@ -1,0 +1,11 @@
+test_checkpoint_boundary_envelope_uses_cached_prefix_offset (__main__.Eligibility.test_checkpoint_boundary_envelope_uses_cached_prefix_offset) ... ok
+test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer) ... ok
+test_unproved_live_recurrent_state_and_lifecycle_fall_back (__main__.Eligibility.test_unproved_live_recurrent_state_and_lifecycle_fall_back) ... ok
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.796s
+
+OK

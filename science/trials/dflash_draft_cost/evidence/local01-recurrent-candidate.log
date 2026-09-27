@@ -1,0 +1,20 @@
+ACTUAL_HOST_PROGRESS {'rounds': 253, 'eligible': 252, 'fallback': 1, 'new_tokens': 2019, 'position': 2041, 'effective_max_rq': 2025}
+test_checkpoint_boundary_envelope_uses_cached_prefix_offset (__main__.Eligibility.test_checkpoint_boundary_envelope_uses_cached_prefix_offset) ... ok
+test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer) ... ok
+test_unproved_live_recurrent_state_and_lifecycle_fall_back (__main__.Eligibility.test_unproved_live_recurrent_state_and_lifecycle_fall_back) ... ok
+test_actual_requeue_budget_boundary_and_continuation (__main__.HostPreservation.test_actual_requeue_budget_boundary_and_continuation) ... ok
+test_checkpoint_truncation_and_stash_unchanged (__main__.HostPreservation.test_checkpoint_truncation_and_stash_unchanged) ... ok
+test_end_over_requeue_precedence_unchanged_for_recurrence (__main__.HostPreservation.test_end_over_requeue_precedence_unchanged_for_recurrence) ... ok
+test_interior_progresses_to_effective_requeue_not_requested_one (__main__.HostPreservation.test_interior_progresses_to_effective_requeue_not_requested_one) ... ok
+test_max_new_and_unexpected_eos_preserve_terminal_controls (__main__.HostPreservation.test_max_new_and_unexpected_eos_preserve_terminal_controls) ... ok
+test_selected_short_windows_stop_tokens_and_bonus (__main__.HostPreservation.test_selected_short_windows_stop_tokens_and_bonus) ... ok
+test_zero_and_short_policy_rounds_keep_native_page_coverage (__main__.HostPreservation.test_zero_and_short_policy_rounds_keep_native_page_coverage) ... ok
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+test_wrong_architecture_and_state_types_are_not_name_allowlisted (__main__.Initialization.test_wrong_architecture_and_state_types_are_not_name_allowlisted) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 2.156s
+
+OK

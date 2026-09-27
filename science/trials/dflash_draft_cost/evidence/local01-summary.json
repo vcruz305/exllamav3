@@ -1,0 +1,131 @@
+{
+  "pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "results": {
+    "parent_red": {
+      "tests": 3,
+      "exit_code": 1
+    },
+    "source_init_red": {
+      "tests": 1,
+      "exit_code": 1
+    },
+    "profile": {
+      "tests": 1,
+      "exit_code": 0
+    },
+    "pages_baseline": {
+      "tests": 187,
+      "exit_code": 0
+    },
+    "native_baseline": {
+      "tests": 20,
+      "exit_code": 0
+    },
+    "sampler_baseline": {
+      "tests": 12,
+      "exit_code": 0
+    },
+    "pages_original": {
+      "tests": 187,
+      "exit_code": 0
+    },
+    "native_original": {
+      "tests": 19,
+      "exit_code": 0
+    },
+    "sampler_original": {
+      "tests": 12,
+      "exit_code": 0
+    },
+    "cost_original": {
+      "tests": 22,
+      "exit_code": 0
+    },
+    "pages_candidate": {
+      "tests": 187,
+      "exit_code": 0
+    },
+    "native_candidate": {
+      "tests": 19,
+      "exit_code": 0
+    },
+    "sampler_candidate": {
+      "tests": 12,
+      "exit_code": 0
+    },
+    "cost_candidate": {
+      "tests": 22,
+      "exit_code": 0
+    },
+    "recurrent_candidate": {
+      "tests": 14,
+      "exit_code": 0
+    },
+    "pages_applied": {
+      "tests": 187,
+      "exit_code": 0
+    },
+    "native_applied": {
+      "tests": 19,
+      "exit_code": 0
+    },
+    "sampler_applied": {
+      "tests": 12,
+      "exit_code": 0
+    },
+    "cost_applied": {
+      "tests": 22,
+      "exit_code": 0
+    },
+    "recurrent_applied": {
+      "tests": 14,
+      "exit_code": 0
+    },
+    "pages_incremental": {
+      "tests": 187,
+      "exit_code": 0
+    },
+    "native_incremental": {
+      "tests": 19,
+      "exit_code": 0
+    },
+    "sampler_incremental": {
+      "tests": 12,
+      "exit_code": 0
+    },
+    "cost_incremental": {
+      "tests": 22,
+      "exit_code": 0
+    },
+    "recurrent_incremental": {
+      "tests": 14,
+      "exit_code": 0
+    }
+  },
+  "seals": {
+    "original_files": 3219,
+    "other_input_files": 956
+  },
+  "baseline_clean": true,
+  "all_baseline_blobs_match": true,
+  "both_applied_trees_byte_identical": true,
+  "incremental_changed": [
+    "exllamav3/generator/draft_cost.py"
+  ],
+  "combined_changed": [
+    "exllamav3/generator/draft_cost.py",
+    "exllamav3/generator/generator.py"
+  ],
+  "incremental_sha256": "5f2ff5f766072d5e8d7a8769d1dde65df0bc4523e70fa79be828370628f2b25a",
+  "combined_sha256": "93a653fd430a8d23cab3c01c1e5ad3352d010c02fdd45080b35991f0c89f2528",
+  "profile_sha256": "798adbc9c69156524d16f1ae028731974825b01322998613f03faa8ad6efa7e6",
+  "files": {
+    "exllamav3/generator/generator.py": "30da9fd112d04ee1c8aae48819ce0c6af0833d7b26b2f03092aa1fd965cf0e58",
+    "exllamav3/generator/draft_cost.py": "543f8acb15cd0047985ea4efe70ae93566bb50fdc426c3b863d3778edcb2c334"
+  },
+  "total_per_repaired_tree": 254,
+  "no_real_torch_or_exllamav3_imports": true,
+  "no_gpu_validation": true,
+  "no_tps_claim": true,
+  "live_attestation": false
+}

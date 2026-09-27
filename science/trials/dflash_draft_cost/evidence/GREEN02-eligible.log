@@ -1,0 +1,9 @@
+test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer) ... ok
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.244s
+
+OK

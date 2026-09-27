@@ -1,0 +1,8 @@
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.223s
+
+OK

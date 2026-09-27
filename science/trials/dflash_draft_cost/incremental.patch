@@ -1,0 +1,109 @@
+--- a/exllamav3/generator/draft_cost.py
++++ b/exllamav3/generator/draft_cost.py
+@@ -106,7 +106,7 @@
+         if (not g.dflash_draft or g.mtp_draft or g.draft_model.config.block_size != 8 or
+                 not 1 <= g.num_draft_tokens <= 7 or not g.dynamic_draft or g.draft_calibrator is None or
+                 g.draft_confidence != 0.6 or g.max_batch_size != 1 or g.max_chunk_size != 4096 or
+-                g.recurrent_cache is not None or batch_verify or
++                batch_verify or
+                 g.model.config.directory != ctx["model_directory"] or
+                 g.draft_model.config.directory != ctx["drafter_directory"]):
+             raise ValueError("Unsupported cost-aware DFlash generator configuration")
+@@ -118,20 +118,71 @@
+         if (os.environ.get("EXL3_MOE_MIXEDK_ELIDE_HANDLED", "0") != "1" or
+                 os.environ.get("EXL3_UMA_RESERVE_MB") != "8192"):
+             raise ValueError("Unsupported cost-aware DFlash runtime flags")
++        if g.recurrent_cache is not None:
++            obj._bind_mimo_swa(g)
+         return obj
++
++    def _bind_mimo_swa(self, g):
++        """Allow only the retained MiMo window ring, not arbitrary recurrence.
++
++        Q4 applies to cache.layers (global attention), NOT recurrent_layers:
++        SWA uses half-precision per-slot rings. This is a structural check, not
++        weight/runtime authentication; the independent attestation remains required.
++        """
++        from exllamav3.architecture.mimo_v2 import MiMoV2Model
++        from exllamav3.modules.sliding_attn import SWAState, SWALayerState, SlidingAttention
++        from exllamav3.cache.recurrent import RecurrentCache
++
++        m, c = g.model, g.cache
++        cfg = m.config
++        global_layers = {0, 5, 11, 17, 23, 29, 35, 41, 47}
++        pattern = [0 if i in global_layers else 1 for i in range(48)]
++        try:
++            valid = (
++                type(m) is MiMoV2Model and not m.loaded_tp and m.swa_full is False and
++                m.recurrent_state_cls is SWAState and c.recurrent_state_cls is SWAState and
++                c.model is m and cfg.layer_map is None and cfg.num_hidden_layers == 48 and
++                cfg.hybrid_layer_pattern == pattern and cfg.sliding_window == 128 and
++                cfg.head_dim == 192 and cfg.v_head_dim == 128 and cfg.num_kv_heads == 4 and
++                cfg.swa_num_kv_heads == 8 and c.num_slots == 1 and c.max_history == 7 and
++                g.draft_reserve_tokens == 7 and g.recurrent_checkpoint_interval == 2048 and
++                g.recurrent_checkpoint_interval_pp == 32768 and
++                type(g.recurrent_cache) is RecurrentCache and g.recurrent_cache.model is m and
++                g.recurrent_cache_size == g.recurrent_cache.max_size == 256 * 1024**2 and
++                set(c.layers) == {(i, 0) for i in global_layers} and
++                set(c.recurrent_layers) == {(i, 0) for i in range(48) if i not in global_layers} and
++                all(type(layer) is SWALayerState and type(layer.module) is SlidingAttention and
++                    layer.module.layer_idx == key[0] and layer.module.sliding_window == 127 and
++                    layer.module.sliding_window_overp == 512 and layer.module.kv_state_size == 768 and
++                    layer.module.head_dim == 192 and layer.module.num_kv_heads == 8 and
++                    layer.max_history == 7 and layer.max_batch_size == 1
++                    for key, layer in c.recurrent_layers.items())
++            )
++        except AttributeError:
++            valid = False
++        if not valid:
++            raise ValueError("Unsupported cost-aware recurrent configuration; requires retained MiMo SWA")
++        self._mimo_swa = (m, c, g.recurrent_cache, SWAState)
+ 
+     def select(self, generator, conf, cap):
+         """Narrow singleton neutral-greedy guard; all other jobs retain DDS.
+ 
+         Boundary rounds retain DDS rather than treating suppressed/terminal tokens
+-        as useful output. Recurrent checkpoints and banned-string rewinds are not
+-        modeled. Only already-read CPU scores are inspected here.
++        as useful output. Only validated MiMo SWA interior rounds are admitted;
++        checkpoint/requeue boundaries and banned-string rewinds are not modeled.
++        Only already-read CPU scores are inspected here. Unexpected EOS still
++        follows the unchanged target verifier; the objective is not realized yield.
+         """
+         g = generator
+         if (not g.dflash_draft or g.mtp_draft or g.draft_model.config.block_size != 8 or
+                 not 1 <= g.num_draft_tokens <= 7 or len(g.active_jobs) != 1 or
+-                g.recurrent_cache is not None or conf.shape != (1, 7)):
+-            return None
++                conf.shape != (1, 7)):
++            return None
++        if g.recurrent_cache is not None:
++            bound = getattr(self, "_mimo_swa", None)
++            if (bound is None or bound[0] is not g.model or bound[1] is not g.cache or
++                    bound[2] is not g.recurrent_cache):
++                return None
+         job = g.active_jobs[0]
+         if (len(job.sequences) != 1 or not job.is_prefill_done() or job.filters or
+                 job.forced_ids is not None or job.return_probs or job.return_top_tokens or
+@@ -140,6 +191,21 @@
+                 getattr(job.sampler, "reqs_past_ids", True) or job.device_logit_mask is not None):
+             return None
+         q = cap + 1
++        if g.recurrent_cache is not None:
++            # is_checkpoint_boundary() measures decode checkpoints from cached
++            # pages, not absolute position. Keep DDS at/currently approaching one,
++            # including the bonus position; never mutate the job to probe it.
++            pos = job.sequences[0].kv_position
++            state = getattr(job, "recurrent_state", None)
++            if (type(state) is not bound[3] or state.cache is not g.cache or state.position != pos or
++                    getattr(job, "is_requeued", True) or getattr(job, "is_finished", True) or
++                    getattr(job, "checkpoint_rewound", True) or job.stop_strings or job.loop_detector or
++                    g.recurrent_checkpoint_interval != 2048 or
++                    type(job.cached_pages) is not int or not 0 <= job.cached_pages * 256 <= pos):
++                return None
++            phase = (pos - job.cached_pages * 256) % g.recurrent_checkpoint_interval
++            if phase == 0 or g.recurrent_checkpoint_interval - phase <= q:
++                return None
+         # receive_sample increments new_tokens before its strict requeue comparison.
+         remaining = job.max_new_tokens - job.new_tokens
+         rq_remaining = job.max_rq_tokens - g.draft_reserve_tokens - job.new_tokens + 1

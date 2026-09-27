@@ -1,0 +1,37 @@
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ERROR
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ERROR
+
+======================================================================
+ERROR: test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_recurrent.py", line 7, in test_retained_config_enabled
+    try:g=h.construct()
+          ^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\retained_harness.py", line 108, in construct
+    exec(compile(ast.Module(body=loader.body[begin:begin+2],type_ignores=[]),'<actual loader cache slice>','exec'),ns)
+  File "<actual loader cache slice>", line 295, in <module>
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\candidate\exllamav3\cache\cache.py", line 146, in __init__
+    cl = self.model.get_cache_layers()
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DraftAdapter' object has no attribute 'get_cache_layers'
+
+======================================================================
+ERROR: test_retained_default_off (__main__.Initialization.test_retained_default_off)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_recurrent.py", line 18, in test_retained_default_off
+    g=h.construct(False)
+      ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\retained_harness.py", line 108, in construct
+    exec(compile(ast.Module(body=loader.body[begin:begin+2],type_ignores=[]),'<actual loader cache slice>','exec'),ns)
+  File "<actual loader cache slice>", line 295, in <module>
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\candidate\exllamav3\cache\cache.py", line 146, in __init__
+    cl = self.model.get_cache_layers()
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DraftAdapter' object has no attribute 'get_cache_layers'
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.044s
+
+FAILED (errors=2)

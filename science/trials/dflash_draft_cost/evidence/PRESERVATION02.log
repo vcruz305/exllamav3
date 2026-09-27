@@ -1,0 +1,15 @@
+test_checkpoint_boundary_envelope_uses_cached_prefix_offset (__main__.Eligibility.test_checkpoint_boundary_envelope_uses_cached_prefix_offset) ... ok
+test_ordinary_retained_round_reaches_policy_and_native_producer (__main__.Eligibility.test_ordinary_retained_round_reaches_policy_and_native_producer) ... ok
+test_unproved_live_recurrent_state_and_lifecycle_fall_back (__main__.Eligibility.test_unproved_live_recurrent_state_and_lifecycle_fall_back) ... ok
+test_actual_requeue_budget_boundary_and_continuation (__main__.HostPreservation.test_actual_requeue_budget_boundary_and_continuation) ... ok
+test_checkpoint_truncation_and_stash_unchanged (__main__.HostPreservation.test_checkpoint_truncation_and_stash_unchanged) ... ok
+test_max_new_and_unexpected_eos_preserve_terminal_controls (__main__.HostPreservation.test_max_new_and_unexpected_eos_preserve_terminal_controls) ... ok
+test_zero_and_short_policy_rounds_keep_native_page_coverage (__main__.HostPreservation.test_zero_and_short_policy_rounds_keep_native_page_coverage) ... ok
+test_other_recurrence_or_unproved_configuration_rejected (__main__.Initialization.test_other_recurrence_or_unproved_configuration_rejected) ... ok
+test_retained_config_enabled (__main__.Initialization.test_retained_config_enabled) ... ok
+test_retained_default_off (__main__.Initialization.test_retained_default_off) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 1.513s
+
+OK

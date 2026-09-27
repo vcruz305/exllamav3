@@ -1,0 +1,334 @@
+{
+  "schema": 1,
+  "units": "ms",
+  "metric": "whole_round_host",
+  "population": "pooled_warm_actual_q",
+  "provisional": true,
+  "context": {
+    "source_revision": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+    "model_directory": "/workspace/MiMo-V2.6-Flash-RL-EXL3/2.50bpw",
+    "model_pack": "MiMo-V2.6-Flash-RL-EXL3/2.50bpw",
+    "drafter_directory": "/workspace/mimo-exl3/models/MiMo-V2.6-Flash-RL-dflash-EXL3-4.0bpw",
+    "drafter_revision": "d50ead3c6a3dec221e9a595fbdc103ef60db594e",
+    "drafter_bpw": 4.0,
+    "native_block": 8,
+    "cache_bits": 4,
+    "context_tokens": 4096,
+    "chunk_size": 4096,
+    "batch_size": 1,
+    "gpu_split": 106,
+    "reserve_mb": 8192,
+    "dynamic_confidence": 0.6,
+    "batch_verify": 0,
+    "handled_elision": 1,
+    "counts_elision": 0,
+    "kernel": "original-CUDA",
+    "hardware": "France-GB10",
+    "target_weight_identity": "owner-attested unchanged round8 2.50bpw pack"
+  },
+  "q_costs": [
+    {
+      "q": 1,
+      "samples": 99,
+      "case_counts": {
+        "code": 6,
+        "prose": 93
+      },
+      "mean_ms": 61.39701672693282,
+      "min_ms": 60.05629792343825,
+      "max_ms": 63.38513095397502
+    },
+    {
+      "q": 2,
+      "samples": 177,
+      "case_counts": {
+        "code": 39,
+        "prose": 138
+      },
+      "mean_ms": 77.13947787954561,
+      "min_ms": 69.68748499639332,
+      "max_ms": 94.48121103923768
+    },
+    {
+      "q": 3,
+      "samples": 129,
+      "case_counts": {
+        "code": 36,
+        "prose": 93
+      },
+      "mean_ms": 89.04667751766135,
+      "min_ms": 79.43182496819645,
+      "max_ms": 99.67957099433988
+    },
+    {
+      "q": 4,
+      "samples": 42,
+      "case_counts": {
+        "code": 27,
+        "prose": 15
+      },
+      "mean_ms": 98.82343713460224,
+      "min_ms": 89.1769320005551,
+      "max_ms": 106.66744306217879
+    },
+    {
+      "q": 5,
+      "samples": 42,
+      "case_counts": {
+        "code": 15,
+        "prose": 27
+      },
+      "mean_ms": 114.53794461253676,
+      "min_ms": 103.70942403096706,
+      "max_ms": 123.45176504459232
+    },
+    {
+      "q": 6,
+      "samples": 33,
+      "case_counts": {
+        "code": 21,
+        "prose": 12
+      },
+      "mean_ms": 118.77859702023368,
+      "min_ms": 109.25989400129765,
+      "max_ms": 124.49334398843348
+    },
+    {
+      "q": 7,
+      "samples": 24,
+      "case_counts": {
+        "code": 15,
+        "prose": 9
+      },
+      "mean_ms": 131.96463056859406,
+      "min_ms": 120.43680297210813,
+      "max_ms": 141.2014269735664
+    },
+    {
+      "q": 8,
+      "samples": 60,
+      "case_counts": {
+        "code": 60,
+        "prose": 0
+      },
+      "mean_ms": 135.09021818560237,
+      "min_ms": 123.56197205372155,
+      "max_ms": 148.73619202990085
+    }
+  ],
+  "cold_q_costs": [
+    {
+      "q": 1,
+      "samples": 33,
+      "case_counts": {
+        "code": 1,
+        "prose": 32
+      },
+      "mean_ms": 61.8098162989499,
+      "min_ms": 60.47091993968934,
+      "max_ms": 69.60649404209107
+    },
+    {
+      "q": 2,
+      "samples": 39,
+      "case_counts": {
+        "code": 2,
+        "prose": 37
+      },
+      "mean_ms": 77.94145217392212,
+      "min_ms": 69.62219008710235,
+      "max_ms": 102.8273159172386
+    },
+    {
+      "q": 3,
+      "samples": 40,
+      "case_counts": {
+        "code": 5,
+        "prose": 35
+      },
+      "mean_ms": 90.81430369114969,
+      "min_ms": 83.19526293780655,
+      "max_ms": 115.93019997235388
+    },
+    {
+      "q": 4,
+      "samples": 12,
+      "case_counts": {
+        "code": 2,
+        "prose": 10
+      },
+      "mean_ms": 103.09875624564786,
+      "min_ms": 92.526979977265,
+      "max_ms": 117.42705700453371
+    },
+    {
+      "q": 5,
+      "samples": 9,
+      "case_counts": {
+        "code": 4,
+        "prose": 5
+      },
+      "mean_ms": 117.85013898689714,
+      "min_ms": 109.9912989884615,
+      "max_ms": 145.4796310281381
+    },
+    {
+      "q": 6,
+      "samples": 12,
+      "case_counts": {
+        "code": 6,
+        "prose": 6
+      },
+      "mean_ms": 126.62664974535194,
+      "min_ms": 113.1550120189786,
+      "max_ms": 159.90046004299074
+    },
+    {
+      "q": 7,
+      "samples": 5,
+      "case_counts": {
+        "code": 2,
+        "prose": 3
+      },
+      "mean_ms": 136.0571938334033,
+      "min_ms": 126.65293307509273,
+      "max_ms": 155.72860708925873
+    },
+    {
+      "q": 8,
+      "samples": 41,
+      "case_counts": {
+        "code": 40,
+        "prose": 1
+      },
+      "mean_ms": 137.1227334645327,
+      "min_ms": 125.37463603075594,
+      "max_ms": 168.10717398766428
+    }
+  ],
+  "requests": [
+    {
+      "ordinal": 0,
+      "case": "code",
+      "phase": "cold",
+      "rep": 0,
+      "rounds": 62
+    },
+    {
+      "ordinal": 1,
+      "case": "prose",
+      "phase": "cold",
+      "rep": 0,
+      "rounds": 129
+    },
+    {
+      "ordinal": 2,
+      "case": "code",
+      "phase": "warm",
+      "rep": 1,
+      "rounds": 73
+    },
+    {
+      "ordinal": 3,
+      "case": "prose",
+      "phase": "warm",
+      "rep": 1,
+      "rounds": 129
+    },
+    {
+      "ordinal": 4,
+      "case": "code",
+      "phase": "warm",
+      "rep": 2,
+      "rounds": 73
+    },
+    {
+      "ordinal": 5,
+      "case": "prose",
+      "phase": "warm",
+      "rep": 2,
+      "rounds": 129
+    },
+    {
+      "ordinal": 6,
+      "case": "code",
+      "phase": "warm",
+      "rep": 3,
+      "rounds": 73
+    },
+    {
+      "ordinal": 7,
+      "case": "prose",
+      "phase": "warm",
+      "rep": 3,
+      "rounds": 129
+    }
+  ],
+  "warm_rounds": 606,
+  "cold_rounds": 191,
+  "total_rounds": 797,
+  "zero_proposal_rounds": 132,
+  "sources": {
+    "mirror/responses.jsonl": "458f4358c5e5d180511982efafb40e2cfc2c593ab4005aa702e023479bc10afb",
+    "mirror/frozen.json": "aa7cd92de881a35f6288ed1840094296e3f9d51db442f706cbeaffe67d03e160",
+    "parent01-receipt.json": "0a5d6205d84eaab5fed61748415c9431cfd1f7e75ff0955be9bf7d270a09efcb",
+    "mirror/runs/france-round8-cost-1790460677264568082/launch.json": "2fa6395d071c62538dff3284791c3f124bc3824e2975ecbfb52ecfd6241d9596",
+    "mirror/width/source-proof.json": "a7b9590d76b14993d9125575f452464d33632b2d00243264954c98a6d4fe5abe",
+    "cost_diag.py": "882975cb32cb5bd7ffdd7d9670ba0c6758f4a1fbbd89b93644e13bd5e1d80dfd",
+    "mirror/cost/0-rounds.jsonl": "c38e1ed9db0a92495f5b42fc7fa48113f11ebb8bf4007241eae40203235baa71",
+    "mirror/cost/0-terminal.json": "2a3f75c574a7f761e5ef3ba6e4ce6634f5ba3c3cf60084bd499d975b83e668e9",
+    "mirror/cost/0-timing.jsonl": "84c2ae449fa0245a359e60335507b17d62ddcd6abd45c00496675e7ffe823edb",
+    "mirror/cost/1-rounds.jsonl": "b75f0140b295559c784e11d273314badf84df569dd51352907248c2007d14d65",
+    "mirror/cost/1-terminal.json": "54a8941e858103405d44a50c9950dae9f8785f7009d62776e441943ba3ec3f33",
+    "mirror/cost/1-timing.jsonl": "a5544950aac5ab5a0cfe2ce601f4342719a2d6d8c7fe1865e203167c1145bb62",
+    "mirror/cost/2-rounds.jsonl": "51126fb714ff597c997d4f72afa6419943538e8dbfef7796f1ca640f85353b9e",
+    "mirror/cost/2-terminal.json": "0d1e04464da500dcbe1b0245f0317f97a7f58ecb02f12f6d148d33ad6f36106f",
+    "mirror/cost/2-timing.jsonl": "a213f27e98fccec623040bb8a02011e59b28bca5a93849c27c1de82153f04912",
+    "mirror/cost/3-rounds.jsonl": "a0e6d75b2a9f58876c550c9e2abb0e1de05dacaa8286bfea250e5fb8d5a6ab1f",
+    "mirror/cost/3-terminal.json": "90105a5418dae299e975433b8f7300eb130668d3603a8ceec2bbae9ca546067c",
+    "mirror/cost/3-timing.jsonl": "86419f6610394e3300e0d60401802735f4fc46ac17ad10d2921ceabcf5283dfb",
+    "mirror/cost/4-rounds.jsonl": "0aac74decf20d879b80c1a955033e5de3f8b2ec2ec02cc1c146d442c72bcc7fc",
+    "mirror/cost/4-terminal.json": "da70c0f60424f353286b3a8b7a5b079073b78aed03d2b04d2dc64c768a940676",
+    "mirror/cost/4-timing.jsonl": "0aaf594b4a07d0882f170d61b21557edaeec3869e0d7ab064c76ee7b8009ae50",
+    "mirror/cost/5-rounds.jsonl": "773f397e6640f9e42edc9db29e92dd80f223b98cf89d1f822ca864eee8c449f6",
+    "mirror/cost/5-terminal.json": "48e22293bf743dbf693d2a437d74abfdfc13ad5879f716bb5b073b5d3728549e",
+    "mirror/cost/5-timing.jsonl": "7b8384e58dd013dd34206ffeae04aea9bf90b8100941a56be5c02986bb8132d6",
+    "mirror/cost/6-rounds.jsonl": "2beb23bc9022857d4fa9da8c787f6df14ec0d201f342b1cea21958f69d3131c4",
+    "mirror/cost/6-terminal.json": "1cfec106030743dff36aa4a87af087bb3925792ff496bcc481ae494ef2e14cc1",
+    "mirror/cost/6-timing.jsonl": "a2ece2478ac2a131e473afed386df508a1b2a38de0b614c9069df6785150f3d4",
+    "mirror/cost/7-rounds.jsonl": "41d91f6ab0932ae797f9b03e12c75d0cbf8b8a67d998692ea883946bbadb8747",
+    "mirror/cost/7-terminal.json": "af5b7ce66e9759e182c3c2231c66cb27830131d12b12b506be0ba70e58579bd2",
+    "mirror/cost/7-timing.jsonl": "232fc04b1489596166d894fd028e3dc0eedcba1b78870696b0cd468c111042a2"
+  },
+  "measured_source_hashes": {
+    "/workspace/MiMo-V2.6-Flash-RL-EXL3-recipe/server/serve_native.py": "c0224af1b82426013d72312eece41c9cff83a4b65cfe05c1c5e72cd4179fda7d",
+    "/workspace/MiMo-V2.6-Flash-RL-EXL3-recipe/server/protocol.py": "3f5a42447c3c34ef3d07d517e233bf5b93a832c4c4fb3de46cebc9dbb849e6d1",
+    "/workspace/MiMo-V2.6-Flash-RL-EXL3-recipe/server/worker.py": "3dbcb86ce0a0872af2802df3cf69fd50cdf565d1520caea1a5d54295c45c381c",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/architecture/dflash.py": "97699d476ba887d0977cb9853db07efc72ec3e0d26b245c2d0508b9f1c6c652a",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/arch_specific/dflash.py": "547ab475a8f87a777fa14a1a0c30ecd3304043ccd9901b139f60fbbd00a44186",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/generator.py": "3ce3efde084eabe4b9e2dcb937d2b37635b383d294958a599f91dd507896a6ef",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/job.py": "c9525e0c4ae455d7d86947be695781d8ae9b7348c0d129c96e1db242b527ad8e",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/pagetable.py": "0cde876b9969df7120ed7137b35bff3040dc3a7613c9f5a9547e58da4a9849ea",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/draft_confidence.py": "51b27c07cb43845b14f300273d7a3608437ba6ad7c57af9d1b2eeef67ba29f53",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/attn.py": "868556feedfe5858a429e338cdd51200ea22260bc7fabf8c631731dffc1f4b73",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model/config.py": "9a1ae9710a26c68a4b9efbcc46ce54e0acc63b8f16aeddd726989a8175c9c50b",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/util/file.py": "447a732394e55c026ebdd796eb8ab8849279186cefa84e432effc6154031543c",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/util/rope.py": "35b95b3e1eeafb37b520678cd06aaa2e1597bfd40b7d1a72aa528ac7fa3df9c1",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/cache/quant.py": "7c1cce9713ecd16b90ebadb0ffc310e134960a9343464443228b7416c6604e04",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/cache/fp16.py": "8702ebfc547a55248fd3694a757eac54a99d6b725747b642fa34b9f19c3735f8",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model_init.py": "3db208da28e2c96c22abe79a9d3b9b0199b5ec9b0def019f15dc959807d86915",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model/model.py": "eab98d80b80d262bbc8253dc0951d804e665ce923a3b4b7e0e97227ff0e7cf43",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model/model_ls.py": "0dd4fd118f73439a026dfe2c55818e95cf53a81f7d7994563d9e8163ee7d76b8",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/attention_fn/bc_attn.py": "c76c782e7edb402613a53bde253147629f9861bdc1dc166eabb9dab889917191",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/attention_fn/triton_paged.py": "b7235157f6efa0d2ffcf2bf37586cccdb36be3ac23cb7e10ff704334aeb28000",
+    "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/util/tensor.py": "d49d599e6a64a2dbc235c6ecf153c78dc635e9111ab7302f2317d94b9365c931"
+  },
+  "limitations": [
+    "Instrumented observational costs, not clean live cost calibration.",
+    "Policy/state/workload selection bias; q8 warm has code only. No invented prose q8.",
+    "No per-position confidence or proposal IDs: cannot replay candidate windows or acceptance.",
+    "Whole-round span includes native drafter, target, sampling, cache updates. Do not sum overlapping event/readback times.",
+    "Target weight revision/hash absent from round8 evidence; runtime owner must attest identical retained pack. No weight verification performed here.",
+    "Cold code SyntaxError and warm truncation are baseline quality observations, not expected-policy reward."
+  ]
+}

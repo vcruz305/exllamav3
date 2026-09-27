@@ -1,0 +1,17 @@
+test_active_dry_stays_serial (__main__.BatchGateTests.test_active_dry_stays_serial) ... ok
+test_active_penalties_stay_serial (__main__.BatchGateTests.test_active_penalties_stay_serial) ... ok
+test_base_sampler_defaults_to_serial (__main__.BatchGateTests.test_base_sampler_defaults_to_serial) ... ok
+test_categorical_sampling_stays_serial (__main__.BatchGateTests.test_categorical_sampling_stays_serial) ... ok
+test_custom_argmax_subclass_fails_closed (__main__.BatchGateTests.test_custom_argmax_subclass_fails_closed) ... ok
+test_existing_job_constraints_still_close_greedy_gate (__main__.BatchGateTests.test_existing_job_constraints_still_close_greedy_gate) ... ok
+test_greedy_with_extra_steps_is_conservatively_serial (__main__.BatchGateTests.test_greedy_with_extra_steps_is_conservatively_serial) ... ok
+test_inserted_preparation_requirements_are_retained (__main__.BatchGateTests.test_inserted_preparation_requirements_are_retained) ... ok
+test_multinomial_stays_serial_and_keeps_seed_requirement (__main__.BatchGateTests.test_multinomial_stays_serial_and_keeps_seed_requirement) ... ok
+test_neutral_greedy_is_batch_eligible (__main__.BatchGateTests.test_neutral_greedy_is_batch_eligible) ... ok
+test_stateful_adaptive_sampler_is_not_batch_eligible (__main__.BatchGateTests.test_stateful_adaptive_sampler_is_not_batch_eligible) ... ok
+test_unknown_sampler_fails_closed (__main__.BatchGateTests.test_unknown_sampler_fails_closed) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 1.005s
+
+OK

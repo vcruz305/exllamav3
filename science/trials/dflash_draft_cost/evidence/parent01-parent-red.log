@@ -1,0 +1,32 @@
+test_disabled_retained_profile_constructs_recurrent_cache (__main__.RetainedConfiguration.test_disabled_retained_profile_constructs_recurrent_cache) ... ok
+test_enabled_measured_retained_profile_must_be_eligible (__main__.RetainedConfiguration.test_enabled_measured_retained_profile_must_be_eligible) ... FAIL
+test_nonrecurrent_fixture_is_not_the_retained_profile (__main__.RetainedConfiguration.test_nonrecurrent_fixture_is_not_the_retained_profile) ... ok
+
+======================================================================
+FAIL: test_enabled_measured_retained_profile_must_be_eligible (__main__.RetainedConfiguration.test_enabled_measured_retained_profile_must_be_eligible)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_parent_repro.py", line 99, in test_enabled_measured_retained_profile_must_be_eligible
+    try:g=self.construct(True)
+          ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_parent_repro.py", line 89, in construct
+    return t.n.h.Generator(**kw)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-candidate\candidate\exllamav3\generator\generator.py", line 284, in __init__
+    self.dflash_cost_policy = DFlashCostPolicy.from_environment(self, _BATCH_VERIFY)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-candidate\candidate\exllamav3\generator\draft_cost.py", line 112, in from_environment
+    raise ValueError("Unsupported cost-aware DFlash generator configuration")
+ValueError: Unsupported cost-aware DFlash generator configuration
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\dflash-cost-aware-recurrent-repair\test_parent_repro.py", line 101, in test_enabled_measured_retained_profile_must_be_eligible
+    self.fail('Measured MiMo profile is rejected by its cost-policy guard: '+str(exc))
+AssertionError: Measured MiMo profile is rejected by its cost-policy guard: Unsupported cost-aware DFlash generator configuration
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.077s
+
+FAILED (failures=1)

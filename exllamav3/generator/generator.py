@@ -13,6 +13,7 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
+from .draft_cost import DFlashCostPolicy
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -273,6 +274,14 @@ class Generator:
         self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # Experimental external cost profile: default off, initialization errors only.
+        self.dflash_cost_policy = None
+        cost_aware = _os.environ.get("EXL3_DFLASH_COST_AWARE", "0")
+        if cost_aware not in ("0", "1"):
+            raise ValueError("EXL3_DFLASH_COST_AWARE must be 0 or 1")
+        if cost_aware == "1":
+            self.dflash_cost_policy = DFlashCostPolicy.from_environment(self, _BATCH_VERIFY)
 
 
     def num_remaining_jobs(self):
@@ -918,6 +927,11 @@ class Generator:
             first_below = below.int().argmax(dim = 1)
             cuts = torch.where(any_below, first_below, torch.full_like(first_below, window))
             w_used = int(cuts.max().item())
+            policy = getattr(self, "dflash_cost_policy", None)
+            if policy is not None:
+                selected = policy.select(self, conf, window)
+                if selected is not None:
+                    w_used = selected
             self._draft_conf_round = {"ids": ids_full, "conf": conf, "window": w_used}
             if w_used == 0:
                 return None

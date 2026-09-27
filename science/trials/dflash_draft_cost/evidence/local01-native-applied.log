@@ -1,0 +1,25 @@
+test_architecture_shape_mask_and_rope (regressions.Regressions.test_architecture_shape_mask_and_rope) ... ok
+test_calibration_feedback_zero_one_full (regressions.Regressions.test_calibration_feedback_zero_one_full) ... ok
+test_capacity_gate_precedes_write (regressions.Regressions.test_capacity_gate_precedes_write) ... ok
+test_config_only_two_width_fields_change (regressions.Regressions.test_config_only_two_width_fields_change) ... ok
+test_dds_windows_zero_one_full_have_full_native_writes (regressions.Regressions.test_dds_windows_zero_one_full_have_full_native_writes) ... ok
+test_defaults_follow_config_and_zero_is_not_disable (regressions.Regressions.test_defaults_follow_config_and_zero_is_not_disable) ... ok
+test_eos_and_mismatch_at_first_middle_last (regressions.Regressions.test_eos_and_mismatch_at_first_middle_last) ... ok
+test_full_accept_and_bonus (regressions.Regressions.test_full_accept_and_bonus) ... ok
+test_implicit_budget_native_width (regressions.Regressions.test_implicit_budget_native_width) ... ok
+test_incomplete_prefill_does_not_draft (regressions.Regressions.test_incomplete_prefill_does_not_draft) ... ok
+test_legacy12_native8_failure_and_native16_success (regressions.Regressions.test_legacy12_native8_failure_and_native16_success) ... ok
+test_mask_header_has_no_block_axis (regressions.Regressions.test_mask_header_has_no_block_axis) ... ok
+test_native8_requested15_is_rejected_not_padded (regressions.Regressions.test_native8_requested15_is_rejected_not_padded) ... ok
+test_prefill_target_state_update_and_accepted_crop (regressions.Regressions.test_prefill_target_state_update_and_accepted_crop) ... ok
+test_requeue_physical_writes_under_short_windows (regressions.Regressions.test_requeue_physical_writes_under_short_windows) ... ok
+test_requeue_rejects_tail_then_reallocates_real_pages (regressions.Regressions.test_requeue_rejects_tail_then_reallocates_real_pages) ... ok
+test_tiny_first_requeue_and_boundary_matrix (regressions.Regressions.test_tiny_first_requeue_and_boundary_matrix) ... ok
+test_tiny_request_and_eos_suppress_requeue (regressions.Regressions.test_tiny_request_and_eos_suppress_requeue) ... ok
+test_top_level_precedence_is_real_reader (regressions.Regressions.test_top_level_precedence_is_real_reader) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.338s
+
+OK
+
