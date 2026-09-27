@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "inert_fixture": false,
+  "source_pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "root": "/workspace/mimo-tune",
+  "width": {
+    "native_block": 16,
+    "retained_block": 8,
+    "drafter_config": "<abs path to the installed native16 dflash config.json>",
+    "drafter_config_sha256": "259759b66599137681e9ef2c62b4047a2331f21466ca5dd33276b0e2ce8efd52",
+    "retained_drafter_config": "<abs path to the installed native8 dflash config.json>",
+    "retained_drafter_config_sha256": "<fill-me>",
+    "probe_dir": "round8-cost-width/width/ndt1",
+    "events": "events.jsonl",
+    "run_prefix": "france-round8-width16-ndt1-",
+    "failed_run": null,
+    "failed_pids": {
+      "guard_pid": 0,
+      "server_pid": 0
+    },
+    "env": {
+      "ROUND8_WIDTH": "1",
+      "ROUND8_WIDTH_OUT": "/workspace/mimo-tune/round8-cost-width/width/ndt1"
+    },
+    "expect": {
+      "input_shape": [
+        1,
+        16,
+        4096
+      ],
+      "state_shape": [
+        1,
+        16,
+        4096
+      ],
+      "q_shape": [
+        1,
+        16,
+        64,
+        128
+      ],
+      "k_shape": [
+        1,
+        16,
+        8,
+        128
+      ],
+      "samples_shape": [
+        1,
+        16
+      ],
+      "proposal_count": 15,
+      "assigned_span": 16,
+      "max_round": 512
+    }
+  },
+  "protected": {
+    "mandatory_roots": [
+      "<abs protected root 1>",
+      "<abs protected root 2>"
+    ],
+    "nesting_acknowledged": false
+  },
+  "artifacts": {
+    "integration_pins": "integration-pins.json",
+    "integration_pins_sha256": "<fill-me>"
+  },
+  "scope": "ONE bounded native16 width trial on the GB10 host; no deployment, no tuning loop"
+}

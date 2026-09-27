@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "intent": "stop_owned_then_launch_retained_once",
+  "root": "/workspace/mimo-tune",
+  "operator_lock": "operator.lock",
+  "ingress_blocked": true,
+  "uid": 0,
+  "boot_id": "<fill-me>",
+  "config_sha256": "<fill-me>",
+  "receipt_sha256": "<fill-me>",
+  "trial_sha256": "<fill-me>",
+  "issued_at": 0,
+  "failure_at": 0,
+  "expires_at": 0,
+  "width": {
+    "status": "<passed or failed>",
+    "phase": "after_width",
+    "error": "<the observed error text when status is failed>"
+  },
+  "stage": "<release or restore>",
+  "scope": "ONE bounded native16 width trial on the GB10 host; no deployment"
+}

@@ -1,0 +1,18 @@
+{
+  "60tps-round3/mirror/python-shadow/exllamav3/modules/block_sparse_mlp.py": {
+    "copy": "source/retained_block_sparse_mlp.py",
+    "sha256": "61653605b432350db3cccddbaa00b12f121e38fa2b072fc9de2032adf9e2a706"
+  },
+  "round6-quant-readback/mirror/start_quant_readback.py": {
+    "copy": "source/retained_launcher.py",
+    "sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515"
+  },
+  "round8-cost-width/mirror/runs/france-round8-width16-ndt1-1790461459427612910/launch.json": {
+    "copy": "source/failed_launch.json",
+    "sha256": "31b046b1dd2c246a6a00e1c9fd3ca0eb5cd510cead1beefab4bc3acf5b598a2d"
+  },
+  "round8-cost-width/mirror/runs/france-round6-quant-readback-1790461754447572632/launch.json": {
+    "copy": "source/retained_launch.json",
+    "sha256": "a9bbcf2ff1cefd796abb241a876b560a63b35e5304f12078423bb80d711da32a"
+  }
+}

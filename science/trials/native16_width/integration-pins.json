@@ -1,0 +1,282 @@
+{
+  "schema": 1,
+  "source_pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "composed_from": {
+    "harness_repair": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair",
+    "recovery_adapter": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter",
+    "native_width_study": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/dflash-native-width-study",
+    "parent_audit": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-parent-audit",
+    "read_only_context": [
+      "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round9-three-stage-gpu",
+      "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round9b-three-stage-timing",
+      "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-cost-width",
+      "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/mixedk-three-stage-trial-integration"
+    ]
+  },
+  "artifacts": {
+    "linux_adapter.py": {
+      "sha256": "af775cdc2011ee4acffb6a8441c6a7e9bc693fa960ee8cc48eaf106c29f1b416",
+      "bytes": 52529,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/linux_adapter.py",
+      "origin_sha256": "af775cdc2011ee4acffb6a8441c6a7e9bc693fa960ee8cc48eaf106c29f1b416"
+    },
+    "recover_linux.py": {
+      "sha256": "8f847a35da01fa7bc4c3fb8c3e8cd4de0e3b15e09463c9fec91866479ab0ebf1",
+      "bytes": 1005,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/recover_linux.py",
+      "origin_sha256": "8f847a35da01fa7bc4c3fb8c3e8cd4de0e3b15e09463c9fec91866479ab0ebf1"
+    },
+    "production-template.json": {
+      "sha256": "31864c8b10936af99decb06ed5484880b967c513b1236f5eef8d56fb1633b88d",
+      "bytes": 3972,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/production-template.json",
+      "origin_sha256": "31864c8b10936af99decb06ed5484880b967c513b1236f5eef8d56fb1633b88d"
+    },
+    "runtime-pins.json": {
+      "sha256": "906eeac92d38ce18fa5743524b88e58e0c2d87c9d88047939d224ce30893f354",
+      "bytes": 92,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/runtime-pins.json",
+      "origin_sha256": "906eeac92d38ce18fa5743524b88e58e0c2d87c9d88047939d224ce30893f354"
+    },
+    "trust.schema.json": {
+      "sha256": "9b7785a5dd3eed74440f6fdea9c0099d024b54ed0d4ff958035e7f6342bc0b52",
+      "bytes": 10859,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/trust.schema.json",
+      "origin_sha256": "9b7785a5dd3eed74440f6fdea9c0099d024b54ed0d4ff958035e7f6342bc0b52"
+    },
+    "core/recover.py": {
+      "sha256": "ab2bd9a4e646c0852bc3aa3507014db516356ba0da49beec0a47ca4ab0420645",
+      "bytes": 4622,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/core/recover.py",
+      "origin_sha256": "ab2bd9a4e646c0852bc3aa3507014db516356ba0da49beec0a47ca4ab0420645"
+    },
+    "core/width_controller.py": {
+      "sha256": "c80b438e78b6a917580dee55841d300cb06b209e413f5e246a919de9241b3d7f",
+      "bytes": 1787,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/core/width_controller.py",
+      "origin_sha256": "c80b438e78b6a917580dee55841d300cb06b209e413f5e246a919de9241b3d7f"
+    },
+    "witness/inert_trial_io.py": {
+      "sha256": "8a1d5cd3ff4992e30896ad1450d7139fdea765037f7e097c4f5307d255d8e042",
+      "bytes": 2754,
+      "origin": "witness/inert_trial_io.py",
+      "origin_sha256": "8a1d5cd3ff4992e30896ad1450d7139fdea765037f7e097c4f5307d255d8e042"
+    },
+    "witness/guard_uma.py": {
+      "sha256": "eef5706b327cf20007dd49087b6d70b97ec178fcdbde616374188a0bc916d24d",
+      "bytes": 6982,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/guard_uma.py",
+      "origin_sha256": "eef5706b327cf20007dd49087b6d70b97ec178fcdbde616374188a0bc916d24d"
+    },
+    "witness/retained_launcher.py": {
+      "sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515",
+      "bytes": 3615,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/retained_launcher.py",
+      "origin_sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515"
+    },
+    "witness/retained_server.py": {
+      "sha256": "205ee1c08d7a7763522aa7b269eddeb6a8ebf5ae2674532d0c6d62ce89cb2d83",
+      "bytes": 919,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/retained_server.py",
+      "origin_sha256": "205ee1c08d7a7763522aa7b269eddeb6a8ebf5ae2674532d0c6d62ce89cb2d83"
+    },
+    "witness/retained_launch.json": {
+      "sha256": "a9bbcf2ff1cefd796abb241a876b560a63b35e5304f12078423bb80d711da32a",
+      "bytes": 1352,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/retained_launch.json",
+      "origin_sha256": "a9bbcf2ff1cefd796abb241a876b560a63b35e5304f12078423bb80d711da32a"
+    },
+    "witness/failed_launch.json": {
+      "sha256": "31b046b1dd2c246a6a00e1c9fd3ca0eb5cd510cead1beefab4bc3acf5b598a2d",
+      "bytes": 1436,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/failed_launch.json",
+      "origin_sha256": "31b046b1dd2c246a6a00e1c9fd3ca0eb5cd510cead1beefab4bc3acf5b598a2d"
+    },
+    "witness/source-provenance.json": {
+      "sha256": "40b9440541ee685e1e967c751e16361f969adf31b7374fdee39148254b5279ba",
+      "bytes": 6222,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/source-provenance.json",
+      "origin_sha256": "40b9440541ee685e1e967c751e16361f969adf31b7374fdee39148254b5279ba"
+    },
+    "witness/supplementary-provenance.json": {
+      "sha256": "22e10da26cf2422a5f2944b5b16df13fa8328a57696e09639c0932d7f5a11cec",
+      "bytes": 874,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-recovery-adapter/witness/supplementary-provenance.json",
+      "origin_sha256": "22e10da26cf2422a5f2944b5b16df13fa8328a57696e09639c0932d7f5a11cec"
+    },
+    "trial_contract.py": {
+      "sha256": "b6b07d73fe9a54ce76cf8e8920b120eb504ec89e9a5b3efcb3e4f2910b4ca3aa",
+      "bytes": 22105,
+      "origin": "trial_contract.py",
+      "origin_sha256": "b6b07d73fe9a54ce76cf8e8920b120eb504ec89e9a5b3efcb3e4f2910b4ca3aa"
+    },
+    "trial_io.py": {
+      "sha256": "0ac22018566502bfa7e43978050ffb1cea82a4620456e35e8c32de4399e1cbd1",
+      "bytes": 17792,
+      "origin": "trial_io.py",
+      "origin_sha256": "0ac22018566502bfa7e43978050ffb1cea82a4620456e35e8c32de4399e1cbd1"
+    },
+    "trial_preflight.py": {
+      "sha256": "670fef09f8071f0b5d16766a6da4364fb4fbafe66871f6d9fe3af4fc62c8e21b",
+      "bytes": 11966,
+      "origin": "trial_preflight.py",
+      "origin_sha256": "670fef09f8071f0b5d16766a6da4364fb4fbafe66871f6d9fe3af4fc62c8e21b"
+    },
+    "trial_readiness.py": {
+      "sha256": "0dfe05fcf905a7129be75610ed9bf7d4eae24afe950040463881f60ba2225d8d",
+      "bytes": 12609,
+      "origin": "trial_readiness.py",
+      "origin_sha256": "0dfe05fcf905a7129be75610ed9bf7d4eae24afe950040463881f60ba2225d8d"
+    },
+    "device_contract.py": {
+      "sha256": "8bb8a1767281d91e6e7b136e001f8544f99ea35bcc8b9dc302b13845d743f9c6",
+      "bytes": 18967,
+      "origin": "device_contract.py",
+      "origin_sha256": "8bb8a1767281d91e6e7b136e001f8544f99ea35bcc8b9dc302b13845d743f9c6"
+    },
+    "width_trial.py": {
+      "sha256": "bd053b406734c52cad0a10d9b0fbcd0d8b231ee48176c885194ffc53858e6f91",
+      "bytes": 11515,
+      "origin": "width_trial.py",
+      "origin_sha256": "bd053b406734c52cad0a10d9b0fbcd0d8b231ee48176c885194ffc53858e6f91"
+    },
+    "inert_width_stack.py": {
+      "sha256": "36fa29467053e50c2bb1238ae6076cde0ba460652c0806e19440a8348b86d4cf",
+      "bytes": 5614,
+      "origin": "inert_width_stack.py",
+      "origin_sha256": "36fa29467053e50c2bb1238ae6076cde0ba460652c0806e19440a8348b86d4cf"
+    },
+    "device_docs.py": {
+      "sha256": "ffefe397620a8b4d648878fc1a8f291b0a747927575a563b831120ca70882e73",
+      "bytes": 12595,
+      "origin": "device_docs.py",
+      "origin_sha256": "ffefe397620a8b4d648878fc1a8f291b0a747927575a563b831120ca70882e73"
+    },
+    "device-docs/config.json": {
+      "sha256": "fd93439aee4fbb60ee033b249005f1288f0d6ce3d48b4fc3024b631c7ccb148a",
+      "bytes": 3855,
+      "origin": "device-docs/config.json",
+      "origin_sha256": "fd93439aee4fbb60ee033b249005f1288f0d6ce3d48b4fc3024b631c7ccb148a"
+    },
+    "device-docs/trial.json": {
+      "sha256": "64938bf5aa3d14d06c5aa9535cfc6a8adc20f0581bc1db515f5a689c01025a81",
+      "bytes": 1673,
+      "origin": "device-docs/trial.json",
+      "origin_sha256": "64938bf5aa3d14d06c5aa9535cfc6a8adc20f0581bc1db515f5a689c01025a81"
+    },
+    "device-docs/receipt.json": {
+      "sha256": "8bbe36d00471ad2aeb3055f14c76cd8d152fef6cdb1f570fff6dcc437804355a",
+      "bytes": 906,
+      "origin": "device-docs/receipt.json",
+      "origin_sha256": "8bbe36d00471ad2aeb3055f14c76cd8d152fef6cdb1f570fff6dcc437804355a"
+    },
+    "device-docs/authorization.json": {
+      "sha256": "31557d1d48f963caeb5d1db318f5b6bad003f859ea5656733cf25482bf8bfe1e",
+      "bytes": 616,
+      "origin": "device-docs/authorization.json",
+      "origin_sha256": "31557d1d48f963caeb5d1db318f5b6bad003f859ea5656733cf25482bf8bfe1e"
+    },
+    "width/device_preflight.py": {
+      "sha256": "4e56a24895ce7cff6b326a556ed420d2dbc3028a9df3b5f675b3d48c4398e9b9",
+      "bytes": 2528,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/deferred_device_preflight.py",
+      "origin_sha256": "4e56a24895ce7cff6b326a556ed420d2dbc3028a9df3b5f675b3d48c4398e9b9"
+    },
+    "width/candidate/width_diag.py": {
+      "sha256": "7f537742bf2de7b506abaed464035f118c9c5e4f016083c2abbb78c8be9e798e",
+      "bytes": 7945,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/candidate/width_diag.py",
+      "origin_sha256": "7f537742bf2de7b506abaed464035f118c9c5e4f016083c2abbb78c8be9e798e"
+    },
+    "width/candidate/width_contract.py": {
+      "sha256": "59889cfc4fcc818d8a01cae72422d9b1c78bedc2cc416306eb827881b4eb3552",
+      "bytes": 288,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/candidate/width_contract.py",
+      "origin_sha256": "59889cfc4fcc818d8a01cae72422d9b1c78bedc2cc416306eb827881b4eb3552"
+    },
+    "width/candidate/width_config.json": {
+      "sha256": "259759b66599137681e9ef2c62b4047a2331f21466ca5dd33276b0e2ce8efd52",
+      "bytes": 1502,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/candidate/width_config.json",
+      "origin_sha256": "259759b66599137681e9ef2c62b4047a2331f21466ca5dd33276b0e2ce8efd52"
+    },
+    "width/candidate/width_expected.json": {
+      "sha256": "316058d2a67d8837450f4d12e83e42b04c1317a518aa6138cc70883ac0ef4413",
+      "bytes": 1862,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/candidate/width_expected.json",
+      "origin_sha256": "316058d2a67d8837450f4d12e83e42b04c1317a518aa6138cc70883ac0ef4413"
+    },
+    "width/baseline/width_diag.py": {
+      "sha256": "16251941215aead728fae60b116cb25d3001ab287dac3c6f15479f293646c834",
+      "bytes": 7434,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/baseline/width_diag.py",
+      "origin_sha256": "16251941215aead728fae60b116cb25d3001ab287dac3c6f15479f293646c834"
+    },
+    "width/baseline/width_controller.py": {
+      "sha256": "9d85dbd409b91e686e653b4c63daf313ef4028cd7fcdf88cedca39f1fc2ca0be",
+      "bytes": 4575,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/baseline/width_controller.py",
+      "origin_sha256": "9d85dbd409b91e686e653b4c63daf313ef4028cd7fcdf88cedca39f1fc2ca0be"
+    },
+    "width/baseline/recover.py": {
+      "sha256": "b8863ad517d18b704008f728d1fab96ca3285492537a5622ad4ff5342fd38f94",
+      "bytes": 2599,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/baseline/recover.py",
+      "origin_sha256": "b8863ad517d18b704008f728d1fab96ca3285492537a5622ad4ff5342fd38f94"
+    },
+    "width/baseline/failed-server.log": {
+      "sha256": "bb656982c0fb4a00e4b1121156a651cd202e5f1425137c01c61104d1cbc57c66",
+      "bytes": 13197,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/baseline/failed-server.log",
+      "origin_sha256": "bb656982c0fb4a00e4b1121156a651cd202e5f1425137c01c61104d1cbc57c66"
+    },
+    "width/retained/retained_launcher.py": {
+      "sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515",
+      "bytes": 3615,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/source/retained_launcher.py",
+      "origin_sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515"
+    },
+    "width/retained/retained_launch.json": {
+      "sha256": "a9bbcf2ff1cefd796abb241a876b560a63b35e5304f12078423bb80d711da32a",
+      "bytes": 1352,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/source/retained_launch.json",
+      "origin_sha256": "a9bbcf2ff1cefd796abb241a876b560a63b35e5304f12078423bb80d711da32a"
+    },
+    "width/retained/failed_launch.json": {
+      "sha256": "31b046b1dd2c246a6a00e1c9fd3ca0eb5cd510cead1beefab4bc3acf5b598a2d",
+      "bytes": 1436,
+      "origin": "/mnt/c/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/round8-width-harness-repair/source/failed_launch.json",
+      "origin_sha256": "31b046b1dd2c246a6a00e1c9fd3ca0eb5cd510cead1beefab4bc3acf5b598a2d"
+    },
+    "fixture_width_trial.py": {
+      "sha256": "089133c00b8ff49479c60d8623274f04da470c900c4104748c05dcf1b9a54a82",
+      "bytes": 21843,
+      "origin": "fixture_width_trial.py",
+      "origin_sha256": "089133c00b8ff49479c60d8623274f04da470c900c4104748c05dcf1b9a54a82"
+    },
+    "test_trial_contract.py": {
+      "sha256": "a07b67632921e33c7889bd251d0e6d7b61f6cc286daf5108c2bb18e71bd6bd00",
+      "bytes": 13976,
+      "origin": "test_trial_contract.py",
+      "origin_sha256": "a07b67632921e33c7889bd251d0e6d7b61f6cc286daf5108c2bb18e71bd6bd00"
+    },
+    "test_device_contract.py": {
+      "sha256": "2460c25353c37992c187ce6022eb216bc551fd706c86eb5d99f8ea0a69affbf5",
+      "bytes": 13194,
+      "origin": "test_device_contract.py",
+      "origin_sha256": "2460c25353c37992c187ce6022eb216bc551fd706c86eb5d99f8ea0a69affbf5"
+    },
+    "test_trial_linux.py": {
+      "sha256": "c08fb7173393433888067536a9e8bc6da56310de88a702dc2a653d6f124653a4",
+      "bytes": 23311,
+      "origin": "test_trial_linux.py",
+      "origin_sha256": "c08fb7173393433888067536a9e8bc6da56310de88a702dc2a653d6f124653a4"
+    },
+    "test_device_docs.py": {
+      "sha256": "f6eec6e2ddfdb88dd1606d0ebc30f04c7fc0f742e98698bd05f2e8721f7a5d76",
+      "bytes": 12476,
+      "origin": "test_device_docs.py",
+      "origin_sha256": "f6eec6e2ddfdb88dd1606d0ebc30f04c7fc0f742e98698bd05f2e8721f7a5d76"
+    }
+  }
+}

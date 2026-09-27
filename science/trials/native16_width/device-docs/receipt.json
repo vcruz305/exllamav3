@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "phase": "pre_failure",
+  "captured_at": 0,
+  "boot_id": "<fill-me>",
+  "uid": 0,
+  "owner": {
+    "run": "<abs path of the LIVE retained run>",
+    "pids": {
+      "guard_pid": 0,
+      "server_pid": 0,
+      "command": [
+        "<the exact server argv of the live run>"
+      ]
+    },
+    "processes": [
+      {
+        "role": "guard",
+        "pid": 0,
+        "starttime": "<fill-me>",
+        "args": [
+          "<exact argv>"
+        ]
+      },
+      {
+        "role": "server",
+        "pid": 0,
+        "starttime": "<fill-me>",
+        "args": [
+          "<exact argv>"
+        ]
+      }
+    ]
+  },
+  "scopes": {
+    "<guard_pid>": {
+      "uid": 0,
+      "ppid": 0,
+      "pgid": 0,
+      "sid": 0
+    },
+    "<server_pid>": {
+      "uid": 0,
+      "ppid": 0,
+      "pgid": 0,
+      "sid": 0
+    }
+  },
+  "launch_sha256": "<fill-me>",
+  "live_config_sha256": "<fill-me>"
+}

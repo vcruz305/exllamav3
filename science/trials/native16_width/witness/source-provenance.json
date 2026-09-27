@@ -1,0 +1,95 @@
+{
+  "pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "files": {
+    "exllamav3/architecture/dflash.py": {
+      "blob_sha256": "97699d476ba887d0977cb9853db07efc72ec3e0d26b245c2d0508b9f1c6c652a",
+      "worktree_byte_sha256": "97699d476ba887d0977cb9853db07efc72ec3e0d26b245c2d0508b9f1c6c652a",
+      "expected_runtime_LF_sha256": "97699d476ba887d0977cb9853db07efc72ec3e0d26b245c2d0508b9f1c6c652a"
+    },
+    "exllamav3/modules/arch_specific/dflash.py": {
+      "blob_sha256": "547ab475a8f87a777fa14a1a0c30ecd3304043ccd9901b139f60fbbd00a44186",
+      "worktree_byte_sha256": "547ab475a8f87a777fa14a1a0c30ecd3304043ccd9901b139f60fbbd00a44186",
+      "expected_runtime_LF_sha256": "547ab475a8f87a777fa14a1a0c30ecd3304043ccd9901b139f60fbbd00a44186"
+    },
+    "exllamav3/generator/generator.py": {
+      "blob_sha256": "3ce3efde084eabe4b9e2dcb937d2b37635b383d294958a599f91dd507896a6ef",
+      "worktree_byte_sha256": "3ce3efde084eabe4b9e2dcb937d2b37635b383d294958a599f91dd507896a6ef",
+      "expected_runtime_LF_sha256": "3ce3efde084eabe4b9e2dcb937d2b37635b383d294958a599f91dd507896a6ef"
+    },
+    "exllamav3/generator/job.py": {
+      "blob_sha256": "c9525e0c4ae455d7d86947be695781d8ae9b7348c0d129c96e1db242b527ad8e",
+      "worktree_byte_sha256": "c9525e0c4ae455d7d86947be695781d8ae9b7348c0d129c96e1db242b527ad8e",
+      "expected_runtime_LF_sha256": "c9525e0c4ae455d7d86947be695781d8ae9b7348c0d129c96e1db242b527ad8e"
+    },
+    "exllamav3/generator/pagetable.py": {
+      "blob_sha256": "0cde876b9969df7120ed7137b35bff3040dc3a7613c9f5a9547e58da4a9849ea",
+      "worktree_byte_sha256": "0cde876b9969df7120ed7137b35bff3040dc3a7613c9f5a9547e58da4a9849ea",
+      "expected_runtime_LF_sha256": "0cde876b9969df7120ed7137b35bff3040dc3a7613c9f5a9547e58da4a9849ea"
+    },
+    "exllamav3/generator/draft_confidence.py": {
+      "blob_sha256": "51b27c07cb43845b14f300273d7a3608437ba6ad7c57af9d1b2eeef67ba29f53",
+      "worktree_byte_sha256": "51b27c07cb43845b14f300273d7a3608437ba6ad7c57af9d1b2eeef67ba29f53",
+      "expected_runtime_LF_sha256": "51b27c07cb43845b14f300273d7a3608437ba6ad7c57af9d1b2eeef67ba29f53"
+    },
+    "exllamav3/modules/attn.py": {
+      "blob_sha256": "868556feedfe5858a429e338cdd51200ea22260bc7fabf8c631731dffc1f4b73",
+      "worktree_byte_sha256": "868556feedfe5858a429e338cdd51200ea22260bc7fabf8c631731dffc1f4b73",
+      "expected_runtime_LF_sha256": "868556feedfe5858a429e338cdd51200ea22260bc7fabf8c631731dffc1f4b73"
+    },
+    "exllamav3/model/config.py": {
+      "blob_sha256": "9a1ae9710a26c68a4b9efbcc46ce54e0acc63b8f16aeddd726989a8175c9c50b",
+      "worktree_byte_sha256": "9a1ae9710a26c68a4b9efbcc46ce54e0acc63b8f16aeddd726989a8175c9c50b",
+      "expected_runtime_LF_sha256": "9a1ae9710a26c68a4b9efbcc46ce54e0acc63b8f16aeddd726989a8175c9c50b"
+    },
+    "exllamav3/util/file.py": {
+      "blob_sha256": "447a732394e55c026ebdd796eb8ab8849279186cefa84e432effc6154031543c",
+      "worktree_byte_sha256": "447a732394e55c026ebdd796eb8ab8849279186cefa84e432effc6154031543c",
+      "expected_runtime_LF_sha256": "447a732394e55c026ebdd796eb8ab8849279186cefa84e432effc6154031543c"
+    },
+    "exllamav3/util/rope.py": {
+      "blob_sha256": "35b95b3e1eeafb37b520678cd06aaa2e1597bfd40b7d1a72aa528ac7fa3df9c1",
+      "worktree_byte_sha256": "35b95b3e1eeafb37b520678cd06aaa2e1597bfd40b7d1a72aa528ac7fa3df9c1",
+      "expected_runtime_LF_sha256": "35b95b3e1eeafb37b520678cd06aaa2e1597bfd40b7d1a72aa528ac7fa3df9c1"
+    },
+    "exllamav3/cache/quant.py": {
+      "blob_sha256": "7c1cce9713ecd16b90ebadb0ffc310e134960a9343464443228b7416c6604e04",
+      "worktree_byte_sha256": "7c1cce9713ecd16b90ebadb0ffc310e134960a9343464443228b7416c6604e04",
+      "expected_runtime_LF_sha256": "7c1cce9713ecd16b90ebadb0ffc310e134960a9343464443228b7416c6604e04"
+    },
+    "exllamav3/cache/fp16.py": {
+      "blob_sha256": "8702ebfc547a55248fd3694a757eac54a99d6b725747b642fa34b9f19c3735f8",
+      "worktree_byte_sha256": "8702ebfc547a55248fd3694a757eac54a99d6b725747b642fa34b9f19c3735f8",
+      "expected_runtime_LF_sha256": "8702ebfc547a55248fd3694a757eac54a99d6b725747b642fa34b9f19c3735f8"
+    },
+    "exllamav3/model_init.py": {
+      "blob_sha256": "3db208da28e2c96c22abe79a9d3b9b0199b5ec9b0def019f15dc959807d86915",
+      "worktree_byte_sha256": "3db208da28e2c96c22abe79a9d3b9b0199b5ec9b0def019f15dc959807d86915",
+      "expected_runtime_LF_sha256": "3db208da28e2c96c22abe79a9d3b9b0199b5ec9b0def019f15dc959807d86915"
+    },
+    "exllamav3/model/model.py": {
+      "blob_sha256": "eab98d80b80d262bbc8253dc0951d804e665ce923a3b4b7e0e97227ff0e7cf43",
+      "worktree_byte_sha256": "eab98d80b80d262bbc8253dc0951d804e665ce923a3b4b7e0e97227ff0e7cf43",
+      "expected_runtime_LF_sha256": "eab98d80b80d262bbc8253dc0951d804e665ce923a3b4b7e0e97227ff0e7cf43"
+    },
+    "exllamav3/model/model_ls.py": {
+      "blob_sha256": "0dd4fd118f73439a026dfe2c55818e95cf53a81f7d7994563d9e8163ee7d76b8",
+      "worktree_byte_sha256": "0dd4fd118f73439a026dfe2c55818e95cf53a81f7d7994563d9e8163ee7d76b8",
+      "expected_runtime_LF_sha256": "0dd4fd118f73439a026dfe2c55818e95cf53a81f7d7994563d9e8163ee7d76b8"
+    },
+    "exllamav3/modules/attention_fn/bc_attn.py": {
+      "blob_sha256": "c76c782e7edb402613a53bde253147629f9861bdc1dc166eabb9dab889917191",
+      "worktree_byte_sha256": "c76c782e7edb402613a53bde253147629f9861bdc1dc166eabb9dab889917191",
+      "expected_runtime_LF_sha256": "c76c782e7edb402613a53bde253147629f9861bdc1dc166eabb9dab889917191"
+    },
+    "exllamav3/modules/attention_fn/triton_paged.py": {
+      "blob_sha256": "b7235157f6efa0d2ffcf2bf37586cccdb36be3ac23cb7e10ff704334aeb28000",
+      "worktree_byte_sha256": "b7235157f6efa0d2ffcf2bf37586cccdb36be3ac23cb7e10ff704334aeb28000",
+      "expected_runtime_LF_sha256": "b7235157f6efa0d2ffcf2bf37586cccdb36be3ac23cb7e10ff704334aeb28000"
+    },
+    "exllamav3/util/tensor.py": {
+      "blob_sha256": "d49d599e6a64a2dbc235c6ecf153c78dc635e9111ab7302f2317d94b9365c931",
+      "worktree_byte_sha256": "d49d599e6a64a2dbc235c6ecf153c78dc635e9111ab7302f2317d94b9365c931",
+      "expected_runtime_LF_sha256": "d49d599e6a64a2dbc235c6ecf153c78dc635e9111ab7302f2317d94b9365c931"
+    }
+  }
+}

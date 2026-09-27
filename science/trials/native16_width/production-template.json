@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "source_pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "root": "/workspace/mimo-tune",
+  "operator_lock": "REQUIRED_EXISTING_OPERATOR_LOCK_RELATIVE_PATH",
+  "active": "france-active-run.txt",
+  "live_config": "france-uma.json",
+  "server_lock": "server.lock",
+  "guard_argv": [
+    "/usr/bin/python3",
+    "/workspace/mimo-tune/guard_uma.py",
+    "/workspace/mimo-tune/france-uma.json"
+  ],
+  "launcher_argv": [
+    "/usr/bin/python3",
+    "/workspace/mimo-tune/round6-quant-readback/start_quant_readback.py"
+  ],
+  "launcher_env": {
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C.UTF-8",
+    "HOME": "REQUIRED_OPERATOR_HOME",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "retained": {
+    "memory_policy": "uma",
+    "max_seconds": 43200,
+    "env": {
+      "CUDA_HOME": "/usr/local/cuda",
+      "PATH": "/workspace/mimo-exl3/venv/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin",
+      "EXL3_ROOT": "/workspace/mimo-tune/60tps-round3/python-shadow",
+      "PYTHONPATH": "/workspace/mimo-tune/60tps-round3/python-shadow",
+      "PYTHONUNBUFFERED": "1",
+      "EXL3_UMA": "1",
+      "EXL3_UMA_RESERVE_MB": "8192",
+      "TORCH_CUDA_ARCH_LIST": "12.1",
+      "OMP_NUM_THREADS": "8",
+      "EXL3_BATCH_VERIFY": "0",
+      "EXL3_MOE_MIXEDK_ELIDE_HANDLED": "1"
+    },
+    "command": [
+      "/workspace/mimo-exl3/venv/bin/python",
+      "/workspace/mimo-tune/round6-quant-readback/serve_native.py",
+      "-m",
+      "/workspace/MiMo-V2.6-Flash-RL-EXL3/2.50bpw",
+      "-dm",
+      "/workspace/mimo-exl3/models/MiMo-V2.6-Flash-RL-dflash-EXL3-4.0bpw",
+      "-ndt",
+      "7",
+      "-dds",
+      "-dc",
+      "0.6",
+      "-gs",
+      "106",
+      "-cs",
+      "4096",
+      "-cq",
+      "4",
+      "-ambs",
+      "1",
+      "-chunk_size",
+      "4096",
+      "-ccs",
+      "0",
+      "-rcs",
+      "0.25",
+      "--max-active-requests",
+      "1",
+      "--max-pending-requests",
+      "2",
+      "--max-model-len",
+      "4096",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8096",
+      "--request-timeout",
+      "600",
+      "-lv"
+    ]
+  },
+  "identities": [
+    {
+      "role": "guard",
+      "path": "/workspace/mimo-tune/guard_uma.py",
+      "sha256": "eef5706b327cf20007dd49087b6d70b97ec178fcdbde616374188a0bc916d24d"
+    },
+    {
+      "role": "launcher",
+      "path": "/workspace/mimo-tune/round6-quant-readback/start_quant_readback.py",
+      "sha256": "7441d4e0de981462c03f05cca38be81ea3bb7c5965d4b83cd96e582d9147b515"
+    },
+    {
+      "role": "server",
+      "path": "/workspace/mimo-tune/round6-quant-readback/serve_native.py",
+      "sha256": "205ee1c08d7a7763522aa7b269eddeb6a8ebf5ae2674532d0c6d62ce89cb2d83"
+    },
+    {
+      "role": "source",
+      "path": "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/block_sparse_mlp.py",
+      "sha256": "61653605b432350db3cccddbaa00b12f121e38fa2b072fc9de2032adf9e2a706"
+    },
+    {
+      "role": "dso",
+      "path": "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3_ext.cpython-312-aarch64-linux-gnu.so",
+      "sha256": "02b0ae5bc8414d335facca41083f561cf24f41d56ef6e1e73a8b41fb16f80207"
+    },
+    {
+      "role": "interpreter",
+      "path": "/usr/bin/python3.12",
+      "sha256": "REQUIRED_OPERATOR_SHA256"
+    },
+    {
+      "role": "target_config",
+      "path": "/workspace/MiMo-V2.6-Flash-RL-EXL3/2.50bpw/config.json",
+      "sha256": "REQUIRED_OPERATOR_SHA256"
+    },
+    {
+      "role": "drafter_config",
+      "path": "/workspace/mimo-exl3/models/MiMo-V2.6-Flash-RL-dflash-EXL3-4.0bpw/config.json",
+      "sha256": "REQUIRED_OPERATOR_SHA256"
+    },
+    {
+      "role": "source_manifest",
+      "path": "/workspace/mimo-tune/recovery-trust/approved-source-manifest.json",
+      "sha256": "REQUIRED_OPERATOR_SHA256"
+    }
+  ],
+  "port": 8096,
+  "new_run_prefix": "france-round6-quant-readback-",
+  "receipt_dir": "recovery-receipts",
+  "timeouts": {
+    "stop": 120,
+    "headroom": 120,
+    "launch": 120,
+    "ready": 500,
+    "http": 5
+  }
+}

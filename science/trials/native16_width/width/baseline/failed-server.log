@@ -1,0 +1,157 @@
+ROUND6_IMPORT {"python": "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/modules/block_sparse_mlp.py", "source_sha256": "61653605b432350db3cccddbaa00b12f121e38fa2b072fc9de2032adf9e2a706", "extension": "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3_ext.cpython-312-aarch64-linux-gnu.so", "elide": true}
+[transformers] You are using a model of type `mimo_v2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Canonical chat template sha256=853650bee57bf95020373e4c928bd5a4b41b9915adf964a77711d2b49a291887
+ !! Overriding mask_embedding from /workspace/mimo-tune/round8-cost-width/width/inference-view/mask_embedding.safetensors with /workspace/mimo-tune/round8-cost-width/width/inference-view/model.safetensors
+ !! Replaced 1 tensors from /workspace/mimo-tune/round8-cost-width/width/inference-view
+ -- Loading /workspace/mimo-tune/round8-cost-width/width/inference-view
+EXL3_UMA device=0 mode=use request_bytes=113816633344 current=23068672 host_available=125696798720 cgroup_headroom=123569782784 device_headroom=130640166912 os_reserve=8589934592 effective_reserve=8589934592 additional_headroom=114979848192 cap_bytes=113839702016 fraction=0.8712450867085364
+EXL3_UMA device=0 mode=reserve request_bytes=0 current=864026624 host_available=124557033472 cgroup_headroom=123150721024 device_headroom=129799208960 os_reserve=8589934592 effective_reserve=8589934592 additional_headroom=114560786432 cap_bytes=115424813056 fraction=0.88337635709163487
+
+ -- Loading /workspace/MiMo-V2.6-Flash-RL-EXL3/2.50bpw
+EXL3_UMA device=0 mode=use request_bytes=113816633344 current=864026624 host_available=123184852992 cgroup_headroom=122056749056 device_headroom=129799208960 os_reserve=8589934592 effective_reserve=8589934592 additional_headroom=113466814464 cap_bytes=114330841088 fraction=0.87500390279635831
+ -- Mixed-K experts in model.layers.14.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.14.mlp: 1 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.14.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.15.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.15.mlp: 1 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.15.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.17.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.17.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.17.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.18.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.18.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.18.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.19.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.19.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.19.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.20.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.20.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.20.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.21.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.21.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.21.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.22.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.22.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.22.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.23.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.23.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.23.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.24.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.24.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.24.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.25.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.25.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.25.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.26.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.26.mlp: 1 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.26.mlp: 256 experts, K_up range [4,4]
+ -- Mixed-K experts in model.layers.27.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.27.mlp: 2 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.27.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.28.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.28.mlp: 2 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.28.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.29.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.29.mlp: 2 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.29.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.30.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.30.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.30.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.31.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.31.mlp: 2 groups, 254/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.31.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.32.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.32.mlp: 2 groups, 253/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.32.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.33.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.33.mlp: 3 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.33.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.34.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.34.mlp: 4 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.34.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.35.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.35.mlp: 3 groups, 254/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.35.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.36.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.36.mlp: 3 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.36.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.37.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.37.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.37.mlp: 256 experts, K_up range [6,6]
+ -- Mixed-K experts in model.layers.38.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.38.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.38.mlp: 256 experts, K_up range [6,6]
+ -- Mixed-K experts in model.layers.39.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.39.mlp: 2 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.39.mlp: 256 experts, K_up range [4,6]
+ -- Mixed-K experts in model.layers.40.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.40.mlp: 2 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.40.mlp: 256 experts, K_up range [6,6]
+ -- Mixed-K experts in model.layers.41.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.41.mlp: 2 groups, 254/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.41.mlp: 256 experts, K_up range [6,8]
+ -- Mixed-K experts in model.layers.42.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.42.mlp: 3 groups, 253/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.42.mlp: 256 experts, K_up range [6,8]
+ -- Mixed-K experts in model.layers.43.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.43.mlp: 4 groups, 254/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.43.mlp: 256 experts, K_up range [4,8]
+ -- Mixed-K experts in model.layers.44.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.44.mlp: 4 groups, 256/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.44.mlp: 256 experts, K_up range [6,8]
+ -- Mixed-K experts in model.layers.45.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.45.mlp: 3 groups, 253/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.45.mlp: 256 experts, K_up range [6,8]
+ -- Mixed-K experts in model.layers.46.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.46.mlp: 4 groups, 255/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.46.mlp: 256 experts, K_up range [6,8]
+ -- Mixed-K experts in model.layers.47.mlp: dense per-expert path
+ -- Mixed-K fused groups in model.layers.47.mlp: 4 groups, 254/256 experts fused
+ -- Mixed-K UNIFIED kernel enabled in model.layers.47.mlp: 256 experts, K_up range [4,8]
+EXL3_UMA device=0 mode=reserve request_bytes=0 current=98792636416 host_available=23274389504 cgroup_headroom=120730177536 device_headroom=31870599168 os_reserve=8589934592 effective_reserve=8589934592 additional_headroom=14684454912 cap_bytes=113477091328 fraction=0.86846993204181389
+
+ -- Warming up...
+
+ -- Warmup: 9/9 passes in 7.11 s
+ -- Loading tokenizer...
+Stop conditions: [151645, 151643, 151672, '<|im_end|>', '<|endoftext|>', 151644, '<|im_start|>']
+Native API listening 127.0.0.1:8096; max_active=1
+127.0.0.1 "GET /health HTTP/1.1" 200 -
+127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+Traceback (most recent call last):
+  File "/workspace/MiMo-V2.6-Flash-RL-EXL3-recipe/server/worker.py", line 101, in _run
+    for event in self.generator.iterate():
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/round8-cost-width/width_diag.py", line 118, in iterate
+    results=old_iter()
+            ^^^^^^^^^^
+  File "/workspace/mimo-exl3/venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/generator.py", line 552, in iterate
+    draft_tokens = self.iterate_draftmodel_dflash_gen(results)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/round8-cost-width/width_diag.py", line 101, in draft
+    y=old_draft(results);emit('proposal_truncation',proposed=0 if y is None else y.shape[-1]);return y
+      ^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/generator/generator.py", line 890, in iterate_draftmodel_dflash_gen
+    out_state = self.draft_model.forward(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/round8-cost-width/width_diag.py", line 69, in forward
+    y=original_forward(*a,**kw);emit('state',shape=list(y.shape),finite=finite(y));assert list(y.shape)==[1,16,4096] and finite(y)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-exl3/venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model/model.py", line 393, in forward
+    y = self.forward_ls(x, params)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/60tps-round3/python-shadow/exllamav3/model/model_ls.py", line 334, in forward_ls
+    x = module.forward(x, params)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mimo-tune/round8-cost-width/width_diag.py", line 33, in inp
+    row=dict(anchor_shape=list(x.shape),input_shape=list(y.shape),finite=finite(y),mask_equal=bool(torch.equal(y[:,1:,:],dm.input_layer.mask_embedding.to(y.dtype).reshape(1,1,-1).expand(1,15,-1))))
+                                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but got other is on cuda:0, different from other tensors on cpu (when checking argument in method wrapper_CUDA__equal)
+127.0.0.1 "GET /health HTTP/1.1" 503 -
+127.0.0.1 "GET /health HTTP/1.1" 503 -
