@@ -1,0 +1,32 @@
+{"name": "baseline-red", "command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\tests\\test_driver.py", "test_mixedk.Elision", "test_telemetry.RoundDiagnostics.test_final_round_survives_job_removal"], "returncode": 1}
+TEST_RESULT {"tests": 2, "failures": 2, "errors": 0, "skipped": 0, "unexpected_successes": 0}
+test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback) ... FAIL
+test_final_round_survives_job_removal (test_telemetry.RoundDiagnostics.test_final_round_survives_job_removal) ... FAIL
+
+======================================================================
+FAIL: test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 12, in test_opt_in_removes_only_dead_readback
+    self.assertEqual(READBACKS, ['counts'])
+AssertionError: Lists differ: ['counts', 'nonzero'] != ['counts']
+
+First list contains 1 additional elements.
+First extra element 1:
+'nonzero'
+
+- ['counts', 'nonzero']
++ ['counts']
+
+======================================================================
+FAIL: test_final_round_survives_job_removal (test_telemetry.RoundDiagnostics.test_final_round_survives_job_removal)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_telemetry.py", line 13, in test_final_round_survives_job_removal
+    self.assertIsNotNone(diag, 'completed target pass must be exported outside removed Job')
+AssertionError: unexpectedly None : completed target pass must be exported outside removed Job
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.159s
+
+FAILED (failures=2)

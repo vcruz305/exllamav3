@@ -1,0 +1,1 @@
+{"name": "combined-check-1", "command": ["git", "-c", "core.autocrlf=false", "-c", "core.whitespace=cr-at-eol", "apply", "--check", "--whitespace=error-all", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\patches\\target-round-diagnostics.patch"], "returncode": 0}

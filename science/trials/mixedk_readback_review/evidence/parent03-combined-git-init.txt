@@ -1,0 +1,1 @@
+{"name": "combined-git-init", "command": ["git", "init", "--quiet", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\verified\\parent03\\combined"], "returncode": 0}

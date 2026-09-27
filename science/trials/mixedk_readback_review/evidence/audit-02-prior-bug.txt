@@ -1,0 +1,25 @@
+{"name": "prior-bug", "command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\tests\\test_driver.py", "prior_telemetry_repro"], "returncode": 1}
+TEST_RESULT {"tests": 2, "failures": 2, "errors": 0, "skipped": 0, "unexpected_successes": 0}
+test_one_round_final_result_includes_that_round (prior_telemetry_repro.EarlierFinalRoundBug.test_one_round_final_result_includes_that_round) ... FAIL
+test_two_round_final_result_includes_both_rounds (prior_telemetry_repro.EarlierFinalRoundBug.test_two_round_final_result_includes_both_rounds) ... FAIL
+
+======================================================================
+FAIL: test_one_round_final_result_includes_that_round (prior_telemetry_repro.EarlierFinalRoundBug.test_one_round_final_result_includes_that_round)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\prior_telemetry_repro.py", line 11, in test_one_round_final_result_includes_that_round
+    self.assertEqual(results[-1].get('draft_rounds'),1)
+AssertionError: None != 1
+
+======================================================================
+FAIL: test_two_round_final_result_includes_both_rounds (prior_telemetry_repro.EarlierFinalRoundBug.test_two_round_final_result_includes_both_rounds)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\prior_telemetry_repro.py", line 18, in test_two_round_final_result_includes_both_rounds
+    self.assertEqual(results[-1].get('draft_rounds'),2)
+AssertionError: 1 != 2
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.125s
+
+FAILED (failures=2)

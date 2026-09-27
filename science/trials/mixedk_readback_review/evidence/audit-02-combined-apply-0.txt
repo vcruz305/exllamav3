@@ -1,0 +1,1 @@
+{"name": "combined-apply-0", "command": ["git", "-c", "core.autocrlf=false", "-c", "core.whitespace=cr-at-eol", "apply", "--whitespace=error-all", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\patches\\mixedk-dead-readback.patch"], "returncode": 0}

@@ -1,0 +1,18 @@
+{"command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "-m", "unittest", "-v", "test_mixedk"], "source": "C:/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/60tps-review/candidate", "returncode": 0}
+test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback) ... ok
+test_active_below_concurrency_unchanged (test_mixedk.Preservation.test_active_below_concurrency_unchanged) ... ok
+test_atomic_mode (test_mixedk.Preservation.test_atomic_mode) ... ok
+test_default_retains_both_readbacks (test_mixedk.Preservation.test_default_retains_both_readbacks) ... ok
+test_empty_expert_slice (test_mixedk.Preservation.test_empty_expert_slice) ... ok
+test_empty_local_tp_sentinel (test_mixedk.Preservation.test_empty_local_tp_sentinel) ... ok
+test_first_unified_init (test_mixedk.Preservation.test_first_unified_init) ... ok
+test_grouped_then_unified_preexisting_hazard (test_mixedk.Preservation.test_grouped_then_unified_preexisting_hazard) ... ok
+test_legacy_grouped_unchanged (test_mixedk.Preservation.test_legacy_grouped_unchanged) ... ok
+test_mtile_host_counts (test_mixedk.Preservation.test_mtile_host_counts) ... ok
+test_partial_local_tp_sentinel (test_mixedk.Preservation.test_partial_local_tp_sentinel) ... ok
+test_row_cap_and_fallback_exact_once (test_mixedk.Preservation.test_row_cap_and_fallback_exact_once) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.967s
+
+OK

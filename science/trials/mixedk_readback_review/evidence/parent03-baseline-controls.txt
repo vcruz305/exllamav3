@@ -1,0 +1,22 @@
+{"name": "baseline-controls", "command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\tests\\test_driver.py", "test_mixedk.Preservation", "test_telemetry.Preservation"], "returncode": 0}
+TEST_RESULT {"tests": 15, "failures": 0, "errors": 0, "skipped": 0, "unexpected_successes": 0}
+test_active_below_concurrency_unchanged (test_mixedk.Preservation.test_active_below_concurrency_unchanged) ... ok
+test_atomic_mode (test_mixedk.Preservation.test_atomic_mode) ... ok
+test_default_retains_both_readbacks (test_mixedk.Preservation.test_default_retains_both_readbacks) ... ok
+test_empty_expert_slice (test_mixedk.Preservation.test_empty_expert_slice) ... ok
+test_empty_local_tp_sentinel (test_mixedk.Preservation.test_empty_local_tp_sentinel) ... ok
+test_first_unified_init (test_mixedk.Preservation.test_first_unified_init) ... ok
+test_grouped_then_unified_preexisting_hazard (test_mixedk.Preservation.test_grouped_then_unified_preexisting_hazard) ... ok
+test_legacy_grouped_unchanged (test_mixedk.Preservation.test_legacy_grouped_unchanged) ... ok
+test_mtile_host_counts (test_mixedk.Preservation.test_mtile_host_counts) ... ok
+test_partial_local_tp_sentinel (test_mixedk.Preservation.test_partial_local_tp_sentinel) ... ok
+test_real_row_cap_boundary_exact_once (test_mixedk.Preservation.test_real_row_cap_boundary_exact_once) ... ok
+test_row_cap_and_fallback_exact_once (test_mixedk.Preservation.test_row_cap_and_fallback_exact_once) ... ok
+test_default_disabled_no_draft (test_telemetry.Preservation.test_default_disabled_no_draft) ... ok
+test_instrumentation_off_avoids_output_tensor_scan (test_telemetry.Preservation.test_instrumentation_off_avoids_output_tensor_scan) ... ok
+test_on_off_generation_identical (test_telemetry.Preservation.test_on_off_generation_identical) ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 1.793s
+
+OK

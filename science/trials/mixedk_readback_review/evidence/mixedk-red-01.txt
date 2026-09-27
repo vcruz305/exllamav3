@@ -1,0 +1,154 @@
+{"command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "-m", "unittest", "-v", "test_mixedk"], "source": "C:/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/60tps-review/baseline", "returncode": 1}
+test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback) ... ERROR
+test_active_below_concurrency_unchanged (test_mixedk.Preservation.test_active_below_concurrency_unchanged) ... ERROR
+test_atomic_mode (test_mixedk.Preservation.test_atomic_mode) ... ERROR
+test_default_retains_both_readbacks (test_mixedk.Preservation.test_default_retains_both_readbacks) ... ERROR
+test_empty_expert_slice (test_mixedk.Preservation.test_empty_expert_slice) ... ok
+test_empty_local_tp_sentinel (test_mixedk.Preservation.test_empty_local_tp_sentinel) ... ok
+test_first_unified_init (test_mixedk.Preservation.test_first_unified_init) ... ERROR
+test_grouped_then_unified_preexisting_hazard (test_mixedk.Preservation.test_grouped_then_unified_preexisting_hazard) ... ok
+test_legacy_grouped_unchanged (test_mixedk.Preservation.test_legacy_grouped_unchanged) ... ok
+test_mtile_host_counts (test_mixedk.Preservation.test_mtile_host_counts) ... ERROR
+test_partial_local_tp_sentinel (test_mixedk.Preservation.test_partial_local_tp_sentinel) ... ERROR
+test_row_cap_and_fallback_exact_once (test_mixedk.Preservation.test_row_cap_and_fallback_exact_once) ... ERROR
+
+======================================================================
+ERROR: test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 9, in test_opt_in_removes_only_dead_readback
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_active_below_concurrency_unchanged (test_mixedk.Preservation.test_active_below_concurrency_unchanged)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 36, in test_active_below_concurrency_unchanged
+    trace = self.check([[0,0],[0,0]], concurrency=12)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_atomic_mode (test_mixedk.Preservation.test_atomic_mode)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 48, in test_atomic_mode
+    def test_atomic_mode(self): self.check([[0,1],[2,3]],det=False)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_default_retains_both_readbacks (test_mixedk.Preservation.test_default_retains_both_readbacks)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 33, in test_default_retains_both_readbacks
+    m.forward(x,{})
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_first_unified_init (test_mixedk.Preservation.test_first_unified_init)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 47, in test_first_unified_init
+    def test_first_unified_init(self): self.check([[0,1],[2,3]],initialized=False)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_mtile_host_counts (test_mixedk.Preservation.test_mtile_host_counts)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 44, in test_mtile_host_counts
+    trace = self.check([[0]]*80 + [[1]]*40 + [[2]]*5, mtile=True, rowcap=96)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_partial_local_tp_sentinel (test_mixedk.Preservation.test_partial_local_tp_sentinel)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 39, in test_partial_local_tp_sentinel
+    def test_partial_local_tp_sentinel(self): self.check([[0,3],[4,7]], local=2,total=8,first=3)
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+======================================================================
+ERROR: test_row_cap_and_fallback_exact_once (test_mixedk.Preservation.test_row_cap_and_fallback_exact_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 42, in test_row_cap_and_fallback_exact_once
+    self.check([[0],[0],[0],[1],[2]], rowcap=2)
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_mixedk.py", line 20, in check
+    out = m.forward(x,{})
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in forward
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\baseline\exllamav3\modules\block_sparse_mlp.py", line 1442, in <genexpr>
+    t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
+                                        ^^^^^^^^
+NameError: name 'MTILE_T1' is not defined
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.941s
+
+FAILED (errors=8)

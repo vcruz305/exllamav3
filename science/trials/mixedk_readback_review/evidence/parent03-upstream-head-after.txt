@@ -1,0 +1,2 @@
+{"name": "upstream-head-after", "command": ["git", "-C", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\dflash-pages-candidate\\upstream", "rev-parse", "HEAD"], "returncode": 0}
+ca4a880e8918e1985fd25e06c6aff561666d3f14

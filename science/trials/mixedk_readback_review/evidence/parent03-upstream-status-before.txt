@@ -1,0 +1,1 @@
+{"name": "upstream-status-before", "command": ["git", "-C", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\dflash-pages-candidate\\upstream", "status", "--porcelain"], "returncode": 0}

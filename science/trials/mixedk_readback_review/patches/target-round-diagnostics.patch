@@ -1,0 +1,118 @@
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -112,7 +112,12 @@
+             API servers that do not expose this knob (e.g. TabbyAPI) can still be tuned per deployment.
+ 
+         :param record_draft_stats:
+-            Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
++            Record the latest 256 (position, window, accepted) tuples in job.draft_stats.
++            Also retain the latest 256 target-decode calls in self.draft_diagnostics, plus
++            invocation/drop counters. Export this CPU-only dict after the job from the
++            generator's owning thread. It excludes prefill/drafter calls and timings;
++            sampled tokens, accepted prefixes and emitted token IDs are distinct counts.
++            Default False: no diagnostic scans/readbacks or HTTP/server changes.
+ 
+         :param show_visualizer:
+             Open window to render visualization of cache (for debug/demonstration purposes)
+@@ -178,6 +183,13 @@
+         self.ngram_match_min = ngram_match_min
+         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
+         self.record_draft_stats = record_draft_stats
++        # Bounded, CPU-scalar diagnostics for iterate_gen target calls only. No tensors,
++        # timings, drafter/prefill calls or HTTP usage fields. Export after the job on
++        # the generator-owning thread; a record is finalized before job removal/requeue.
++        self.draft_diagnostics = {
++            "schema": 1, "scope": "target_decode_only", "target_forward_invocations": 0,
++            "dropped_passes": 0, "passes": [],
++        } if record_draft_stats else None
+         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+ 
+         # Chunking/partitioning
+@@ -1069,6 +1081,27 @@
+         }
+         if self.draft_model:
+             params.update(self.draft_model.draft_verifier_params)
++        diagnostic = None
++        if self.record_draft_stats:
++            diag = self.draft_diagnostics
++            diag["target_forward_invocations"] += 1
++            diagnostic_jobs = {
++                id(job): {"serial": job.serial_number, "sampled_tokens": 0, "accepted_prefix": 0}
++                for job in batch_jobs
++            }
++            diagnostic_start_tokens = {id(job): job.new_tokens for job in batch_jobs}
++            diagnostic_result_start = len(results)
++            diagnostic = {
++                "pass_id": diag["target_forward_invocations"], "role": "target_decode",
++                "proposed_window": draft_tokens.shape[-1] if draft_tokens is not None else 0,
++                "input_rows": batch_ids.shape[0], "input_tokens_per_row": batch_ids.shape[1],
++                "completed": False, "jobs": list(diagnostic_jobs.values()),
++            }
++            # Count actual invocations, including a forward that subsequently raises.
++            if len(diag["passes"]) == 256:
++                del diag["passes"][0]
++                diag["dropped_passes"] += 1
++            diag["passes"].append(diagnostic)
+         batch_logits = self.model.forward(
+             input_ids = batch_ids,
+             params = params,
+@@ -1167,6 +1200,8 @@
+                     next_prob,
+                     results,
+                 )
++                if diagnostic is not None:
++                    diagnostic_jobs[id(job)]["sampled_tokens"] += 1
+                 # Single-token rewinds need no batch cleanup, but the post-batch draft carry update must still be
+                 # suppressed so it doesn't resurrect a stale MTP state
+                 if job.checkpoint_rewound:
+@@ -1238,6 +1273,9 @@
+                         results,
+                     )
+ 
++                    if diagnostic is not None:
++                        diagnostic_jobs[id(job)]["sampled_tokens"] += 1
++
+                     # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job
+                     # uses the full sequence generated so far as its next prompt. Unconsumed draft positions must
+                     # be rejected here so the recurrent state and page positions match the accepted sequence
+@@ -1293,6 +1331,8 @@
+                         else:
+                             job.accepted_draft_tokens += 1
+                             accepted_length += 1
++                            if diagnostic is not None:
++                                diagnostic_jobs[id(job)]["accepted_prefix"] += 1
+ 
+                             # Advance filters
+                             for f in job.filters:
+@@ -1315,6 +1355,8 @@
+                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
+                 if draft_tokens is not None and rejected != -1:
+                     if self.record_draft_stats:
++                        if len(job.draft_stats) == 256:
++                            del job.draft_stats[0]
+                         job.draft_stats.append((
+                             job.new_tokens,
+                             draft_tokens.shape[-1],
+@@ -1398,6 +1440,22 @@
+                     a_idx:b_idx, accepted_length - 1:accepted_length, :
+                 ].clone()
+ 
++        if diagnostic is not None:
++            # receive_sample has now built even the last EOS event. Count actual emitted
++            # token_ids (may include a previous pass's held tokens), NOT 1 + accepted.
++            for job in batch_jobs:
++                d = diagnostic_jobs[id(job)]
++                d.update({
++                    "emitted_token_ids": sum(
++                        r["token_ids"].numel() for r in results[diagnostic_result_start:]
++                        if r.get("job") is job and "token_ids" in r
++                    ),
++                    "new_tokens_delta": job.new_tokens - diagnostic_start_tokens[id(job)],
++                    "eos": job in completed_jobs, "requeued": job in requeuing_jobs,
++                    "rewound": id(job) in rewound_jobs,
++                })
++            diagnostic["completed"] = True
++
+         # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
+         # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
+         # recurrent state.

@@ -1,0 +1,23 @@
+{"command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "-m", "unittest", "-v", "test_telemetry"], "source": "C:/Users/Victor Cruz/AppData/Local/hermes/cache/scratch/mimo-tune/60tps-review/candidate", "returncode": 1}
+test_default_disabled_no_draft (test_telemetry.Preservation.test_default_disabled_no_draft) ... ok
+test_eos_stop_token_not_emitted (test_telemetry.RoundDiagnostics.test_eos_stop_token_not_emitted) ... ok
+test_final_round_survives_job_removal (test_telemetry.RoundDiagnostics.test_final_round_survives_job_removal) ... ok
+test_first_last_mismatch_full_accept_serial_and_batch (test_telemetry.RoundDiagnostics.test_first_last_mismatch_full_accept_serial_and_batch) ... ok
+test_forward_error_counted_without_completed_claim (test_telemetry.RoundDiagnostics.test_forward_error_counted_without_completed_claim) ... ok
+test_no_draft_instrumented (test_telemetry.RoundDiagnostics.test_no_draft_instrumented) ... ok
+test_no_ready_job_no_forward (test_telemetry.RoundDiagnostics.test_no_ready_job_no_forward) ... ok
+test_records_bounded_including_legacy_history (test_telemetry.RoundDiagnostics.test_records_bounded_including_legacy_history) ... FAIL
+test_requeue_finalized_before_job_reinit (test_telemetry.RoundDiagnostics.test_requeue_finalized_before_job_reinit) ... ok
+
+======================================================================
+FAIL: test_records_bounded_including_legacy_history (test_telemetry.RoundDiagnostics.test_records_bounded_including_legacy_history)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\60tps-review\tests\test_telemetry.py", line 31, in test_records_bounded_including_legacy_history
+    self.assertEqual(len(job.draft_stats),256)
+AssertionError: 260 != 256
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.829s
+
+FAILED (failures=1)

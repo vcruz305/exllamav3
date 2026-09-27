@@ -1,0 +1,28 @@
+{
+  "pin": "ca4a880e8918e1985fd25e06c6aff561666d3f14",
+  "sha256": {
+    "AUDIT.md": "3519d7c022029cd872d0864502a91da03abf03bbb9f26286eb0d2ca16c9e997f",
+    "baseline/exllamav3/generator/generator.py": "3ce3efde084eabe4b9e2dcb937d2b37635b383d294958a599f91dd507896a6ef",
+    "baseline/exllamav3/modules/block_sparse_mlp.py": "269bc2d994e0232ef994eb29cf71edab14d9317a110b24479315ee7585c09a31",
+    "baseline.tar": "4c48c6bfcd7e8301de80129799193fc0be2304447851a91525e1f4d62e3965a0",
+    "build_manifest.py": "1c8d6a3ebfd3f748d7efa2b08cc778140c03ba929b7fb4602fb0d3add4925e02",
+    "build_patches.py": "ebfcbd922a6e47cfa64a0c471c2fbbd62d676f81ef15df9246f1acf0df97f776",
+    "candidate/exllamav3/generator/generator.py": "f16d6d36442343864feea6ea1496fd58e594810183f6075e7ccb334b9fd567ab",
+    "candidate/exllamav3/modules/block_sparse_mlp.py": "61653605b432350db3cccddbaa00b12f121e38fa2b072fc9de2032adf9e2a706",
+    "GPU_VALIDATION.md": "039fab2ed4c2040cfd4746649144654aa7967e7bb81a7a4afc4c80c97ce976c5",
+    "patches/mixedk-dead-readback.patch": "e07007f16b0ffd6422b4d744875c5c4a0565350bfdc84f537dba744ca0e78fbc",
+    "patches/target-round-diagnostics.patch": "955117806aed7b83e5c6a4ede2d38a23d3410a83f867106bca54c3942c309a80",
+    "prior-source/exllamav3/generator/generator.py": "a749f2c9c19d41f82e216f1fa49c6567ca371a3f90b1395cf01a72461296acd3",
+    "prior-source/exllamav3/generator/job.py": "14c92ec2c4788c94f6cb23685058e39963a90835ce8959e30df0d16cfbb3419b",
+    "README.md": "f8424dbcb97cf2c9ad053923462521ba8af341645ca136cb7157832f2769d958",
+    "repair_archive_eol.py": "547ad18fb4b7faf992dbf7aee41f6f6bd3a8a6af3a3ace6727f6fb2b2716dc1b",
+    "run_tests.py": "f882572247a4da2689f2640259198904244d9f0e6c5c65c3b19582a8f992845a",
+    "tests/generator_harness.py": "0ea0a66fd6b8bec5c964f5f2d74d03a4b1676ae0337da530f35cad656aff69e9",
+    "tests/prior_telemetry_repro.py": "2af9d228abb8eb8d2c4a166c220bd9ded325518a6a2a3ada22752a78beea9cca",
+    "tests/source_harness.py": "34b931cb408c3db502c191fe2c301931a76f4258ed522972154dc6b0855070a1",
+    "tests/test_driver.py": "d27b2d40b7f431b3e2005ab9bcade7256eb9930f48e591a57edb2b9ad5d6287c",
+    "tests/test_mixedk.py": "bb21d406423eb29eec8360d96be79cd437234a4505adaa1194408348fa2ae2a4",
+    "tests/test_telemetry.py": "e27a14f418a4c3b3fa41b86a5fb4269d46702925b58db8f26103cfdbd76e229a",
+    "verify.py": "c0e2329c17a670eb4c77d3c2ffe9ab6cfe9b3bd77a323408a454da81251a42b0"
+  }
+}

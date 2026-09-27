@@ -50,6 +50,9 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # compile-time"), so it cannot unroll the trellis decode loop. Row tiles amortize that at prefill
 # but not at one token. 0 leaves the EXL3_MIXEDK_LEGACY behaviour unchanged
 MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
+# Experimental: elide only the handled-set readback when no host fallback will run.
+# Keep counts_fused, num_active, row tiles and all CUDA launch geometry unchanged.
+MIXEDK_ELIDE_HANDLED = os.environ.get("EXL3_MOE_MIXEDK_ELIDE_HANDLED", "0") == "1"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -1457,7 +1460,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 c = expert_count_list[e]
                                 if 0 < c <= _mkd_rows:
                                     mixedk_handled.add(e)
-                        else:
+                        elif not MIXEDK_ELIDE_HANDLED:
+                            # expert_count_list is None: the fallback loop below has zero
+                            # iterations. This set is unconsumed; opt-in removes only its sync.
                             _ec = expert_count[:num_ex]
                             for e in ((_ec > 0) & (_ec <= _mkd_rows)).nonzero(as_tuple=True)[0].tolist():
                                 mixedk_handled.add(e)

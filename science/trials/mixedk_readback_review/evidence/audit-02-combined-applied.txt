@@ -1,0 +1,37 @@
+{"name": "combined-applied", "command": ["C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe", "C:\\Users\\Victor Cruz\\AppData\\Local\\hermes\\cache\\scratch\\mimo-tune\\60tps-review\\tests\\test_driver.py", "test_mixedk", "test_telemetry"], "returncode": 0}
+TEST_RESULT {"tests": 30, "failures": 0, "errors": 0, "skipped": 0, "unexpected_successes": 0}
+test_opt_in_removes_only_dead_readback (test_mixedk.Elision.test_opt_in_removes_only_dead_readback) ... ok
+test_active_below_concurrency_unchanged (test_mixedk.Preservation.test_active_below_concurrency_unchanged) ... ok
+test_atomic_mode (test_mixedk.Preservation.test_atomic_mode) ... ok
+test_default_retains_both_readbacks (test_mixedk.Preservation.test_default_retains_both_readbacks) ... ok
+test_empty_expert_slice (test_mixedk.Preservation.test_empty_expert_slice) ... ok
+test_empty_local_tp_sentinel (test_mixedk.Preservation.test_empty_local_tp_sentinel) ... ok
+test_first_unified_init (test_mixedk.Preservation.test_first_unified_init) ... ok
+test_grouped_then_unified_preexisting_hazard (test_mixedk.Preservation.test_grouped_then_unified_preexisting_hazard) ... ok
+test_legacy_grouped_unchanged (test_mixedk.Preservation.test_legacy_grouped_unchanged) ... ok
+test_mtile_host_counts (test_mixedk.Preservation.test_mtile_host_counts) ... ok
+test_partial_local_tp_sentinel (test_mixedk.Preservation.test_partial_local_tp_sentinel) ... ok
+test_real_row_cap_boundary_exact_once (test_mixedk.Preservation.test_real_row_cap_boundary_exact_once) ... ok
+test_row_cap_and_fallback_exact_once (test_mixedk.Preservation.test_row_cap_and_fallback_exact_once) ... ok
+test_default_disabled_no_draft (test_telemetry.Preservation.test_default_disabled_no_draft) ... ok
+test_instrumentation_off_avoids_output_tensor_scan (test_telemetry.Preservation.test_instrumentation_off_avoids_output_tensor_scan) ... ok
+test_on_off_generation_identical (test_telemetry.Preservation.test_on_off_generation_identical) ... ok
+test_abandoned_window_kept_and_labeled (test_telemetry.RoundDiagnostics.test_abandoned_window_kept_and_labeled) ... ok
+test_batched_jobs_share_one_actual_target_forward (test_telemetry.RoundDiagnostics.test_batched_jobs_share_one_actual_target_forward) ... ok
+test_diagnostic_json_contains_only_metadata (test_telemetry.RoundDiagnostics.test_diagnostic_json_contains_only_metadata) ... ok
+test_dynamic_window_is_actual_proposal_not_requested_max (test_telemetry.RoundDiagnostics.test_dynamic_window_is_actual_proposal_not_requested_max) ... ok
+test_eos_stop_token_not_emitted (test_telemetry.RoundDiagnostics.test_eos_stop_token_not_emitted) ... ok
+test_final_round_survives_job_removal (test_telemetry.RoundDiagnostics.test_final_round_survives_job_removal) ... ok
+test_first_last_mismatch_full_accept_serial_and_batch (test_telemetry.RoundDiagnostics.test_first_last_mismatch_full_accept_serial_and_batch) ... ok
+test_forward_error_counted_without_completed_claim (test_telemetry.RoundDiagnostics.test_forward_error_counted_without_completed_claim) ... ok
+test_held_tokens_emitted_on_later_pass_not_reconstructed (test_telemetry.RoundDiagnostics.test_held_tokens_emitted_on_later_pass_not_reconstructed) ... ok
+test_no_draft_instrumented (test_telemetry.RoundDiagnostics.test_no_draft_instrumented) ... ok
+test_no_ready_job_no_forward (test_telemetry.RoundDiagnostics.test_no_ready_job_no_forward) ... ok
+test_records_bounded_including_legacy_history (test_telemetry.RoundDiagnostics.test_records_bounded_including_legacy_history) ... ok
+test_requeue_finalized_before_job_reinit (test_telemetry.RoundDiagnostics.test_requeue_finalized_before_job_reinit) ... ok
+test_two_target_passes_include_final_partial_pass (test_telemetry.RoundDiagnostics.test_two_target_passes_include_final_partial_pass) ... ok
+
+----------------------------------------------------------------------
+Ran 30 tests in 3.308s
+
+OK
