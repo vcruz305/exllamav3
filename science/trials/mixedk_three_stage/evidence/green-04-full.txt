@@ -1,0 +1,25 @@
+ownership_cases= 94 same_CTA_projection_groups= 194048
+test_distinct_three_stage_dispatch_and_same_cta_epilogues (test_candidate.FusionContracts.test_distinct_three_stage_dispatch_and_same_cta_epilogues) ... ok
+test_debug_build_poisons_actual_owned_intermediates (test_candidate.PoisonContracts.test_debug_build_poisons_actual_owned_intermediates) ... ok
+test_actual_caller_arguments_unchanged (test_guard.GuardTests.test_actual_caller_arguments_unchanged) ... ok
+test_decode_only_default_off_and_original_identity (test_guard.GuardTests.test_decode_only_default_off_and_original_identity) ... ok
+test_input_padding_and_sliced_weights_fall_back (test_guard.GuardTests.test_input_padding_and_sliced_weights_fall_back) ... ok
+test_metadata_all_formats_and_scalar_rejections (test_guard.GuardTests.test_metadata_all_formats_and_scalar_rejections) ... ok
+test_mul1_scalar_decode_exact_all_indices (test_layout.CodebookTests.test_mul1_scalar_decode_exact_all_indices) ... ok
+test_integer_and_half_bit_payload_windows_and_stores (test_layout.FormatTests.test_integer_and_half_bit_payload_windows_and_stores) ... ok
+test_bijective_quadrant_swap_is_detected (test_layout.LayoutTests.test_bijective_quadrant_swap_is_detected) ... ok
+test_scalar_layout_matches_actual_labeled_stores (test_layout.LayoutTests.test_scalar_layout_matches_actual_labeled_stores) ... ok
+test_all_rows_tiles_partial_tiers_duplicates_exclusions (test_ownership.OwnershipTests.test_all_rows_tiles_partial_tiers_duplicates_exclusions) ... ok
+test_compact_gather_source_and_tier_offsets (test_ownership.OwnershipTests.test_compact_gather_source_and_tier_offsets) ... ok
+test_incumbent_complete_K_topology_and_counterexample (test_ownership.OwnershipTests.test_incumbent_complete_K_topology_and_counterexample) ... ok
+test_stage_boundaries_and_shared_reuse_are_explicit (test_ownership.OwnershipTests.test_stage_boundaries_and_shared_reuse_are_explicit) ... ok
+test_all_had_codebooks_decoder_and_persistent_body_unchanged (test_preservation.PreservationTests.test_all_had_codebooks_decoder_and_persistent_body_unchanged) ... ok
+test_existing_35arg_abi_gather_and_pointer_types (test_preservation.PreservationTests.test_existing_35arg_abi_gather_and_pointer_types) ... ok
+test_gemm_pipeline_stores_and_accumulators_unchanged (test_preservation.PreservationTests.test_gemm_pipeline_stores_and_accumulators_unchanged) ... ok
+test_noop_and_existing_host_checks_preserved (test_preservation.PreservationTests.test_noop_and_existing_host_checks_preserved) ... ok
+test_rounding_activation_clamp_route_association (test_preservation.PreservationTests.test_rounding_activation_clamp_route_association) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 6.395s
+
+OK

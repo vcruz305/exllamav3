@@ -271,6 +271,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
     m.def("exl3_moe_mixedk", &exl3_moe_mixedk, "exl3_moe_mixedk");
+    m.def("exl3_moe_mixedk_three_stage", &exl3_moe_mixedk_three_stage, "default-off three-stage mixed-K");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");

@@ -24,7 +24,7 @@
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
 // dequantized B fragment instead of re-running the whole B pipeline per 16 rows, with A
 // single-buffered so the row fragments fit alongside the prefetched B fragments.
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool full_k_tiles = false>
 inline __device__
 void exl3_gemm_kernel_inner
 (
@@ -97,8 +97,11 @@ void exl3_gemm_kernel_inner
 
     // Start and end index of current slice, must span at least one tile
     int num_slices = gridDim.x;
-    int slice_beg = tiles_k * tiles_n * blockIdx.x / num_slices;
-    int slice_end = tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
+    // Full-K mode gives each CTA complete columns: no inter-CTA accumulation.
+    int slice_beg = full_k_tiles ? (tiles_n * blockIdx.x / num_slices) * tiles_k
+                                : tiles_k * tiles_n * blockIdx.x / num_slices;
+    int slice_end = full_k_tiles ? (tiles_n * (blockIdx.x + 1) / num_slices) * tiles_k
+                                : tiles_k * tiles_n * (blockIdx.x + 1) / num_slices;
     int slice_len = slice_end - slice_beg;
     if (slice_len < 1) return;
 
@@ -830,46 +833,57 @@ void exl3_gemm_kernel_inner
         // First reduce all partial sums along k for the current slice
         threadblock_reduce();
 
-        // Process (partial) slices within column in reverse order so the threadblock doing the bottom slice is
-        // free to proceed to the next column right away
-        int lock_i = tiles_k - slice2_k - 1;
-        int lock_d = slice2_k - slice2_k0 + 1;
-        int* lock = &locks[slice_m * blocks_n + slice2_n];
-
-        barrier_acquire(lock, lock_i);
-
-        bool first = lock_i == 0;
-        bool last = lock_i + lock_d == tiles_k;
-
-        // Second and subsequent threadblocks in column read back the intermediate sum from global memory
-        if (!sub_k && !first)
+        if constexpr (full_k_tiles)
         {
-            read_sum_gl();
+            static_assert(!shmem_out_had, "full-K mode currently writes row-major only");
+            if (!sub_k) write_sum_gl();
+            // Keep CTA-local synchronization before the shared staging is reused.
+            __syncthreads();
         }
-
-        // All but last threadblock in column write the intermediate result to global memory
-        if (!sub_k && !last)
+        else
         {
-            write_sum_gl();
-        }
+            // Process (partial) slices within column in reverse order so the threadblock doing the bottom slice is
+            // free to proceed to the next column right away
+            int lock_i = tiles_k - slice2_k - 1;
+            int lock_d = slice2_k - slice2_k0 + 1;
+            int* lock = &locks[slice_m * blocks_n + slice2_n];
 
-        // Last block writes in row-major format
-        if (!sub_k && last)
-        {
-            if constexpr (shmem_out_had)
-                write_sum_tile_sh();
-            else
+            barrier_acquire(lock, lock_i);
+
+            bool first = lock_i == 0;
+            bool last = lock_i + lock_d == tiles_k;
+
+            // Second and subsequent threadblocks in column read back the intermediate sum from global memory
+            if (!sub_k && !first)
+            {
+                read_sum_gl();
+            }
+
+            // All but last threadblock in column write the intermediate result to global memory
+            if (!sub_k && !last)
+            {
                 write_sum_gl();
-        }
+            }
 
-        if constexpr (shmem_out_had)
-        {
-            if (last) __syncthreads();
+            // Last block writes in row-major format
             if (!sub_k && last)
-                output_had_sh_gl();
-        }
+            {
+                if constexpr (shmem_out_had)
+                    write_sum_tile_sh();
+                else
+                    write_sum_gl();
+            }
 
-        barrier_release(lock, lock_d, last);
+            if constexpr (shmem_out_had)
+            {
+                if (last) __syncthreads();
+                if (!sub_k && last)
+                    output_had_sh_gl();
+            }
+
+            barrier_release(lock, lock_d, last);
+
+        }
 
         clear_frag_c();
     };
@@ -993,5 +1007,13 @@ void exl3_gemm_kernel_inner
             FSTAGE(4, 3);
             FSTAGE(0, 4);
         }
+    }
+    // Full-K callers may immediately reuse shared memory and consume global
+    // half stores in a fused epilogue. Drain even empty trailing async groups;
+    // this is opt-in only and does not touch the incumbent pipeline arithmetic.
+    if constexpr (full_k_tiles)
+    {
+        cp_async_wait<0>();
+        __syncthreads();
     }
 }

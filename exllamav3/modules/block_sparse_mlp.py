@@ -507,6 +507,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def load_local(self, **kwargs):
 
+        self._mk_three_stage_ok = False
+
         # Test if experts can be fused
         num_exl3_tensors = 0
         num_nonexl3_tensors = 0
@@ -637,6 +639,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     [self.downs[i].inner.svh.data_ptr() for i in range(_ne)], dtype=_torch.long, device=self.device)
                 self.mixedk_mcg = list(_all_mcg)[0]
                 self.mixedk_mul1 = list(_all_mul1)[0]
+                from .mixedk_three_stage import format_supported
+                self._mk_three_stage_ok = format_supported(self)
                 # EXL3_MIXEDK_LEGACY=1 selects the legacy per-K-group coop dispatch.
                 # Measured +5% on GB10 (sm_121): the grouped coop kernel is ~2.9x
                 # cheaper per call than the unified mixed-K kernel there.
@@ -1404,8 +1408,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         _m = (_ec > 0) & (_ec <= _mkd_rows)
                         counts_fused = _ec[_m].tolist()
                     if counts_fused:
+                        from .mixedk_three_stage import select_entry
+                        mixedk_entry = select_entry(self, params, num_tokens, ext, routing_dots)
                         def run_mixedk_fused(num_active, count_lo=1, count_hi=_mkd_rows, m_tile=16):
-                            ext.exl3_moe_mixedk(
+                            mixedk_entry(
                                 y,
                                 final_hidden_states,
                                 expert_count,

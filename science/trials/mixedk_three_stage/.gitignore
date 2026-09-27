@@ -1,0 +1,24 @@
+# Generated artifacts — materialized locally, never committed.
+#
+# original/, tree/ and five-stage-control/ are full source trees (~21 MB, ~2,100 files
+# each). The branch stays source-sized by rebuilding them from git history instead of
+# vendoring them:
+#   original/            == BASE_SHA, exactly
+#   tree/                == BASE_SHA with this branch's exllamav3/ overlaid
+#                           (the candidate patch only touches exllamav3/)
+#   five-stage-control/  == BASE_SHA + five-stage-control.delta.patch
+#
+# Rebuild with:  sh science/trials/mixedk_three_stage/materialize_controls.sh
+/original/
+/tree/
+/five-stage-control/
+
+# Run receipts and the patch verifier.py re-derives from original/ vs tree/.
+# The same change is the branch's own committed diff, so it is not re-vendored here;
+# verify.py regenerates it and asserts byte equality if it is already present.
+/verify-*/
+/mixedk-three-stage.patch
+
+# local test residue
+__pycache__/
+*.pyc

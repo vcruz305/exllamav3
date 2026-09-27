@@ -1,0 +1,6 @@
+test_distinct_three_stage_dispatch_and_same_cta_epilogues (test_candidate.FusionContracts.test_distinct_three_stage_dispatch_and_same_cta_epilogues) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK

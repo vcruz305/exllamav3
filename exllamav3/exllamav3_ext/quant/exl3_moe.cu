@@ -3,6 +3,8 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/Functions.h>
+#include <limits>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include "../util.h"
@@ -504,6 +506,7 @@ void exl3_moe_gather
 }
 // ---- Mixed-K entry point: appended to exl3_moe.cu ----
 #include "comp_units/exl3_moe_mixedk_instances.cuh"
+#include "exl3_moe_three_stage.cuh"
 
 // ---- Mixed-K launch tuning -------------------------------------------------------------
 // Dynamic shared memory a mixedk instance actually needs, mirroring the layout in
@@ -586,8 +589,9 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[] =
     exl3_moe_mixedk_kernel_n128_cb2_m64()
 };
 
-void exl3_moe_mixedk
+static void exl3_moe_mixedk_impl
 (
+    const bool allow_three_stage,
     const at::Tensor& hidden_state,
     const at::Tensor& output_state,
     const at::Tensor& expert_count,
@@ -806,6 +810,56 @@ void exl3_moe_mixedk
     void* _K_up_arr = K_up_arr.data_ptr();
     void* _K_down_arr = K_down_arr.data_ptr();
 
+    // Explicit new entry point AND default-off environment flag. The original
+    // entry point never opts in (including tiny prefills rejected by Python).
+    int major = 0, minor = 0;
+    const bool requested = allow_three_stage && exl3_moe_env_int("EXL3_MK_THREE_STAGE", 0) == 1;
+    if (requested)
+    {
+        cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+        cuda_check(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    }
+    const bool three_stage = requested && major == 12 && minor == 1 &&
+        bsz >= 1 && bsz <= 8 && hidden_dim == 4096 && intermediate_dim == 2048 &&
+        num_experts == 256 && num_experts_per_tok == 8 && token_sorted.numel() == bsz * 8 &&
+        gate_mul1 && act_function == MOE_ACT_SILU && m_tile == 16 &&
+        N_off == 1 && pipe_sel == 0 && smem_override == 0 && blocks_per_sm == 1 &&
+        _output_scratch != nullptr && _fused_base != nullptr &&
+        hidden_state.is_contiguous() && weight_sorted.is_contiguous() && token_sorted.is_contiguous() &&
+        weight_sorted.scalar_type() == at::kHalf && expert_count.is_contiguous() &&
+        fused_base.value().is_contiguous() && fused_base.value().numel() >= (int64_t) num_experts &&
+        K_gate_arr.is_contiguous() && K_up_arr.is_contiguous() && K_down_arr.is_contiguous() &&
+        gate_ptrs_trellis.is_contiguous() && gate_ptrs_suh.is_contiguous() && gate_ptrs_svh.is_contiguous() &&
+        up_ptrs_trellis.is_contiguous() && up_ptrs_suh.is_contiguous() && up_ptrs_svh.is_contiguous() &&
+        down_ptrs_trellis.is_contiguous() && down_ptrs_suh.is_contiguous() && down_ptrs_svh.is_contiguous() &&
+        gate_ptrs_trellis.scalar_type() == at::kLong && gate_ptrs_suh.scalar_type() == at::kLong && gate_ptrs_svh.scalar_type() == at::kLong &&
+        up_ptrs_trellis.scalar_type() == at::kLong && up_ptrs_suh.scalar_type() == at::kLong && up_ptrs_svh.scalar_type() == at::kLong &&
+        down_ptrs_trellis.scalar_type() == at::kLong && down_ptrs_suh.scalar_type() == at::kLong && down_ptrs_svh.scalar_type() == at::kLong;
+    // Per-call current-stream owning tensors, exactly the prior bounded footprint.
+    // Four HALF buffers, <= 64 * (2H + 2I) * 2 bytes. No persistent shared cache.
+    at::Tensor phase_g, phase_u, phase_ig, phase_iu;
+    if (three_stage)
+    {
+        const int64_t slots = token_sorted.numel();
+        phase_g = at::empty({slots, (int64_t) hidden_dim}, hidden_state.options());
+        phase_u = at::empty_like(phase_g);
+        phase_ig = at::empty({slots, (int64_t) intermediate_dim}, hidden_state.options());
+        phase_iu = at::empty_like(phase_ig);
+#ifdef EXL3_THREE_STAGE_POISON
+        // Diagnostic-only isolated build: fill the ACTUAL allocation, not legacy
+        // caller scratch. Excluded rows remain NaN. Never time this build.
+        const float poison = std::numeric_limits<float>::quiet_NaN();
+        phase_g.fill_(poison);
+        phase_u.fill_(poison);
+        phase_ig.fill_(poison);
+        phase_iu.fill_(poison);
+#endif
+        _temp_state_g = phase_g.data_ptr();
+        _temp_state_u = phase_u.data_ptr();
+        _temp_intermediate_g = phase_ig.data_ptr();
+        _temp_intermediate_u = phase_iu.data_ptr();
+    }
+
     void* kernelArgs[] =
     {
         &_hidden_state,
@@ -844,15 +898,148 @@ void exl3_moe_mixedk
         (void*) &count_hi
     };
 
-    cudaLaunchKernel
-    (
-        (void*) kernel,
-        grid_dim,
-        block_dim,
-        kernelArgs,
-        smem_bytes,
-        stream
-    );
-
+    if (three_stage)
+    {
+        fp_exl3_moe_mixedk_kernel stages[] = {
+            exl3_moe_three_stage_kernel<0>, exl3_moe_three_stage_kernel<1>, exl3_moe_three_stage_kernel<2>
+        };
+        // GEMM and output-Hadamard shared spans are reused sequentially, NOT added.
+        // 512 threads = 16 physical warps => 8192 bytes for output-Hadamard.
+        const size_t gemm_smem = exl3_moe_mixedk_smem_bytes(16, 256, 8, 3);
+        const size_t output_had_smem = (512 / 32) * 128 * sizeof(float);
+        const size_t fused_smem = MAX(gemm_smem, output_had_smem);
+        const int experts = MIN((int) token_sorted.numel(), (int) num_experts);
+        for (int stage = 0; stage < 3; ++stage)
+        {
+            const dim3 stage_grid(stage == 0 ? 1 : (stage == 1 ? 8 : 16), 1, experts);
+            auto fn = stages[stage];
+            if (stage != 0 && moe_mixedk_kernel_attr_set[device].insert((void*) fn).second)
+                cuda_check(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, fused_smem));
+            cuda_check(cudaLaunchKernel((void*) fn, stage_grid, stage == 0 ? 256 : 512,
+                                       kernelArgs, stage == 0 ? 0 : fused_smem, stream));
+        }
+    }
+    else
+    {
+        cudaLaunchKernel((void*) kernel, grid_dim, block_dim, kernelArgs, smem_bytes, stream);
+    }
+    if (allow_three_stage && exl3_moe_env_int("EXL3_MK_THREE_STAGE_TRACE", 0))
+        fprintf(stderr, "mixedk actual=%s requested=%d rows=%zu slots=%lld\n",
+                three_stage ? "three-stage-fullk" : "persistent", (int) requested,
+                bsz, (long long) token_sorted.numel());
     cuda_check(cudaPeekAtLastError());
+}
+
+void exl3_moe_mixedk
+(
+    const at::Tensor& hidden_state,
+    const at::Tensor& output_state,
+    const at::Tensor& expert_count,
+    const at::Tensor& token_sorted,
+    const at::Tensor& weight_sorted,
+
+    const at::Tensor& temp_state_g,
+    const at::Tensor& temp_state_u,
+    const at::Tensor& temp_intermediate_g,
+    const at::Tensor& temp_intermediate_u,
+
+    const int act_function,
+
+    const at::Tensor& K_gate_arr,
+    const at::Tensor& K_up_arr,
+    const at::Tensor& K_down_arr,
+
+    const at::Tensor& gate_ptrs_trellis,
+    const at::Tensor& gate_ptrs_suh,
+    const at::Tensor& gate_ptrs_svh,
+    const at::Tensor& up_ptrs_trellis,
+    const at::Tensor& up_ptrs_suh,
+    const at::Tensor& up_ptrs_svh,
+    const at::Tensor& down_ptrs_trellis,
+    const at::Tensor& down_ptrs_suh,
+    const at::Tensor& down_ptrs_svh,
+
+    const bool gate_mcg,
+    const bool gate_mul1,
+    const bool up_mcg,
+    const bool up_mul1,
+    const bool down_mcg,
+    const bool down_mul1,
+
+    const float act_limit,
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
+)
+{
+    exl3_moe_mixedk_impl(false,
+        hidden_state, output_state, expert_count, token_sorted,
+        weight_sorted, temp_state_g, temp_state_u, temp_intermediate_g,
+        temp_intermediate_u, act_function, K_gate_arr, K_up_arr,
+        K_down_arr, gate_ptrs_trellis, gate_ptrs_suh, gate_ptrs_svh,
+        up_ptrs_trellis, up_ptrs_suh, up_ptrs_svh, down_ptrs_trellis,
+        down_ptrs_suh, down_ptrs_svh, gate_mcg, gate_mul1,
+        up_mcg, up_mul1, down_mcg, down_mul1,
+        act_limit, num_active, output_scratch, fused_base,
+        count_lo, count_hi, m_tile);
+}
+
+void exl3_moe_mixedk_three_stage
+(
+    const at::Tensor& hidden_state,
+    const at::Tensor& output_state,
+    const at::Tensor& expert_count,
+    const at::Tensor& token_sorted,
+    const at::Tensor& weight_sorted,
+
+    const at::Tensor& temp_state_g,
+    const at::Tensor& temp_state_u,
+    const at::Tensor& temp_intermediate_g,
+    const at::Tensor& temp_intermediate_u,
+
+    const int act_function,
+
+    const at::Tensor& K_gate_arr,
+    const at::Tensor& K_up_arr,
+    const at::Tensor& K_down_arr,
+
+    const at::Tensor& gate_ptrs_trellis,
+    const at::Tensor& gate_ptrs_suh,
+    const at::Tensor& gate_ptrs_svh,
+    const at::Tensor& up_ptrs_trellis,
+    const at::Tensor& up_ptrs_suh,
+    const at::Tensor& up_ptrs_svh,
+    const at::Tensor& down_ptrs_trellis,
+    const at::Tensor& down_ptrs_suh,
+    const at::Tensor& down_ptrs_svh,
+
+    const bool gate_mcg,
+    const bool gate_mul1,
+    const bool up_mcg,
+    const bool up_mul1,
+    const bool down_mcg,
+    const bool down_mul1,
+
+    const float act_limit,
+    const int num_active,
+    const c10::optional<at::Tensor>& output_scratch,
+    const c10::optional<at::Tensor>& fused_base,
+    const int count_lo,
+    const int count_hi,
+    const int m_tile
+)
+{
+    exl3_moe_mixedk_impl(true,
+        hidden_state, output_state, expert_count, token_sorted,
+        weight_sorted, temp_state_g, temp_state_u, temp_intermediate_g,
+        temp_intermediate_u, act_function, K_gate_arr, K_up_arr,
+        K_down_arr, gate_ptrs_trellis, gate_ptrs_suh, gate_ptrs_svh,
+        up_ptrs_trellis, up_ptrs_suh, up_ptrs_svh, down_ptrs_trellis,
+        down_ptrs_suh, down_ptrs_svh, gate_mcg, gate_mul1,
+        up_mcg, up_mul1, down_mcg, down_mul1,
+        act_limit, num_active, output_scratch, fused_base,
+        count_lo, count_hi, m_tile);
 }

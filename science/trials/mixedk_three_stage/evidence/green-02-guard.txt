@@ -1,0 +1,9 @@
+test_distinct_three_stage_dispatch_and_same_cta_epilogues (test_candidate.FusionContracts.test_distinct_three_stage_dispatch_and_same_cta_epilogues) ... ok
+test_actual_caller_arguments_unchanged (test_guard.GuardTests.test_actual_caller_arguments_unchanged) ... ok
+test_decode_only_default_off_and_original_identity (test_guard.GuardTests.test_decode_only_default_off_and_original_identity) ... ok
+test_metadata_all_formats_and_scalar_rejections (test_guard.GuardTests.test_metadata_all_formats_and_scalar_rejections) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.047s
+
+OK

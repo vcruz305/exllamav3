@@ -1,0 +1,15 @@
+ownership_cases= 94 same_CTA_projection_groups= 194048
+test_distinct_three_stage_dispatch_and_same_cta_epilogues (test_candidate.FusionContracts.test_distinct_three_stage_dispatch_and_same_cta_epilogues) ... ok
+test_debug_build_poisons_actual_owned_intermediates (test_candidate.PoisonContracts.test_debug_build_poisons_actual_owned_intermediates) ... ok
+test_actual_caller_arguments_unchanged (test_guard.GuardTests.test_actual_caller_arguments_unchanged) ... ok
+test_decode_only_default_off_and_original_identity (test_guard.GuardTests.test_decode_only_default_off_and_original_identity) ... ok
+test_metadata_all_formats_and_scalar_rejections (test_guard.GuardTests.test_metadata_all_formats_and_scalar_rejections) ... ok
+test_all_rows_tiles_partial_tiers_duplicates_exclusions (test_ownership.OwnershipTests.test_all_rows_tiles_partial_tiers_duplicates_exclusions) ... ok
+test_compact_gather_source_and_tier_offsets (test_ownership.OwnershipTests.test_compact_gather_source_and_tier_offsets) ... ok
+test_incumbent_complete_K_topology_and_counterexample (test_ownership.OwnershipTests.test_incumbent_complete_K_topology_and_counterexample) ... ok
+test_stage_boundaries_and_shared_reuse_are_explicit (test_ownership.OwnershipTests.test_stage_boundaries_and_shared_reuse_are_explicit) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 5.512s
+
+OK

@@ -1,0 +1,21 @@
+{
+  "source": "existing derived local header table; not fresh raw headers or weights",
+  "sha256": "b861cd38b192c35729b83178885d6682f4c8fcc950685e113fa81d1e53199983",
+  "layers": 47,
+  "matrices": 36096,
+  "mixed_layers": 33,
+  "K2_counts": {
+    "4": 21381,
+    "6": 12049,
+    "8": 2665,
+    "10": 1
+  },
+  "outliers": [
+    {
+      "layer": "model.layers.46.mlp",
+      "expert": "148",
+      "projection": "down_proj",
+      "K2": 10
+    }
+  ]
+}

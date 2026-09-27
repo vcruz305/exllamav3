@@ -1,0 +1,26 @@
+test_all_rows_tiles_partial_tiers_duplicates_exclusions (test_ownership.OwnershipTests.test_all_rows_tiles_partial_tiers_duplicates_exclusions) ... ERROR
+test_compact_gather_source_and_tier_offsets (test_ownership.OwnershipTests.test_compact_gather_source_and_tier_offsets) ... ok
+test_incumbent_complete_K_topology_and_counterexample (test_ownership.OwnershipTests.test_incumbent_complete_K_topology_and_counterexample) ... ok
+test_stage_boundaries_and_shared_reuse_are_explicit (test_ownership.OwnershipTests.test_stage_boundaries_and_shared_reuse_are_explicit) ... ok
+
+======================================================================
+ERROR: test_all_rows_tiles_partial_tiers_duplicates_exclusions (test_ownership.OwnershipTests.test_all_rows_tiles_partial_tiers_duplicates_exclusions)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_ownership.py", line 91, in test_all_rows_tiles_partial_tiers_duplicates_exclusions
+    p,c,d=source_domain(counts,cap,lo,hi)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_ownership.py", line 52, in source_domain
+    b=evaluate(beg,tiles_n=n//256,tiles_k=k//32,bx=bx,num_slices=n//256)
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_ownership.py", line 22, in evaluate
+    return eval(expr, {'__builtins__':{},'MIN':min,'MAX':max},env)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 2
+    
+IndentationError: unexpected indent
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.019s
+
+FAILED (errors=1)

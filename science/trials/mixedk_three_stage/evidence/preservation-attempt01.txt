@@ -1,0 +1,19 @@
+test_all_had_codebooks_decoder_and_persistent_body_unchanged (test_preservation.PreservationTests.test_all_had_codebooks_decoder_and_persistent_body_unchanged) ... ok
+test_existing_35arg_abi_gather_and_pointer_types (test_preservation.PreservationTests.test_existing_35arg_abi_gather_and_pointer_types) ... ok
+test_gemm_pipeline_stores_and_accumulators_unchanged (test_preservation.PreservationTests.test_gemm_pipeline_stores_and_accumulators_unchanged) ... ok
+test_noop_and_existing_host_checks_preserved (test_preservation.PreservationTests.test_noop_and_existing_host_checks_preserved) ... FAIL
+test_rounding_activation_clamp_route_association (test_preservation.PreservationTests.test_rounding_activation_clamp_route_association) ... ok
+
+======================================================================
+FAIL: test_noop_and_existing_host_checks_preserved (test_preservation.PreservationTests.test_noop_and_existing_host_checks_preserved)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_preservation.py", line 60, in test_noop_and_existing_host_checks_preserved
+    self.assertEqual(old[old.index(begin):old.index(end)+len(end)],new[new.index(begin):new.index(end)+len(end)])
+AssertionError: '    [14071 chars]uh"\n\n// ---- Mixed-K launch tuning ---------[13705 chars]r();' != '    [14071 chars]uh"\n#include "exl3_moe_three_stage.cuh"\n\n//[13789 chars]r();'
+Diff is 28592 characters long. Set self.maxDiff to None to see it.
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.007s
+
+FAILED (failures=1)

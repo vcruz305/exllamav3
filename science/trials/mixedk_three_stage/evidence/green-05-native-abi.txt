@@ -1,0 +1,7 @@
+test_query_architecture_geometry_default_off_fallbacks (test_native_guard.NativeGuardTests.test_query_architecture_geometry_default_off_fallbacks) ... ok
+test_raw_pointer_tables_are_int64 (test_native_guard.NativeGuardTests.test_raw_pointer_tables_are_int64) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.011s
+
+OK

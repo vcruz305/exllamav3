@@ -1,0 +1,15 @@
+test_query_architecture_geometry_default_off_fallbacks (test_native_guard.NativeGuardTests.test_query_architecture_geometry_default_off_fallbacks) ... ok
+test_raw_pointer_tables_are_int64 (test_native_guard.NativeGuardTests.test_raw_pointer_tables_are_int64) ... FAIL
+
+======================================================================
+FAIL: test_raw_pointer_tables_are_int64 (test_native_guard.NativeGuardTests.test_raw_pointer_tables_are_int64)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_native_guard.py", line 50, in test_raw_pointer_tables_are_int64
+    self.assertFalse(guard(e),'non-int64 pointer table accepted: '+key)
+AssertionError: True is not false : non-int64 pointer table accepted: gate_ptrs_trellis
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.009s
+
+FAILED (failures=1)

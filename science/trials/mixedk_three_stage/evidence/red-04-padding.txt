@@ -1,0 +1,14 @@
+test_input_padding_and_sliced_weights_fall_back (test_guard.GuardTests.test_input_padding_and_sliced_weights_fall_back) ... FAIL
+
+======================================================================
+FAIL: test_input_padding_and_sliced_weights_fall_back (test_guard.GuardTests.test_input_padding_and_sliced_weights_fall_back)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\Victor Cruz\AppData\Local\hermes\cache\scratch\mimo-tune\mixedk-three-stage-candidate\test_guard.py", line 46, in test_input_padding_and_sliced_weights_fall_back
+    self.assertFalse(self.m.format_supported(l),'Padded input was incorrectly accepted')
+AssertionError: True is not false : Padded input was incorrectly accepted
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (failures=1)

@@ -1,0 +1,46 @@
+--- a/guarded_deferred.py
++++ b/guarded_deferred.py
+@@ -190,7 +190,7 @@
+     ap.add_argument('--guard', type=Path, required=True)
+     ap.add_argument('--guard-sha256', required=True)
+     ap.add_argument('--candidate', type=Path, required=True)
+-    ap.add_argument('--deferred-sha256', required=True, choices=('6eedae4b8c4afe86f340d58b63a4a9178d3c76cb7bee36cf4e02cb55eaa71b31', '00500630f3f875610d9e9f70d0a80d8f4237f2cf42cb626f6152f08c3d7ad83e'))
++    ap.add_argument('--deferred-sha256', required=True, choices=('29a870a4e11c55d185066df788402c283a46409ea08601758d721bb3eeeb1500',))
+     ap.add_argument('--receipt', type=Path, required=True)
+     ap.add_argument('--owner-lock', type=Path, required=True)
+     ap.add_argument('--seconds', type=int, default=1800)
+@@ -223,8 +223,10 @@
+         ap.error('seconds must be 1..1800')
+     pinned = {
+         'deferred_gpu.py': a.deferred_sha256,
+-        'build_trial.py': 'c6f5bea9a9fa956824eac2efd7c88e0ceda18a1833c42e8be88c57702c17b1b0',
+-        'gpu_reference.py': 'b4864bf94989b5982847cf73baf260592ca5fe052f1a1b3c1553bfb92c4776ae',
++        'build_trial.py': 'a4f10a7fc85596a57bccb9d764f573531ab735844ed23a4d160cfe3540eced0f',
++        'gpu_reference.py': '0cde9ed13e945cc4f79a5e4a8366a310c3820643fb44cfbb94fb85a235dd48eb',
++        'source-manifest.json': 'cf6a7cdb9392c50e771d651df94c9c13e7bf8cbbc27dbcf0fdd6900801bd6086',
++        'scalar_reference.py': 'c503fc9c3ef82f056b553c359e95bc6928c24dfb689fd057081d78c50823c7d5',
+     }
+     a.candidate = a.candidate.resolve()
+     for name, digest in pinned.items():
+@@ -249,6 +251,12 @@
+     build = importlib.util.module_from_spec(spec)
+     spec.loader.exec_module(build)
+     build.require_authorization()  # Preserve original MAX_JOBS/RTLD/platform checks.
++    admitted_paths = build.preflight_trial_paths(
++        a.candidate, trial_args.cache, trial_args.output,
++        [*trial_args.protected_root, a.guard.resolve(), Path(__file__).resolve()],
++        inventory_complete=trial_args.protected_roots_complete,
++        extra_writable=[a.receipt], shared_lock=a.owner_lock,
++    )
+     import fcntl
+     with a.owner_lock.open('a') as lock:
+         try:
+@@ -261,6 +269,8 @@
+                           candidate_path=str(a.candidate), candidate_hashes=pinned,
+                           owner_lock=str(a.owner_lock.resolve()), seconds=a.seconds,
+                           memory_policy=a.memory_policy,
++                          protected_roots=admitted_paths['protected'],
++                          protected_roots_complete=trial_args.protected_roots_complete,
+                           confirmations=dict(sole_gpu_owner=True, model_stopped=True, headroom_verified=True),
+                           note='Operator assertions are not proof of ownership; guard uses actual memory samples.')
+         (a.receipt / 'invocation.json').write_text(json.dumps(provenance, indent=2))
