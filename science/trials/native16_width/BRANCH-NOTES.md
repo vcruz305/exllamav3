@@ -11,6 +11,13 @@ the width attempt is a config/launch experiment, and nothing here alters a defau
   71 upstream originals re-hashed, 2 sealed core pins, 18 source witnesses, source pin
   `ca4a880e8918e1985fd25e06c6aff561666d3f14`; fail-closed controls behave (no token → 1,
   token without switch → 1, `--stage deploy` → 2, tampered pin → refusal).
+- The contract suites themselves are self-contained: run from this directory, the four
+  modules complete and pass. `python3 -B -m unittest -q test_trial_contract test_device_contract
+  test_device_docs test_trial_linux` → `Ran 63 tests … OK`, exit 0, on three consecutive runs
+  after this branch was committed. One earlier run of the same command failed a single test and
+  did not reproduce (4 of 5 runs clean); the package's own `GAPS.md` attributes that class of
+  flake to `G-PID-EXEC-RACE`, but the failing assertion was not captured, so treat that
+  attribution as plausible, not proven.
 - **It does not run from this branch alone.** The pin gate is the first thing it does, and it
   reads the sealed upstream trees that this package verifies. Observed from this directory:
 
