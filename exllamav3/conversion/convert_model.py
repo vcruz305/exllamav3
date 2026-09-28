@@ -18,6 +18,7 @@ from .allocation import create_q_strategy, create_q_strategy_from_recipe, print_
 from ..loader.safetensors_alt import save_file, safe_open
 import os, shutil
 import json
+import queue
 import threading
 from pathlib import Path
 from collections import deque
@@ -626,48 +627,46 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
     allow_grouping = state is not None and not args["verbose"] and not args.get("hessians")
     groups = group_quant_linears(linears, strategy, capture_H if allow_grouping else None)
 
-    # Split workload by group
-    all_dev_groups = [[] for _ in devices]
-
-    tot_numel = sum(linear.weights_numel() for linear in linears)
-    if device_ratios is None:
-        dev_numel = [tot_numel // len(devices) for _ in devices]
-    else:
-        tot_split = sum(device_ratios)
-        dev_numel = [tot_numel * r // tot_split for _, r in zip(devices, device_ratios)]
-
+    # Workers pull whole groups. Group membership, tensor order and the quantizer call are unchanged.
+    # There is no measured per-group cost table in this process, so the pull order is the existing
+    # group order. Size*K is not used as a cost. A queue cannot split a group that is already one task.
+    work_q = queue.Queue()
     for group in groups:
-        g_numel = sum(linear.weights_numel() for linear in group)
-        fit = [d_numel - g_numel for d_numel in dev_numel]
-        bestfit = max(range(len(fit)), key = lambda x: fit[x])
-        dev_numel[bestfit] -= g_numel
-        all_dev_groups[bestfit].append(group)
+        work_q.put(group)
 
     with progress_lock:
         curr_progress = 0
         max_progress = len(linears)
 
-    # Worker thread. An uncaught exception in a worker must abort the whole job: a thread that
-    # dies mid-module would otherwise leave its linears unquantized while the job carries on,
-    # compiling a broken model at the end with only a warning in the scrollback
+    # A worker that dies mid-module must abort the job. Do not commit a module with unquantized linears.
     errors = []
+    abort = threading.Event()
+    finished_keys = []
+    sched_debug = os.environ.get("EXL3_QUANT_SCHED_DEBUG") == "1"
+    device_busy = {}
 
-    def work_thread(device_idx, dev_groups):
+    def work_thread(device_idx):
         try:
-            work_thread_(device_idx, dev_groups)
+            work_thread_(device_idx)
         except BaseException as e:
             errors.append(e)
+            abort.set()
 
-    def work_thread_(device_idx, dev_groups):
+    def work_thread_(device_idx):
         global curr_progress
-
+        busy = 0.0
+        work_numel = 0
         with torch.inference_mode():
-            t0 = time.time()
-            work_numel = sum(l.weights_numel() for g in dev_groups for l in g)
-
-            for group in dev_groups:
+            while not abort.is_set():
+                try:
+                    group = work_q.get_nowait()
+                except queue.Empty:
+                    break
+                t0 = time.time()
                 if len(group) > 1:
                     quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
+                    for quant_args_local in quant_args_list:
+                        quant_args_local["scoped_generator"] = True
                     proxy_errs = convert_exl3_group(
                         group,
                         [capture_H[l.qmap] for l in group],
@@ -679,38 +678,46 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                         print_quantized_linear(config, linear, quant_args_local, proxy_err)
                         with progress_lock:
                             curr_progress += 1
-                    continue
+                            finished_keys.append(linear.key)
+                else:
+                    linear = group[0]
+                    quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
+                    quant_args_local["scoped_generator"] = True
+                    H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
+                    proxy_err = linear.convert_exl3(
+                        H_data_,
+                        quant_args = quant_args_local,
+                        verbose = args["verbose"],
+                        save_reg = False,
+                        override_swap_device = device_idx
+                    )
+                    assert isinstance(linear.inner, LinearEXL3)
+                    linear.inner.swap_cpu()
+                    print_quantized_linear(config, linear, quant_args_local, proxy_err)
+                    with progress_lock:
+                        curr_progress += 1
+                        finished_keys.append(linear.key)
+                elapsed = time.time() - t0
+                busy += elapsed
+                work_numel += sum(l.weights_numel() for l in group)
+                if sched_debug:
+                    ks = sorted({strategy[l.key] for l in group})
+                    print(
+                        f" -- quant-sched device={device_idx} tensors={len(group)} "
+                        f"K={ks} in={group[0].in_features} out={group[0].out_features} "
+                        f"s={elapsed:.3f}",
+                        flush = True,
+                    )
+            if work_numel:
+                torch.cuda.synchronize(torch.device(device_idx))
+                auto_split.report("quant_thread", device_idx, work_numel, busy if busy > 0 else 1e-6)
+        device_busy[device_idx] = busy
 
-                linear = group[0]
-                quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
-
-                H_data_, quant_args_local["H_out"] = get_H_data(args, linear, capture_H, state)
-                proxy_err = linear.convert_exl3(
-                    H_data_,
-                    quant_args = quant_args_local,
-                    verbose = args["verbose"],
-                    save_reg = False,
-                    override_swap_device = device_idx
-                )
-                assert isinstance(linear.inner, LinearEXL3)
-                linear.inner.swap_cpu()
-
-                print_quantized_linear(config, linear, quant_args_local, proxy_err)
-                with progress_lock:
-                    curr_progress += 1
-
-            # The device is idle from here until the slowest thread finishes; its measured speed
-            # steers the next module's split
-            torch.cuda.synchronize(torch.device(device_idx))
-            auto_split.report("quant_thread", device_idx, work_numel, time.time() - t0)
-
-    # Launch
     threads = []
-    for i, device_idx in enumerate(devices):
-        if len(all_dev_groups[i]):
-            t = threading.Thread(target = work_thread, args = (device_idx, all_dev_groups[i]))
-            t.daemon = True
-            threads.append(t)
+    for device_idx in devices:
+        t = threading.Thread(target = work_thread, args = (device_idx,))
+        t.daemon = True
+        threads.append(t)
     for t in threads:
         t.start()
 
@@ -727,14 +734,25 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
         print("Aborted.")
         sys.exit()
 
+    for t in threads:
+        t.join()
+
     if errors:
-        # Abort immediately (the other workers' remaining groups are wasted work); the traceback
-        # of the failing worker is what the user needs to see
         print(f" !! Quantization worker failed, aborting job")
         raise errors[0]
 
-    for t in threads:
-        t.join(timeout = 0.1)
+    if len(finished_keys) != len(linears) or len(set(finished_keys)) != len(linears):
+        raise RuntimeError(
+            f"Refusing incomplete module commit: quantized {len(set(finished_keys))} of {len(linears)} linears"
+        )
+
+    if sched_debug and device_busy:
+        finishes = sorted(device_busy.values())
+        tail = finishes[-1] - finishes[0] if len(finishes) > 1 else 0.0
+        print(
+            f" -- quant-sched busy={','.join(f'{d}:{device_busy[d]:.1f}' for d in sorted(device_busy))} tail={tail:.1f}s",
+            flush = True,
+        )
 
 
 def check_bad_rows(bad_rows, num_rows, max_fraction = 0.10):
