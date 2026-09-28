@@ -420,6 +420,11 @@ void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
                     if (size_m > 16)      { moe_gemm_tile<0, cb, 32, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 32; }
                     else                  { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
                 }
+                else if constexpr (M_TILE == 8)
+                {
+                    if (size_m > 8)       { moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16; }
+                    else                  { moe_gemm_tile<0, cb, 8, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 8; }
+                }
                 else
                 {
                     moe_gemm_tile<0, cb, 16, MOE_TILESIZE_N, SH, FS>(in_addr, trellis, out_addr, size_m, size_k, size_n, locks, K); tm = 16;

@@ -53,6 +53,12 @@ MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
 # Experimental: elide only the handled-set readback when no host fallback will run.
 # Keep counts_fused, num_active, row tiles and all CUDA launch geometry unchanged.
 MIXEDK_ELIDE_HANDLED = os.environ.get("EXL3_MOE_MIXEDK_ELIDE_HANDLED", "0") == "1"
+# Workstream E: sync-free unified mixed-K decode (default off). When every expert's row count is
+# bounded by the m16 tier (num_tokens <= MTILE_T1), count assignments on the device with a
+# scatter-add (torch.bincount reads input.max() back to the host) and launch at the temp-buffer
+# concurrency instead of reading the in-range expert count back (_ec[_m].tolist()). Launch grid is
+# unchanged whenever that count >= concurrency, which holds for top_k >= num_sms / 8.
+MIXEDK_NOSYNC = os.environ.get("EXL3_MOE_MIXEDK_NOSYNC", "0") == "1"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
@@ -1221,7 +1227,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Count how many assignments per expert. With few enough total assignments no
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+                _nosync = MIXEDK_NOSYNC and mixedk_unified_ok and num_tokens <= MTILE_T1 and \
+                    getattr(self, "_mkd_bufs", None) is not None
+                if _nosync:
+                    expert_count = torch.zeros((E + 1,), dtype = torch.long, device = y.device)
+                    expert_count.scatter_add_(0, flat_expert_local, torch.ones_like(flat_expert_local))
+                else:
+                    expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
                 elif mixedk_unified_ok and num_tokens * top_k <= getattr(self, "_mkd_fused_rows", TEMP_ROWS_FUSED):
@@ -1401,6 +1413,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     # Count active experts within fused row cap
                     if expert_count_list is not None:
                         counts_fused = [c for c in expert_count_list[:num_ex] if 0 < c <= _mkd_rows]
+                    elif _nosync:
+                        # Placeholder list of the right length for the launch below: every expert
+                        # is in the m16 tier (count <= num_tokens <= MTILE_T1), and num_active only
+                        # sizes the grid, which saturates at the buffer concurrency
+                        counts_fused = [1] * int(self._mkd_bufs.temp_state_g.shape[0])
                     else:
                         # GPU fast path — small readback of just the fused count
                         _ec = expert_count[:num_ex]

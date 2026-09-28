@@ -39,7 +39,8 @@ void exl3_gemm_kernel_inner
     int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
 )
 {
-    const int TILEBLOCKS_M = TILESIZE_M / 16;
+    // TILESIZE_M == 8 (E: decode rows 1..8): one m16 fragment whose upper 8 rows alias rows 0..7
+    const int TILEBLOCKS_M = TILESIZE_M < 16 ? 1 : TILESIZE_M / 16;
     if (size_n_stride == 0) size_n_stride = size_n;
     // Column blocks of the full-width B row: slices index B relative to their own column offset,
     // but a k-tile row still spans the whole matrix
@@ -66,7 +67,7 @@ void exl3_gemm_kernel_inner
 
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
-    static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
+    static_assert(TILESIZE_M == 8 || (TILESIZE_M >= 16 && TILESIZE_M % 16 == 0), "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
@@ -293,6 +294,7 @@ void exl3_gemm_kernel_inner
             for (int m = 0; m < TILEBLOCKS_M; ++m)
             {
                 int R = r + m * 16;
+                if constexpr (TILESIZE_M < 16) R &= (TILESIZE_M - 1);
                 int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
                 ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
             }

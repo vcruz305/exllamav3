@@ -11,6 +11,9 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n256_cb2();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_m32();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_m64();
+// E: 8-row decode tile, mul1 codebook (EXL3_MK_M8=1)
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_m8();
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n256_cb2_m8();
 // Deeper-pipeline m16 / n128 / mul1 variants (see exl3_moe.cu: EXL3_MK_SHPIPE)
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_sh4fs3();
 fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_n128_cb2_sh6fs5();

@@ -586,6 +586,12 @@ fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m64[] =
     exl3_moe_mixedk_kernel_n128_cb2_m64()
 };
 
+// E: 8-row decode tile (mul1 only), [N_off]
+fp_exl3_moe_mixedk_kernel exl3_moe_mixedk_kernel_instances_m8[] =
+{
+    exl3_moe_mixedk_kernel_n128_cb2_m8(), exl3_moe_mixedk_kernel_n256_cb2_m8()
+};
+
 void exl3_moe_mixedk
 (
     const at::Tensor& hidden_state,
@@ -735,6 +741,10 @@ void exl3_moe_mixedk
     if (m_tile <= 16)
     {
         kernel = exl3_moe_mixedk_kernel_instances[2 * cb_idx + N_off];
+        // E: EXL3_MK_M8=1 swaps in the 8-row tile (experts with 9..16 rows still take m16 tiles
+        // inside it). Read per launch so one load can A/B it. Default off.
+        if (cb_idx == 1 && exl3_moe_env_int("EXL3_MK_M8", 0) == 1)
+            kernel = exl3_moe_mixedk_kernel_instances_m8[N_off];
     }
     else
     {
