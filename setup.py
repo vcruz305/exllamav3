@@ -49,6 +49,12 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
 
+# Experimental: EXL3_MAX_BSZN=N raises the fused decode (bszN) row cap (default 8); the Python
+# side must then run with EXL3_MAX_BSZN_PY=N to match
+if _mb := os.environ.get("EXL3_MAX_BSZN"):
+    extra_cflags += [f"-DMAX_BSZN={int(_mb)}"]
+    extra_cuda_cflags += [f"-DMAX_BSZN={int(_mb)}"]
+
 extra_compile_args = {
     "cxx": extra_cflags,
     "nvcc": extra_cuda_cflags,

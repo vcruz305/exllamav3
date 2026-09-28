@@ -8,7 +8,9 @@ namespace py = pybind11;
 #include "linear.h"
 #include "../graph.cuh"
 
+#ifndef MAX_BSZN
 #define MAX_BSZN 8   // must match MAX_BSZN in blocksparse_mlp.h / BlockSparseMLP.py
+#endif
 
 // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
 // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr

@@ -53,7 +53,58 @@ MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
 # Experimental: elide only the handled-set readback when no host fallback will run.
 # Keep counts_fused, num_active, row tiles and all CUDA launch geometry unchanged.
 MIXEDK_ELIDE_HANDLED = os.environ.get("EXL3_MOE_MIXEDK_ELIDE_HANDLED", "0") == "1"
-MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# P1 (workstream A port): size the unified mixed-K grid from the temp-buffer concurrency instead of
+# the per-layer `_ec[_m].tolist()` readback. Grid-preserving whenever the in-range expert count is
+# >= concurrency; below that the grid (and the fp reduction order per expert) differs. Default off.
+MIXEDK_NO_READBACK = os.environ.get("EXL3_MOE_MIXEDK_NO_READBACK", "0") != "0"
+# Workstream A telemetry: distinct experts per forward on the unified mixed-K layers, bucketed by
+# row count (1..CENSUS_MAX_ROWS). Device-side accumulation only (no sync); read with
+# expert_census_snapshot(). Default off.
+EXPERT_CENSUS = os.environ.get("EXL3_EXPERT_CENSUS", "0") == "1"
+CENSUS_MAX_ROWS = 16
+_census_acc = {}
+
+
+def expert_census_add(selected_experts, num_experts, device):
+    rows = selected_experts.shape[0]
+    if rows > CENSUS_MAX_ROWS:
+        return
+    acc = _census_acc.get(device)
+    if acc is None:
+        acc = torch.zeros((CENSUS_MAX_ROWS + 1, 2), dtype = torch.float, device = device)
+        _census_acc[device] = acc
+    sel = selected_experts.reshape(-1)
+    present = torch.zeros((num_experts + 1,), dtype = torch.float, device = device)
+    present.index_fill_(0, sel.clamp(0, num_experts), 1.0)
+    acc[rows, 0] += present[:num_experts].sum()
+    acc[rows, 1] += 1.0
+
+
+def expert_census_snapshot(reset = True):
+    """{rows: [sum_distinct, layer_calls]} summed over devices; syncs."""
+    out = {}
+    for dev, acc in _census_acc.items():
+        a = acc.cpu().tolist()
+        for r, (sd, n) in enumerate(a):
+            if n > 0:
+                o = out.setdefault(r, [0.0, 0.0])
+                o[0] += sd; o[1] += n
+        if reset:
+            acc.zero_()
+    return out
+
+
+def _mixedk_launch_plan(expert_count_list, num_ex, row_cap, concurrency, no_readback):
+    """(counts_fused, num_active); (None, None) = caller falls back to the device readback."""
+    if expert_count_list is not None:
+        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= row_cap]
+        return counts, len(counts)
+    if not no_readback:
+        return None, None
+    return None, int(concurrency)
+
+
+MAX_BSZN = int(os.environ.get("EXL3_MAX_BSZN_PY", "0") or 0) or 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 
 @dataclass
 class FusedBuffers:
@@ -1159,6 +1210,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
         # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
+        if EXPERT_CENSUS and mixedk_unified_ok and not params.get("autosplit_measure"):
+            expert_census_add(selected_experts, self.num_experts, selected_experts.device)
+
         cpu_partial = None
         cpu_pending = None
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
@@ -1398,15 +1452,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             temp_intermediate_u=g_tensor_cache.get(self.device, (C_max, R, I), torch.half, "mkd_interm_u"),
                         )
                     _mkd_rows = self._mkd_fused_rows
-                    # Count active experts within fused row cap
-                    if expert_count_list is not None:
-                        counts_fused = [c for c in expert_count_list[:num_ex] if 0 < c <= _mkd_rows]
-                    else:
+                    # Count active experts within fused row cap (P1: optionally without readback)
+                    counts_fused, _active = _mixedk_launch_plan(
+                        expert_count_list, num_ex, _mkd_rows,
+                        self._mkd_bufs.temp_state_g.shape[0], MIXEDK_NO_READBACK)
+                    if _active is None:
                         # GPU fast path — small readback of just the fused count
                         _ec = expert_count[:num_ex]
                         _m = (_ec > 0) & (_ec <= _mkd_rows)
                         counts_fused = _ec[_m].tolist()
-                    if counts_fused:
+                        _active = len(counts_fused)
+                    if _active:
                         def run_mixedk_fused(num_active, count_lo=1, count_hi=_mkd_rows, m_tile=16):
                             ext.exl3_moe_mixedk(
                                 y,
@@ -1442,8 +1498,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 scratch, tables[0] if tables is not None else None,
                                 count_lo, count_hi, m_tile,
                             )
-                        t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2)
-                        t2 = sum(1 for c in counts_fused if c > MTILE_T2)
+                        t1 = sum(1 for c in counts_fused if MTILE_T1 < c <= MTILE_T2) if counts_fused else 0
+                        t2 = sum(1 for c in counts_fused if c > MTILE_T2) if counts_fused else 0
                         if self._mkd_mtile_ok and (t1 or t2):
                             t0 = len(counts_fused) - t1 - t2
                             if t2:
@@ -1453,7 +1509,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             if t0:
                                 run_mixedk_fused(t0, 1, MTILE_T1, 16)
                         else:
-                            run_mixedk_fused(len(counts_fused))
+                            run_mixedk_fused(_active)
                         # Mark ALL experts with tokens as handled (fused kernel processes them)
                         if expert_count_list is not None:
                             for e in range(num_ex):

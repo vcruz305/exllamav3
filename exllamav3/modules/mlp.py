@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from typing_extensions import override
 import torch
 import torch.nn.functional as F
@@ -12,7 +13,7 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 
-MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+MAX_BSZN = int(os.environ.get("EXL3_MAX_BSZN_PY", "0") or 0) or 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
 class MLP(Module):
 

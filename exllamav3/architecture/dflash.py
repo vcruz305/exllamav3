@@ -71,6 +71,18 @@ class DFlashConfig(Config):
         assert len(set(self.target_layer_ids)) == len(self.target_layer_ids), \
             "DFlash target_layer_ids must be unique"
         self.block_size = self.read_cfg(int, ["block_size", "dflash_config->block_size"], no_default)
+        # Experimental (default off): EXL3_DFLASH_BLOCK=N runs the drafter with an N-wide mask block
+        # (N-1 proposals per round) instead of the trained block_size. Everything downstream (mask
+        # rows, bidirectional window_right, default_draft_size, generator widths/reserve) derives
+        # from block_size, so this is the single switch. The checkpoint was trained at
+        # trained_block_size; positions past it are out of distribution and must be measured.
+        self.trained_block_size = self.block_size
+        import os as _os
+        _nb = int(_os.environ.get("EXL3_DFLASH_BLOCK", "0") or 0)
+        if _nb > 0 and _nb != self.block_size:
+            assert 2 <= _nb <= 64, "EXL3_DFLASH_BLOCK must be in [2, 64]"
+            print(f" -- DFlash: EXL3_DFLASH_BLOCK={_nb} overrides trained block_size={self.block_size}")
+            self.block_size = _nb
 
         # Variant switches for drafters other than the original z-lab ones (e.g. MiMo-V2.6's).
         # Each defaults to the previous behaviour.
@@ -305,6 +317,24 @@ class DFlashModel(Model):
         self.draft_verifier_params.update({
             "export_state_layers": set(config.target_layer_ids),
         })
+
+
+    def set_block_size(self, block_size: int):
+        """
+        Experimental: switch the drafted mask block width at runtime (block_size - 1 proposals).
+        Updates every place the width is read from: the mask rows, the bidirectional right
+        window of the sliding layers and the default draft size. The generator's pinned draft
+        buffer must already be at least block_size - 1 wide (build the generator with
+        num_draft_tokens >= block_size - 1, or load with EXL3_DFLASH_BLOCK set).
+        """
+        assert block_size >= 2
+        cfg = self.config
+        cfg.block_size = block_size
+        self.input_layer.native_draft_len = block_size
+        for idx, attn in enumerate(self.attn_modules):
+            is_swa = cfg.layer_types[idx] == "sliding_attention"
+            attn.window_right = (block_size - 1) if (is_swa and cfg.bidirectional_block) else 0
+        self.caps["default_draft_size"] = block_size - 1
 
 
     def attach_to(self, target):

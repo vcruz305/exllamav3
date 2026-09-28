@@ -42,6 +42,30 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
     return concat_strings, offsets
 
 
+def draft_round_stats(draft_stats) -> dict:
+    """Turn per-round draft records into tokens-per-verify-pass telemetry.
+
+    Draft acceptance on its own cannot distinguish "short window, well accepted" from "long
+    window, poorly accepted", yet bytes per token - and therefore decode speed under speculation -
+    depends on the number of draft positions that reach the target in one forward. Each record is
+    (new_tokens, draft_window, accepted - 1) as appended by Generator.iterate_draftmodel_* and the
+    MTP path, i.e. `accepted` is the number of leading matches in that round, so tokens verified
+    per pass is 1 + mean(accepted).
+    """
+    if not draft_stats:
+        return {}
+    windows = [int(s[1]) for s in draft_stats]
+    accepted = [int(s[2]) for s in draft_stats]
+    return {
+        "draft_rounds": len(draft_stats),
+        "draft_window_mean": sum(windows) / len(windows),
+        "draft_window_min": min(windows),
+        "draft_window_max": max(windows),
+        "draft_accepted_mean": sum(accepted) / len(accepted),
+        "tokens_per_pass": 1.0 + sum(accepted) / len(accepted),
+    }
+
+
 class Job:
 
     def __init__(
@@ -781,6 +805,11 @@ class Job:
                         "accepted_draft_tokens": self.accepted_draft_tokens,
                         "rejected_draft_tokens": self.rejected_draft_tokens
                     })
+                    # Per-round draft telemetry, so the acceptance ratio can be turned into
+                    # tokens-per-verify-pass: the ratio alone cannot distinguish "short window,
+                    # well accepted" from "long window, poorly accepted", and tokens per pass is
+                    # what sets bytes per token and therefore decode speed under speculation.
+                    r.update(draft_round_stats(self.draft_stats))
                 if eos_reason == "stop_string":
                     self.held_text = rem_held_text
                 rh = {}
@@ -1050,6 +1079,7 @@ class Job:
             "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
+            **draft_round_stats(self.draft_stats),
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
