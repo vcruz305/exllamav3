@@ -111,6 +111,31 @@ def _mixedk_launch_plan(expert_count_list, num_ex, row_cap, concurrency, no_read
 
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# Cooperative decode kernels for unified mixed-K layers (default off). At decode and verify shapes
+# (bsz <= MAX_BSZN) a mixed-K layer runs through the two-stage cooperative kernels the uniform-K
+# layers use (exl3_moe_coop), with each expert's gate / up / down bitrate read from a device table
+# instead of fixed per launch (ext.CoopMK): no sort, count, slot tables or gather, and no host
+# synchronization. Larger batches and layers the kernels do not cover keep the unified mixed-K
+# path (and EXL3_MOE_MIXEDK_NOSYNC there). The routed sum is accumulated in a different order
+# than the unified kernel's, so outputs are not bit-identical to it. EXL3_COOPMK_PLAN selects the
+# kernel variant set (1 all-K, 2 split by decode kind, 3 all-K capped at 64 registers, 4 split
+# capped at 64); 3 was fastest per call on the tested pack
+COOP_MIXEDK = os.environ.get("EXL3_MOE_COOP_MIXEDK", "0") == "1"
+COOPMK_PLAN = int(os.environ.get("EXL3_COOPMK_PLAN", "3"))
+_coopmk_warned = False
+
+
+def _coopmk_module():
+    """The extension module with the CoopMK kernels, or None for a build without them. Only
+    consulted when EXL3_MOE_COOP_MIXEDK=1"""
+    global _coopmk_warned
+    if hasattr(ext, "CoopMK"):
+        return ext
+    if not _coopmk_warned:
+        _coopmk_warned = True
+        print(" !! EXL3_MOE_COOP_MIXEDK=1 but this exllamav3_ext build has no CoopMK kernels; "
+              "mixed-K layers keep the unified path")
+    return None
 
 @dataclass
 class FusedBuffers:
@@ -543,6 +568,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.bc = None
         self.bc_sh_exp = False
+        self.coopmk = None
+        self.coopmk_out = None
         self.fused_mode_buffers = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
@@ -906,6 +933,79 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 )
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
+        self._coopmk_setup()
+
+
+    def _coopmk_setup(self):
+        """Bind the cooperative runtime-K decode kernels to this unified mixed-K layer
+        (EXL3_MOE_COOP_MIXEDK=1). self.coopmk stays None, and the layer keeps the unified mixed-K
+        path, whenever the layer is outside what the kernels implement"""
+        self.coopmk = None
+        self.coopmk_out = None
+        if not (COOP_MIXEDK and getattr(self, "mixedk_unified", False)):
+            return
+        # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
+        # requires the last), whole expert range on this device
+        if not self.gated or self.activation_fn not in ("silu", "gelu"):
+            return
+        if self.mixedk_mcg or not self.mixedk_mul1:
+            return
+        if self.num_local_experts != self.num_experts or self.cpu_split_first is not None:
+            return
+        ks = [l.inner.K for l in self.gates + self.ups + self.downs]
+        if any(float(k) != int(k) or not 1 <= int(k) <= 8 for k in ks):
+            return
+        H = self.expert_size
+        Hi = self.ups[0].in_features
+        I = self.intermediate_size_padded
+        Ho = self.downs[0].out_features
+        slots = MAX_BSZN * self.num_experts_per_tok
+        if Hi % 128 or I % 128 or Ho % 128 or H > Ho or H > Hi or slots > 256:
+            return
+        m = _coopmk_module()
+        if m is None:
+            return
+        device = self.device
+        interm = self.interm_dtype if self.interm_dtype in (torch.half, torch.float) else torch.half
+        buf = lambda shape, dtype, name: g_tensor_cache.get(device, shape, dtype, name)
+        ctr = buf((slots * (I // 128) + MAX_BSZN * (Ho // 128) + 2 + (slots + 1) + slots,), torch.int, "coopmk_ctr")
+        ctr.zero_()
+        out = buf((MAX_BSZN, H), torch.float, "coopmk_out")
+        k_tab = lambda ls: torch.tensor([int(l.inner.K) for l in ls], dtype = torch.int32)
+        self.coopmk = m.CoopMK(
+            Hi,
+            self.mixedk_ptrs_gate_trellis, self.mixedk_ptrs_gate_suh, self.mixedk_ptrs_gate_svh,
+            self.mixedk_ptrs_up_trellis, self.mixedk_ptrs_up_suh, self.mixedk_ptrs_up_svh,
+            self.mixedk_ptrs_down_trellis, self.mixedk_ptrs_down_suh, self.mixedk_ptrs_down_svh,
+            None, None, None,
+            k_tab(self.gates), k_tab(self.ups), k_tab(self.downs),
+            bool(self.mixedk_mcg), bool(self.mixedk_mul1),
+            0 if self.activation_fn == "silu" else 1,
+            float(self.act_limit),
+            True,
+            buf((slots, Hi), torch.half, "coopmk_had_g"),
+            buf((slots, Hi), torch.half, "coopmk_had_u"),
+            buf((slots, I), interm, "coopmk_gu_g"),
+            buf((slots, I), interm, "coopmk_gu_u"),
+            buf((slots, I), torch.half, "coopmk_act"),
+            buf((slots, Ho), torch.float, "coopmk_d_out"),
+            ctr, out,
+            None,
+            -1, -1,
+            COOPMK_PLAN,
+        )
+        self.coopmk_out = out
+        print(f" -- Mixed-K coop decode kernels in {self.key}: plan {self.coopmk.plan}, "
+              f"variants A {self.coopmk.stage_variants(0)} B {self.coopmk.stage_variants(1)}")
+
+
+    def _coopmk_forward(self, y, selected_experts, routing_weights, eshape):
+        """Routed sum of bsz <= MAX_BSZN tokens through the cooperative runtime-K kernels: two
+        launches (three at bsz > 1), launch-only, no host synchronization"""
+        bsz = y.shape[0]
+        self.coopmk.run(y, selected_experts.contiguous(), routing_weights.contiguous(), None, -1, -1, -1)
+        return self.coopmk_out[:bsz].view(eshape)
+
 
     def load_routing(self, **kwargs):
 
@@ -1111,6 +1211,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def unload(self):
         self.cpu_unload()
         self.bc = None
+        self.coopmk = None
+        self.coopmk_out = None
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1230,6 +1332,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # Unified mixed-K layer at a decode / verify shape: cooperative runtime-K kernels
+        # (EXL3_MOE_COOP_MIXEDK=1; self.coopmk is only bound when the layer qualifies)
+        elif (
+            self.coopmk is not None and bsz <= MAX_BSZN and y.dtype == torch.half and
+            selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
+            selected_experts.shape[-1] == self.num_experts_per_tok
+        ):
+            final_hidden_states = self._coopmk_forward(y, selected_experts, routing_weights, eshape)
 
         # Torch/C++/fused path
         elif (
