@@ -1421,17 +1421,30 @@ class Job:
                         self.mtp_last_hidden = seq.mtp_carry_hidden
                     else:
                         shifted_hidden = None
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = {
-                            "target_hidden": shifted_hidden,
-                            "attn_mode": "flash_attn",
-                            "block_table": seq.block_index_tensor,
-                            "cache": self.generator.draft_cache,
-                            "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                            "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
-                        }
-                    )
+                    if self.generator.mtp_draft and self.generator.draft_model.caps.get("mtp_multi"):
+                        # Multi-layer MTP (MiMo-V2): paired trunk states for positions
+                        # prefill_start .. prefill_end (the new carry pairs with prefill_end); the
+                        # head finalizes every draft-cache entry whose tokens are all committed
+                        self.generator.draft_model.multi_prefill(
+                            self,
+                            seq,
+                            prefill_start,
+                            torch.cat((shifted_hidden, seq.mtp_carry_hidden), dim = 1),
+                            self.generator.draft_cache,
+                            self.generator.num_draft_tokens,
+                        )
+                    else:
+                        self.generator.draft_model.prefill(
+                            input_ids = prefill_ids,
+                            params = {
+                                "target_hidden": shifted_hidden,
+                                "attn_mode": "flash_attn",
+                                "block_table": seq.block_index_tensor,
+                                "cache": self.generator.draft_cache,
+                                "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                                "indexed_embeddings": self.embeddings if self.generator.mtp_draft else None,
+                            }
+                        )
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the

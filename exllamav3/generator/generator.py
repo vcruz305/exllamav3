@@ -551,6 +551,9 @@ class Generator:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
+            elif self.mtp_draft and self.draft_model.caps.get("mtp_multi"):
+                draft_tokens = self.iterate_draftmodel_mtp_multi_gen(results)
+                self.iterate_gen(results, draft_tokens)
             elif self.mtp_draft:
                 draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -824,6 +827,45 @@ class Generator:
                 "window": window,
             }
 
+        return self.draft_ids_pinned[:, :window]
+
+
+    def iterate_draftmodel_mtp_multi_gen(self, results: list):
+        """
+        Multi-layer MTP drafting (MiMo-V2 nextn, DeepSeek-V3 semantics): MTP layer k drafts token
+        k + 1 from the trunk state of the current position and the previous k drafts; see
+        MiMoV2MTPModel.multi_draft. One draft row per job; rows are cut to the shortest window.
+        """
+        self._draft_conf_round = None
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if not jobs:
+            return None
+        for job in jobs:
+            assert len(job.sequences) == 1, "MTP drafting does not currently support CFG/multi-sequence jobs"
+            if job.mtp_last_hidden is None or getattr(job, "mtp_multi", None) is None:
+                return None
+        for job in jobs:
+            if job.time_first_token is None:
+                cuda_sync_active()
+                job.time_first_token = time.time()
+
+        cal = self.draft_calibrator
+        rows, confs = [], []
+        for job in jobs:
+            d, c = self.draft_model.multi_draft(job, job.sequences[0], self.draft_cache, self.num_draft_tokens, cal)
+            rows.append(d)
+            confs.append(c)
+        window = min(len(r) for r in rows)
+        if window == 0:
+            return None
+        for i, r in enumerate(rows):
+            self.draft_ids_pinned[i, :window] = torch.tensor(r[:window], dtype = self.draft_ids_pinned.dtype)
+        if cal is not None and all(c is not None and len(c) >= window for c in confs):
+            self._draft_conf_round = {
+                "ids": self.draft_ids_pinned[:len(jobs), :window],
+                "conf": torch.tensor([c[:window] for c in confs], dtype = torch.float),
+                "window": window,
+            }
         return self.draft_ids_pinned[:, :window]
 
 
@@ -1366,6 +1408,7 @@ class Generator:
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.mtp_draft:
             target_hidden = p_export_states[-1]
+            mtp_multi = self.draft_model.caps.get("mtp_multi")
             accepted_idx = 0
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx:
@@ -1377,6 +1420,19 @@ class Generator:
                 # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
                 # window into the draft cache
                 if id(job) in rewound_jobs:
+                    continue
+
+                # Multi-layer MTP: record the accepted positions' trunk states; the draft cache
+                # entries are (re)computed by the next drafting round
+                if mtp_multi:
+                    self.draft_model.multi_push_hidden(
+                        job,
+                        int(p_cache_seqlens[a_idx]) + 1,
+                        target_hidden[a_idx:b_idx, :accepted_length, :],
+                    )
+                    job.mtp_last_hidden = target_hidden[
+                        a_idx:b_idx, accepted_length - 1:accepted_length, :
+                    ].clone()
                     continue
 
                 # Position K was drafted from the last target state already. Replace accepted

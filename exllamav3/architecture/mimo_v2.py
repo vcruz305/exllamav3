@@ -10,6 +10,7 @@ from ..modules import (
 )
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
+import os as _os
 
 # MiMo-V2's fused qkv_proj is stored as the concatenation of `ckpt_tp` tensor-parallel shards,
 # each laid out [q_shard; k_shard; v_shard], and its FP8 weight_scale_inv grid is computed per
@@ -82,9 +83,10 @@ class MiMoV2Config(Config):
         directory: str,
         **kwargs,
     ):
+        from .mimo_v2_mtp import MiMoV2MTPModel
         super().__init__(
             directory,
-            {"text": MiMoV2Model},
+            {"text": MiMoV2Model, "mtp": MiMoV2MTPModel},
             **kwargs
         )
 
@@ -169,6 +171,19 @@ class MiMoV2Config(Config):
             RopeStyle.NEOX,
             theta_key = ["swa_rope_theta", "rope_theta", "rope_parameters->rope_theta"],
         )
+
+        # MTP (nextn) head, model.mtp.layers.{k}. EXL3 packs converted from the source checkpoint
+        # carry none of these tensors (the source repo ships them as a separate
+        # model_mtp.safetensors); EXL3_MIMO_MTP_PATH adds that file (or a directory of them) to
+        # the tensor collection. The component only exists when the tensors are present
+        self.num_mtp_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        mtp_path = _os.environ.get("EXL3_MIMO_MTP_PATH", "").strip()
+        if mtp_path and self.num_mtp_layers:
+            self.stc.add_tensor_files(mtp_path)
+        if self.num_mtp_layers == 0 or not any(
+            self.stc.has_tensor(f"model.mtp.layers.0.eh_proj.{t}") for t in ("weight", "trellis")
+        ):
+            del self.model_classes["mtp"]
 
 
     def qkv_dequant(self, layer_idx: int):
