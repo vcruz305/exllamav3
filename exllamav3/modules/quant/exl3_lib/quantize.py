@@ -1020,6 +1020,36 @@ def ldlq_batched(
 
 
 finalize_capture_H_mutex = threading.Lock()
+_rng_tls = threading.local()
+
+
+def _note_reseed(quant_args):
+    """Reseed this tensor's draws. A scoped generator does not call torch.manual_seed, which reseeds every device and other workers."""
+    if "seed" not in quant_args:
+        return
+    if quant_args.get("scoped_generator"):
+        _rng_tls.seed = int(quant_args["seed"])
+        _rng_tls.gens = {}
+        return
+    torch.manual_seed(quant_args["seed"])
+
+
+def _sign_flip(n, device, quant_args):
+    """First draw after _note_reseed on a device, then the next draw on that same device. Same seed rule as torch.manual_seed(quant_args['seed'])."""
+    if not quant_args.get("scoped_generator"):
+        return (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float)
+    dev = torch.device(device)
+    key = (dev.type, dev.index)
+    gens = getattr(_rng_tls, "gens", None)
+    if gens is None:
+        gens = {}
+        _rng_tls.gens = gens
+    g = gens.get(key)
+    if g is None:
+        g = torch.Generator(device = dev)
+        g.manual_seed(int(quant_args["seed"]))
+        gens[key] = g
+    return (torch.randn(n, device = dev, generator = g).sign() + 1e-5).sign().to(torch.float)
 
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
     with finalize_capture_H_mutex:
@@ -1032,7 +1062,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
             H = H_data["H"]
             k = H.shape[0]
-            su = (torch.randn(k, device = H_data["device"]).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+            su = _sign_flip(k, H_data["device"], quant_args).unsqueeze(1)
             H_data["su"] = su
 
             return True, None, None, su, None
@@ -1081,7 +1111,7 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
 
         # Random sign flips for input channel, fixed for the first linear layer to quantize with this H
         k = H.shape[0]
-        su = (torch.randn(k, device = H.device).sign() + 1e-5).sign().to(torch.float).unsqueeze(1)
+        su = _sign_flip(k, H.device, quant_args).unsqueeze(1)
         H_data["su"] = su
 
         # Input had
@@ -1567,7 +1597,7 @@ def quantize_exl3(
         tiles_k = weight.shape[0] // 16
 
         if "seed" in quant_args:
-            torch.manual_seed(quant_args["seed"])
+            _note_reseed(quant_args)
 
         devices = quant_args["devices"]
         device = torch.device(devices[0])
@@ -1585,7 +1615,7 @@ def quantize_exl3(
             su = su.to(device)
         if H_diag is not None and H_diag.is_cuda:
             H_diag = H_diag.to(device)
-        sv = (torch.randn(n, device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+        sv = _sign_flip(n, device, quant_args).unsqueeze(0)
 
         # Move stored L to CPU (if not already), move working L to device
         if H_data["L"] is not None:
@@ -1853,7 +1883,7 @@ def quantize_exl3_batch(
         for t in range(n_t):
             qa = quant_args_list[t]
             if "seed" in qa:
-                torch.manual_seed(qa["seed"])
+                _note_reseed(qa)
             q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
             if q_fallback:
                 finalized.append(None)
@@ -1878,7 +1908,7 @@ def quantize_exl3_batch(
         for bi, t in enumerate(batch_idx):
             qa = quant_args_list[t]
             if "seed" in qa:
-                torch.manual_seed(qa["seed"])
+                _note_reseed(qa)
             H, L, su, H_diag = finalized[t]
             weight = stager.get(t, weights[t])
             if bi + 1 < len(batch_idx):
@@ -1887,7 +1917,7 @@ def quantize_exl3_batch(
                 su = su.to(device)
             if H_diag is not None and H_diag.is_cuda:
                 H_diag = H_diag.to(device)
-            sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            sv = _sign_flip(weight.shape[1], device, qa).unsqueeze(0)
             # Original kept for the post-LDLQ scale refit (regularize works in place)
             origs[t] = weight.clone() if weight.numel() <= 5e7 else weight.cpu()
             apply_out_scales, weight_r, _, su, sv = regularize(
@@ -1914,11 +1944,15 @@ def quantize_exl3_batch(
             # device copies of L (and H, below) in the dict so each device pays the transfer
             # once per layer instead of once per group. A benign race can duplicate a copy;
             # the loser's tensor is simply collected
-            dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {})
-            L = dev_cache.get(("L", device.index))
-            if L is None:
-                L = finalized[batch_idx[0]][1].to(device)
-                dev_cache[("L", device.index)] = L
+            hd0 = H_datas[batch_idx[0]]
+            with finalize_capture_H_mutex:
+                cache_lock = hd0.setdefault("_dev_cache_lock", threading.Lock())
+                dev_cache = hd0.setdefault("dev_cache", {})
+            with cache_lock:
+                L = dev_cache.get(("L", device.index))
+                if L is None:
+                    L = finalized[batch_idx[0]][1].to(device)
+                    dev_cache[("L", device.index)] = L
             widths = [regs[t][0].shape[1] for t in batch_idx]
             weight_r_cat = torch.cat([regs[t][0] for t in batch_idx], dim = 1)
             for t in batch_idx:
@@ -1948,10 +1982,11 @@ def quantize_exl3_batch(
             _, su, sv, apply_out_scales = regs[t]
             if shared_H:
                 if Hd is None:
-                    Hd = dev_cache.get(("H", device.index))
-                    if Hd is None:
-                        Hd = finalized[t][0].to(device)
-                        dev_cache[("H", device.index)] = Hd
+                    with cache_lock:
+                        Hd = dev_cache.get(("H", device.index))
+                        if Hd is None:
+                            Hd = finalized[t][0].to(device)
+                            dev_cache[("H", device.index)] = Hd
             else:
                 Hd = finalized[t][0].to(device)
             try:
