@@ -27,6 +27,32 @@ import os as _os
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
 
+def dflash_draft_geometry(reserve_tokens, native_draft_len, blocks, is_dflash):
+    """Draft capacity / reserve for a DFlash round that chains `blocks` native blocks.
+
+    Returns (blocks, capacity, reserve):
+      blocks    native drafter forwards spent per round (>= 1)
+      capacity  draft tokens a round can produce: blocks * (block_size - 1). The drafter's input
+                layer materialises exactly `native_draft_len - 1` mask rows per forward
+                (modules/arch_specific/dflash.py:119), so no configuration makes a single forward
+                propose more than one native block
+      reserve   slots the pinned draft buffer and the cache-overflow guard must cover; a DFlash
+                drafter writes every mask position of every chained block, so the reserve is the
+                whole chain even when verification stops early
+
+    Every constraint on blocks lives at the call site: the drafter's fixed mask geometry, the row
+    count the target verify path accepts (bsz <= MAX_BSZN = 8 for the fused bszN/coop decode
+    kernels, and the temp buffers' row capacity for the unified mixed-K kernel), and acceptance,
+    which decays block over block because each chained block is conditioned on tokens the target
+    has not verified yet.
+    """
+    if not is_dflash or not native_draft_len:
+        return 1, reserve_tokens, reserve_tokens
+    blocks = max(1, int(blocks))
+    capacity = blocks * native_draft_len
+    return blocks, capacity, max(reserve_tokens, capacity)
+
+
 class Generator:
 
     def __init__(
@@ -160,6 +186,7 @@ class Generator:
         if draft_model:
             assert not ngram_match_min, \
                 "Cannot use both draft model and n-gram draft."
+            _dflash_blocks = int(_os.environ.get("EXL3_DFLASH_DRAFT_BLOCKS", "1"))
             assert draft_cache is not None, \
                 "Must supply cache for draft model"
             assert draft_cache.max_num_tokens == cache.max_num_tokens, \
@@ -199,15 +226,23 @@ class Generator:
 
         # Buffers. Pinned: the draft input ids upload non-blocking from here every round (and
         # the DFlash2 selector reads its anchor from the same view), the drafted ids come back
-        # into draft_ids_pinned
+        # into draft_ids_pinned. The pinned width is the reserve (see the geometry note below the
+        # draft-model block), not the requested window: a DFlash drafter writes every mask position
+        # of every native block it spends, per round.
         if draft_model or ngram_match_min:
+            _blocks, self.draft_window_capacity, self.draft_reserve_tokens = dflash_draft_geometry(
+                self.num_draft_tokens,
+                (draft_model.caps.get("default_draft_size") if draft_model else None),
+                (_dflash_blocks if draft_model else 1),
+                bool(draft_model and draft_model.caps.get("dflash_draft"))
+            )
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
                 pin_memory = True
             )
             self.draft_ids_pinned = torch.empty(
-                (max_batch_size, self.num_draft_tokens),
+                (max_batch_size, self.draft_reserve_tokens),
                 dtype = torch.long,
                 pin_memory = True
             )
@@ -256,10 +291,20 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
-        # DFlash writes its full native block even when verification is shortened.
-        self.draft_reserve_tokens = self.num_draft_tokens
+        # DFlash writes its full native block even when verification is shortened, and a chained
+        # round (EXL3_DFLASH_DRAFT_BLOCKS=k) may spend k of them, so the reserve has to cover the
+        # whole chain; the pinned buffer was sized from that above. k = 1 reproduces the original
+        # max(window, block_size - 1) exactly.
+        self.draft_reserve_tokens = max(getattr(self, "draft_reserve_tokens", 0), self.num_draft_tokens)
+        self.draft_blocks = max(1, _dflash_blocks) if self.dflash_draft else 1
         if self.dflash_draft:
-            self.draft_reserve_tokens = max(self.num_draft_tokens, self.draft_model.config.block_size - 1)
+            self.draft_reserve_tokens = max(self.draft_reserve_tokens, self.draft_model.config.block_size - 1)
+            self.draft_blocks, self.draft_window_capacity, self.draft_reserve_tokens = dflash_draft_geometry(
+                self.draft_reserve_tokens,
+                self.draft_model.caps.get("default_draft_size"),
+                self.draft_blocks,
+                True
+            )
 
         # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
         # DFlash the fixed-size drafted block is truncated before verification; for AR draft
@@ -922,6 +967,21 @@ class Generator:
             if w_used == 0:
                 return None
             window = w_used
+
+        # The drafter can only propose what its mask geometry allows: one native block per
+        # forward, k blocks per chained round. A window wider than that (a -ndt above the
+        # drafter's block size, which is what -ndt 8/12/16 ask for) used to reach this copy with
+        # fewer source columns than destination slots and raise "The size of tensor a (12) must
+        # match the size of tensor b (7)" on every request - reported by the server as
+        # engine_unavailable, on two hosts. Clamp to what was actually proposed and say so once.
+        if window > new_ids.shape[1]:
+            if not getattr(self, "_draft_window_warned", False):
+                self._draft_window_warned = True
+                print(f" !! DFlash draft window {window} exceeds the {new_ids.shape[1]} draft "
+                      f"tokens the drafter proposed (native block {self.draft_model.caps.get('default_draft_size')}"
+                      f" x {self.draft_blocks} block(s)); clamping. Raise EXL3_DFLASH_DRAFT_BLOCKS to "
+                      f"chain more native blocks.")
+            window = new_ids.shape[1]
 
         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
         return self.draft_ids_pinned[:, :window]

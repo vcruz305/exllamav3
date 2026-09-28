@@ -177,6 +177,27 @@ NS_GLOBALS = {
     "tensor_hash_checksum": lambda tensor, prev: hashlib.blake2b(
         (prev or b"") + repr(tensor.tolist()).encode(), digest_size=16).digest(),
 }
+
+
+def module_function(relative, name, namespace):
+    """Extract a module-level function from real source into an exec namespace.
+
+    Extracted methods keep calling whatever they called in the file, so anything they reach for
+    beyond the class has to be present here; pulling it from the same source keeps the harness
+    honest instead of stubbing the behaviour under test.
+    """
+    path = ROOT / relative
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    node = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name))
+    module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[name]
+
+
+NS_GLOBALS["dflash_draft_geometry"] = module_function(
+    "exllamav3/generator/generator.py", "dflash_draft_geometry", NS_GLOBALS)
+NS_GLOBALS["draft_round_stats"] = module_function(
+    "exllamav3/generator/job.py", "draft_round_stats", NS_GLOBALS)
 Generator = extract_class("exllamav3/generator/generator.py", "Generator",
                           ["__init__", "_staging", "iterate_draftmodel_dflash_gen"], NS_GLOBALS)
 Sequence = extract_class("exllamav3/generator/pagetable.py", "Sequence",
@@ -219,6 +240,7 @@ class CPUJob(JobMethods):
         self.held_tokens = self.held_probs = self.held_k_tokens = self.held_k_probs = self.held_logits = None
         self.time_enqueued = self.time_prefill = self.time_generate = 0
         self.accepted_draft_tokens = self.rejected_draft_tokens = 0
+        self.draft_stats = []
         self.rq_prompt_tokens = self.rq_cached = None
         self.cached_pages = self.cached_tokens = 0
         self.sam = self.forced_ids = None
