@@ -630,6 +630,8 @@ def _module_eligible(m):
     """Module-level requirements shared by the global-attention and SWA builders."""
     return (
         bc_attn_enable and
+        # SSMax query scaling (Step-5) runs between RoPE and attention; not in the captured block
+        getattr(m, "ssmax_s", None) is None and getattr(m, "key_ssmax", None) is None and
         # The fused block only softpluses headwise gates; full gates use sigmoid.
         not (m.full_gate and getattr(m, "gate_softplus", False)) and
         _qsa_module_eligible(m) and

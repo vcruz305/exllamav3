@@ -167,6 +167,11 @@ class Step3_5Model(Model):
                         out_dtype = torch.float,
                         tp_split_norm = False,
                         select_hq_bits = 2,
+                        # Step-5 full attention scales q by ssmax_s * log(pos + 1) (SSMax); absent on
+                        # Step-3.5/3.7 checkpoints, where the key stays None
+                        key_ssmax = "ssmax_s" if (
+                            not is_swa and config.stc.has_tensor(f"{key_prefix}.layers.{idx}.self_attn.ssmax_s")
+                        ) else None,
                     )
                     if swa_full or not is_swa else
                     SlidingAttention(

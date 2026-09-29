@@ -190,6 +190,7 @@ class Attention(Module):
         select_hq_bits: int = 0,
         qbits_key: str = "bits",
         qsa_indexer: Module | None = None,
+        key_ssmax: str | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -228,6 +229,10 @@ class Attention(Module):
             "Attn: gate_softplus is not implemented for the interleaved gate"
         self.key_sinks = key_sinks
         self.sinks = None
+        # SSMax (Step-5 full attention): per-query-head scale s_h, applied after RoPE as
+        # q_h *= s_h * log(position + 1) in fp32. Stored whole in the checkpoint (one value per head)
+        self.key_ssmax = key_ssmax
+        self.ssmax_s = None
 
         if self.num_kv_heads == 0:
             return
@@ -439,6 +444,13 @@ class Attention(Module):
                 self.rope_settings,
             )
 
+        if self.key_ssmax:
+            self.ssmax_s = self.config.stc.get_tensor(
+                f"{self.key}.{self.key_ssmax}", device, no_defer = True, allow_bf16 = True
+            ).float().contiguous()
+            assert self.ssmax_s.numel() == self.num_q_heads, \
+                f"{self.key}: ssmax_s has {self.ssmax_s.numel()} values for {self.num_q_heads} query heads"
+
         if self.key_sinks:
             self.sinks = self.config.stc.get_tensor(
                 f"{self.key}.{self.key_sinks}", device, no_defer = True
@@ -566,6 +578,9 @@ class Attention(Module):
         if self.sinks is not None:
             # bf16 -> fp16 is exact at sink-logit magnitudes; stored as loaded
             t[f"{self.key}.{self.key_sinks}"] = self.sinks.half().contiguous()
+        if self.ssmax_s is not None:
+            # Kept fp32: the product with log(position + 1) is formed in fp32 at runtime
+            t[f"{self.key}.{self.key_ssmax}"] = self.ssmax_s.float().contiguous()
         return t
 
 
@@ -580,6 +595,7 @@ class Attention(Module):
 
         self.rope = None
         self.sinks = None
+        self.ssmax_s = None
 
         if self.multi_kv is not None:
             self.multi_kv.unload()
@@ -912,6 +928,9 @@ class Attention(Module):
                 inv_freq,
             )
 
+        if self.ssmax_s is not None:
+            q = self.apply_ssmax(q, position, positions, position_ids)
+
         if simulate_kv_quant:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
             sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
@@ -1120,6 +1139,9 @@ class Attention(Module):
                 inv_freq,
             )
 
+        if self.ssmax_s is not None:
+            q = self.apply_ssmax(q, position, positions, position_ids)
+
         if simulate_kv_quant:
             # (k_bits, v_bits) or (k_bits, v_bits, compand_a)
             sq_ca = simulate_kv_quant[2] if len(simulate_kv_quant) > 2 else 0.0
@@ -1163,6 +1185,26 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def apply_ssmax(self, q: torch.Tensor, position: int, positions, position_ids) -> torch.Tensor:
+        """
+        SSMax query scaling (Step-5 full attention): q[b, t, h] *= s_h * log(pos(b, t) + 1), computed
+        in fp32 after RoPE and cast back once. pos follows the same rules as the RoPE kernel:
+        position_ids (bsz, seq) if given, else positions[b] + t, else position + t.
+        """
+        bsz, seqlen = q.shape[0], q.shape[1]
+        dev = q.device
+        if position_ids is not None:
+            pos = position_ids.to(dev).reshape(bsz, seqlen).float()
+        else:
+            t = torch.arange(seqlen, device = dev, dtype = torch.float32).unsqueeze(0)
+            if positions is not None:
+                pos = t + positions.to(dev).float().view(bsz, 1)
+            else:
+                pos = t + float(position)
+        scale = torch.log(pos + 1.0).unsqueeze(-1) * self.ssmax_s.to(dev).view(1, 1, -1)
+        return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
 
 
     def window_arg(self):
@@ -1278,6 +1320,8 @@ class Attention(Module):
             "qsa_indexer": _export(self.qsa_indexer),
             # Learned attention sinks (gpt-oss): one logit per query head, sliced to the local heads on import
             "sinks": producer.send(self.sinks) if self.sinks is not None else None,
+            # SSMax (Step-5): one fp32 scale per query head, sliced to the local heads on import
+            "ssmax_s": producer.send(self.ssmax_s) if self.ssmax_s is not None else None,
             "device": self.device,
             "cache_layers": [
                 cl.tp_export(plan) for cl in self.cache_layers
@@ -1373,6 +1417,12 @@ class Attention(Module):
             module.sinks = consumer.recv(
                 exported["sinks"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
             )
+
+        if exported.get("ssmax_s") is not None and num_kv_heads:
+            consumer = local_context["consumer"]
+            module.ssmax_s = consumer.recv(
+                exported["ssmax_s"], cuda = True, slice_dim = 0, first = first * n_gqa, last = last * n_gqa
+            ).float().contiguous()
 
         if num_kv_heads:
             cache_layers = exported["cache_layers"]
