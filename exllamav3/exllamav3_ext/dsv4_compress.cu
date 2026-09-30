@@ -30,9 +30,8 @@ Layout/invariants (see cache/dsa.py):
     window reads.
   - Gate softmax runs per COLUMN over the window entries, fp32, matching
     (kv * gate.softmax(dim = 2)).sum(dim = 2).
-  - Norm is a weighted RMSNorm over hd (skipped entirely when no_norm is set, e.g. Step-5
-    z_norm_type "none"; norm_w is then unused but still type/shape-checked); rope is GPT-J
-    pairs on the trailing rope_dim columns at theta = inv_freq * (ec0 + w) * m.
+  - Norm is a weighted RMSNorm over hd; rope is GPT-J pairs on the trailing rope_dim
+    columns at theta = inv_freq * (ec0 + w) * m.
   - Output entry ec0 + w is split-stored: columns [0, Wa) to dest_a, [Wa, hd) to dest_b
     (pool_c/pool_r), or all to dest_a when dest_b is null (pool_idx).
 
@@ -79,9 +78,6 @@ void dsv4_compress_windows_kernel
     const bool stage_rel                 // dest_a is a per-JOB staging buffer of this step's
                                          // entries at rows [0, nw) (packed-pool quantization
                                          // follows); dest_b / pool_bt unused
-    , const bool no_norm                 // skip the RMS-norm stage: out = pooled comp, norm_w
-                                         // unused (Step-5 z_norm_type "none"). Uniform across
-                                         // the block, so the contained syncs stay legal
 )
 {
     extern __shared__ float sh[];        // comp[hd] + reduce[hd / 32]
@@ -171,28 +167,22 @@ void dsv4_compress_windows_kernel
     }
     float comp = active ? acc / l : 0.0f;
 
-    // Weighted RMS norm over the hd columns. no_norm skips the stage entirely: out is the
-    // pooled comp and norm_w is unused. The branch is uniform across the block (no_norm is a
-    // kernel-wide flag), so the contained __syncthreads() remain legal
-    float normed = comp;
-    if (!no_norm)
+    // Weighted RMS norm over the hd columns
+    float sq = comp * comp;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sq += __shfl_down_sync(0xffffffffu, sq, offset);
+    if ((c % 32) == 0) sh_red[c / 32] = sq;
+    __syncthreads();
+    if (c < 32)
     {
-        float sq = comp * comp;
+        sq = c < t_warps ? sh_red[c] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
             sq += __shfl_down_sync(0xffffffffu, sq, offset);
-        if ((c % 32) == 0) sh_red[c / 32] = sq;
-        __syncthreads();
-        if (c < 32)
-        {
-            sq = c < t_warps ? sh_red[c] : 0.0f;
-            for (int offset = 16; offset > 0; offset >>= 1)
-                sq += __shfl_down_sync(0xffffffffu, sq, offset);
-            if (c == 0) sh_red[0] = sq;
-        }
-        __syncthreads();
-        float rmr = rsqrtf(sh_red[0] / (float) hd + eps);
-        normed = comp * rmr * (active ? __half2float(norm_w[c]) : 0.0f);
+        if (c == 0) sh_red[0] = sq;
     }
+    __syncthreads();
+    float rmr = rsqrtf(sh_red[0] / (float) hd + eps);
+    float normed = comp * rmr * (active ? __half2float(norm_w[c]) : 0.0f);
     if (active) sh_comp[c] = normed;
     __syncthreads();
     if (!active) return;
@@ -395,8 +385,7 @@ void dsv4_compress_gr
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
     int pool_epp,
-    bool stage_rel,
-    bool no_norm
+    bool stage_rel
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(kv_new.device());
@@ -501,7 +490,7 @@ void dsv4_compress_gr
             seq, m, buf_rows, ovl_depth, W, hd, rd, Wa,
             overlap,
             slot_ids_ptr, ring_stride, ovl_stride, da_stride, db_stride,
-            pool_bt_ptr, bt_stride, pool_epp, stage_rel, no_norm
+            pool_bt_ptr, bt_stride, pool_epp, stage_rel
         );
         cuda_check(cudaPeekAtLastError());
     }
@@ -542,8 +531,7 @@ void dsv4_compress
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
     int pool_epp,
-    bool stage_rel,
-    bool no_norm
+    bool stage_rel
 )
 {
     dsv4_compress_gr
@@ -566,7 +554,6 @@ void dsv4_compress
         slot_ids,
         pool_bt,
         pool_epp,
-        stage_rel,
-        no_norm
+        stage_rel
     );
 }

@@ -27,9 +27,7 @@ void dsv4_compress_gr
     const c10::optional<at::Tensor>& slot_ids = {},
     const c10::optional<at::Tensor>& pool_bt = {},
     int pool_epp = 0,
-    bool stage_rel = false,         // dest_a = per-job staging rows [0, nw) (see kernel)
-    bool no_norm = false            // skip the RMS-norm stage entirely (norm_w unused;
-                                    // Step-5 z_norm_type "none")
+    bool stage_rel = false          // dest_a = per-job staging rows [0, nw) (see kernel)
 );
 
 void dsv4_compress
@@ -51,8 +49,7 @@ void dsv4_compress
     const c10::optional<at::Tensor>& slot_ids,
     const c10::optional<at::Tensor>& pool_bt,
     int pool_epp,
-    bool stage_rel,
-    bool no_norm = false
+    bool stage_rel
 );
 
 void dsv4_ring_append_gr

@@ -376,3 +376,41 @@ scope here.
    `no_norm = false`) plus the new Step-5 case.
 6. **Bindings gap** (§2.4) — the .cuh/.cu patch alone changes the Python arity; land with the
    `bindings.cpp` diff or `dsv4.py` breaks at runtime.
+
+---
+
+## DECISION (supersedes the "kernel flag applied" state above): kernel reverted
+
+The `no_norm` flag patch to `dsv4_compress.cu`/`.cuh` was **reverted**. Both files are
+now byte-identical to `fork/master`.
+
+Reason: the flag cannot land safely on its own. `exllamav3/exllamav3_ext/bindings.cpp:108`
+binds the kernel as `m.def("dsv4_compress", &dsv4_compress, "dsv4_compress")` with **no
+`py::arg` list**. pybind11 does not read C++ default arguments, so adding a 19th parameter
+raises the binding's required arity and breaks `exllamav3/modules/dsv4.py:241` and `:1369`
+(both call with 18 positional args) on the next extension rebuild. That would regress the
+DeepSeek-V4 CSA compressor for every architecture in the fork, not just Step-5.
+
+Not needed for the current goal: the re-encode only quantizes tensors and never runs the
+compressor forward. And `Step5CSACompressor.forward_fused` already degrades to an exact
+pure-torch chunked path (`_forward_fused_torch`) when the extension lacks the flag — verified
+to mirror the kernel's entry addressing. So correctness is preserved with zero fork risk.
+
+To land the kernel fast-path later, BOTH of these must go in together:
+
+1. `dsv4_compress.cuh` / `.cu`: `bool no_norm = false` (as previously drafted).
+2. `bindings.cpp:108`: declare the full `py::arg` list so the default is reachable from
+   Python, e.g.
+   `m.def("dsv4_compress", &dsv4_compress, "dsv4_compress",
+      py::arg("kv_new"), py::arg("gate_new"), py::arg("ring_kv"), py::arg("ring_gate"),
+      py::arg("ovl") = c10::nullopt, py::arg("ape"), py::arg("norm_w"),
+      py::arg("rms_norm_eps"), py::arg("inv_freq"), py::arg("dest_a"),
+      py::arg("dest_b") = c10::nullopt, py::arg("position"),
+      py::arg("position_tensor") = c10::nullopt, py::arg("m"),
+      py::arg("slot_ids") = c10::nullopt, py::arg("pool_bt") = c10::nullopt,
+      py::arg("pool_epp") = 0, py::arg("stage_rel") = false,
+      py::arg("no_norm") = false);`
+   Check the `c10::nullopt` defaults convert cleanly before merging; if they do not, bind a
+   small lambda wrapper taking 18 args and forwarding `no_norm` explicitly instead.
+3. Re-verify `tests/test_dsv4_compress_kernel.py` — it is already stale (calls 17 args vs
+   the 18 the kernel took before this work), so it should be fixed in the same change.
