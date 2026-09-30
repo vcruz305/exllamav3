@@ -116,3 +116,62 @@ class Step5RoboticsConfig(Step3_7Config):
 class Step5RoboticsModel(Step3_5Model):
 
     config_class = Step5RoboticsConfig
+
+    def __init__(self, config: Step5RoboticsConfig, key_prefix: str = "model", **kwargs):
+        super().__init__(config, key_prefix = key_prefix, **kwargs)
+
+        # Attach the CSA sparse indexer + the Scalable-Softmax scale to the 23
+        # "full_attention" layers. Both are registered as submodules of the layer's
+        # Attention, so convert_model's recursive Linear walk picks them up
+        # (`linears = [m for m in module if isinstance(m, Linear) and m.qmap ...]`).
+        #
+        # qmap = "block.attn.input" is deliberate: the indexer's q/z project from the same
+        # post-input_layernorm hidden as the main q/k/v, so they share that Hessian group
+        # and are covered by the existing 368-teacher bank. idx_k / idx_w keep qmap=None
+        # and stay unquantized, matching mla_attn.py's rationale (tiny, router-like, and
+        # selection noise is coherent across every layer that shares them).
+        if not config.sparse_enabled:
+            return
+
+        from ..modules.step5_csa_indexer import Step5CSAIndexer
+        from ..modules.step5_ssmax_scale import Step5SSMaxScale
+
+        for idx in config.sparse_indexer_layers:
+            attn = self._find_module(f"{key_prefix}.layers.{idx}.self_attn")
+            assert attn is not None, \
+                f"no Attention module for layer {idx}; cannot attach the CSA indexer"
+
+            attn.register_submodule(Step5CSAIndexer(
+                config = config,
+                key = attn.key,
+                layer_idx = idx,
+                hidden_size = config.hidden_size,
+                num_heads = config.index_n_heads,
+                proxy_dim = config.index_head_dim,
+                rope_dim = config.index_rope_dim,
+                topk = config.index_topk,
+                region_block_size = config.index_region_block_size,
+                rope_settings = config.rope_settings_list[idx],
+                norm_eps = config.rms_norm_eps,
+                qmap = "block.attn.input",
+                out_dtype = torch.half,
+                qbits_key = "bits",
+                select_hq_bits = 2,
+            ))
+            attn.register_submodule(Step5SSMaxScale(
+                config = config,
+                key = f"{attn.key}.ssmax_s",
+                out_dtype = torch.float,
+            ))
+
+    def _find_module(self, key: str):
+        """Depth-first search of the module tree for a module with the given tensor key."""
+        def walk(mods):
+            for m in mods:
+                if getattr(m, "key", None) == key:
+                    return m
+                hit = walk(getattr(m, "modules", []) or [])
+                if hit is not None:
+                    return hit
+            return None
+        return walk(self.modules)
