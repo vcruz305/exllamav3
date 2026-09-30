@@ -72,6 +72,32 @@ class Step5RoboticsConfig(Step3_7Config):
             if self.layer_types[idx] in self.sparse_apply_to_layer_types
         ]
 
+        # ---- indexer geometry, in the names the modules consume -------------------
+        # Verified against safetensors headers (port-notes/05): q [4096,4096],
+        # k [256,4096], w [16,4096], z [256,4096], q_norm/k_norm [256].
+        self.index_n_heads = int(self.sparse_num_heads or 0)        # 16
+        self.index_head_dim = int(self.sparse_proxy_dim or 0)       # 256  (== proxy_dim)
+        self.index_topk = int(self.sparse_topk or 0)                # 512
+        self.index_rope_dim = int(self.sparse_rope_dim or 0)        # 32
+        self.index_num_k_heads = int(self.sparse_num_k_heads or 1)  # 1
+        self.index_region_block_size = int(self.sparse_region_block_size or 1)  # 8
+
+        if self.sparse_enabled:
+            assert self.index_num_k_heads == 1, \
+                "Step-5 CSA assumes a single shared indexer key head"
+            assert self.index_head_dim % 2 == 0, "index_head_dim must be even for rope"
+            assert self.index_rope_dim <= self.index_head_dim, \
+                "sparse_indexer_rope_dim exceeds proxy_dim"
+
+        # Scalable-Softmax (arXiv 2501.19399) scale lives on the MAIN attention
+        # softmax (ssmax_s [64] == num_attention_heads), NOT on the indexer. The
+        # checkpoint carries it as a tensor; it is loaded by the attention module.
+        self.ssmax_enabled = self.sparse_softmax_variant == "ssmax"
+        self.ssmax_granularity = self.sparse_ssmax_granularity     # "q_head"
+        # UNVERIFIED: whether the runtime applies `s` alone or `s * log(n)`.
+        # See port-notes/03. Default to the paper's definition (s * log(n)).
+        self.ssmax_use_log_n = True
+
         # MTP / nextn layers (model.layers.{92,93,94}). Per-layer rope_theta,
         # partial_rotary_factors, swiglu_limits, swiglu_limits_shared and layer_types are all
         # 95-long in this checkpoint, so the MTP depths already have config values at
