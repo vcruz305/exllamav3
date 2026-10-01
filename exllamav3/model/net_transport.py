@@ -325,7 +325,7 @@ class NetEndpoint:
         if target_device.type == "cuda":
             # Fast zero-copy path: recv directly into reusable pinned host buffer
             staging = self._get_pinned_buffer(payload_len)
-            mv = memoryview(staging[:payload_len].view(torch.uint8).numpy())
+            mv = memoryview(staging[:payload_len].view(torch.uint8).numpy()).cast("B")
             self._recv_into_exact(mv)
 
             host_view = staging[:payload_len].view(dtype).view(shape)
@@ -336,7 +336,7 @@ class NetEndpoint:
                 out.copy_(host_view, non_blocking = False)
         else:
             # CPU target: read directly into destination tensor buffer
-            mv = memoryview(out.view(torch.uint8).numpy())
+            mv = memoryview(out.view(torch.uint8).numpy()).cast("B")
             self._recv_into_exact(mv)
 
         return out
