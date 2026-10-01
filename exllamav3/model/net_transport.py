@@ -8,10 +8,11 @@ node runs layers 0..k and the other k+1..N.
 The transport layer handles:
 - Fixed-size framing with magic, msg type, dtype code, shape, payload length
 - Reliable recv loops that handle partial reads and detect EOF
-- CUDA tensor staging via pinned host memory
-- All required dtypes (float16, bfloat16, float32, int32, int64, uint8, bool)
+- Fast CUDA tensor staging via reused pinned host memory
+- Direct zero-copy recv_into from socket into pinned buffers for GPU transfers
+- Support for FP8 (float8_e4m3fn) alongside float16, bfloat16, float32, int32, int64, uint8, bool
 - Non-contiguous tensor handling (make contiguous before send)
-- Zero-copy where possible (recv_into, memoryview)
+- Socket buffer tuning for high-throughput networks (QSFP/100GbE)
 - Clear error handling with NetTransportError
 """
 
@@ -21,6 +22,7 @@ import socket
 import struct
 import json
 import io
+import sys
 from typing import Any
 
 import torch
@@ -51,6 +53,10 @@ class NetEndpoint:
         torch.bool: 6,
     }
 
+    # Register float8_e4m3fn if supported in this torch build
+    if hasattr(torch, "float8_e4m3fn"):
+        _DTYPE_TO_CODE[torch.float8_e4m3fn] = 7
+
     _CODE_TO_DTYPE = {v: k for k, v in _DTYPE_TO_CODE.items()}
 
     # Message types
@@ -60,7 +66,7 @@ class NetEndpoint:
     # Fixed header layout:
     # magic (4 bytes): 0xDEADBEEF
     # msg_type (1 byte): 0=tensor, 1=object
-    # dtype_code (1 byte): 0-6 for tensor types
+    # dtype_code (1 byte): 0-7 for tensor types
     # ndim (1 byte): number of dimensions
     # shape (40 bytes): 5 uint64 slots for dims (up to 5D)
     # payload_len (8 bytes): byte count of payload
@@ -69,19 +75,40 @@ class NetEndpoint:
     _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
     _MAGIC = 0xDEADBEEF
 
-    def __init__(self, sock: socket.socket, is_server: bool = False):
+    def __init__(self, sock: socket.socket, is_server: bool = False, buffer_size: int = 4 * 1024 * 1024):
         """
         Initialize endpoint with an existing socket.
 
         Args:
             sock: Connected socket.socket instance.
             is_server: Whether this endpoint is the listening side (for logging/clarity).
+            buffer_size: TCP send/recv buffer size in bytes (default 4MB for high-speed interconnects).
         """
         self.sock = sock
         self.is_server = is_server
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Pinned staging buffer for CUDA -> host transfers (reused across calls)
+        # Low latency socket tuning
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        # Socket buffer sizing for large prefill chunks (e.g. 100GbE / QSFP)
+        if buffer_size > 0:
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buffer_size)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_size)
+            except OSError:
+                pass
+
+        # Quick-ACK on Linux if available to minimize handshake delays
+        if hasattr(socket, "TCP_QUICKACK"):
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+            except OSError:
+                pass
+
+        # Pinned staging buffer for CUDA <-> host transfers (reused across calls)
         self._pinned_buffer = None
         self._pinned_size = 0
 
@@ -91,6 +118,7 @@ class NetEndpoint:
         host: str,
         port: int,
         timeout: float = 60.0,
+        buffer_size: int = 4 * 1024 * 1024,
     ) -> NetEndpoint:
         """
         Create a server endpoint that listens for and accepts one peer connection.
@@ -99,6 +127,7 @@ class NetEndpoint:
             host: Interface to bind to (e.g., "0.0.0.0").
             port: Port to listen on.
             timeout: Accept timeout in seconds.
+            buffer_size: TCP socket buffer size.
 
         Returns:
             NetEndpoint connected to the peer.
@@ -118,7 +147,7 @@ class NetEndpoint:
             finally:
                 server_sock.close()
 
-            return cls(peer_sock, is_server = True)
+            return cls(peer_sock, is_server = True, buffer_size = buffer_size)
         except Exception as e:
             raise NetTransportError(f"listen on {host}:{port} failed: {e}") from e
 
@@ -128,6 +157,7 @@ class NetEndpoint:
         host: str,
         port: int,
         timeout: float = 60.0,
+        buffer_size: int = 4 * 1024 * 1024,
     ) -> NetEndpoint:
         """
         Create a client endpoint that connects to a listening peer.
@@ -138,6 +168,7 @@ class NetEndpoint:
             host: Remote host to connect to.
             port: Remote port to connect to.
             timeout: Total time to retry before giving up (seconds).
+            buffer_size: TCP socket buffer size.
 
         Returns:
             NetEndpoint connected to the peer.
@@ -156,7 +187,7 @@ class NetEndpoint:
         while time.time() - start_time < timeout:
             try:
                 sock.connect((host, port))
-                return cls(sock, is_server = False)
+                return cls(sock, is_server = False, buffer_size = buffer_size)
             except (socket.timeout, ConnectionRefusedError, OSError) as e:
                 last_error = e
                 attempt += 1
@@ -170,7 +201,7 @@ class NetEndpoint:
             f"connect to {host}:{port} failed after {timeout}s: {last_error}"
         )
 
-    def send_tensor(self, t: torch.Tensor) -> None:
+    def send_tensor(self, t: torch.Tensor, stream: torch.cuda.Stream | None = None) -> None:
         """
         Send a tensor to the peer.
 
@@ -179,11 +210,11 @@ class NetEndpoint:
 
         Args:
             t: torch.Tensor to send (any shape, any supported dtype/device).
+            stream: Optional CUDA stream for asynchronous staging.
 
         Raises:
             NetTransportError: If dtype is unsupported or send fails.
         """
-        # Ensure contiguous and on correct device/dtype for send
         if not t.is_contiguous():
             t = t.contiguous()
 
@@ -199,13 +230,16 @@ class NetEndpoint:
         shape_tuple = tuple(t.shape) + (0,) * (5 - ndim)
         payload_len = t.numel() * t.itemsize
 
-        # Stage a CUDA tensor through the reused pinned buffer. The staged tensor stays on the host
-        # and is sent straight from its storage; copying it again with .cpu() would undo the point
-        # of pinning
+        # Stage a CUDA tensor through the reused pinned buffer
         if t.is_cuda:
             staging = self._get_pinned_buffer(payload_len)
             send_data = staging[:payload_len].view(t.dtype).view(t.shape)
-            send_data.copy_(t, non_blocking = False)
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    send_data.copy_(t, non_blocking = True)
+                stream.synchronize()
+            else:
+                send_data.copy_(t, non_blocking = False)
             send_data = send_data.view(-1)
         else:
             send_data = t.view(-1)
@@ -222,32 +256,32 @@ class NetEndpoint:
         )
         self._sendall(header)
 
-        # Send exactly the payload. For a CUDA source, send_data is a VIEW into the reused
-        # pinned staging buffer, which _get_pinned_buffer over-allocates (size * 1.5 + 1024)
-        # and never shrinks, so untyped_storage() hands over the whole allocation: the header
-        # declares payload_len while the socket receives more, and the surplus desynchronises
-        # the stream on the next message. A uint8 view is exactly payload_len bytes, and it
-        # also gives numpy a dtype it always supports, which is what made the byte-exact path
-        # awkward for bfloat16 and bool, so this is zero-copy rather than one copy worse.
+        # Send payload
         if send_data.numel() > 0:
-            self._sendall(memoryview(send_data.view(torch.uint8).numpy()))
+            # send_data viewed as uint8 avoids numpy conversion issues with bfloat16 / fp8
+            u8_tensor = send_data.view(torch.uint8)
+            # Use buffer interface directly
+            self._sendall(memoryview(u8_tensor.numpy()))
 
-    def recv_tensor(self, out: torch.Tensor | None = None) -> torch.Tensor:
+    def recv_tensor(
+        self,
+        out: torch.Tensor | None = None,
+        device: torch.device | str | None = None,
+        stream: torch.cuda.Stream | None = None,
+    ) -> torch.Tensor:
         """
         Receive a tensor from the peer.
 
-        If `out` is provided and matches the incoming shape/dtype/device,
-        the data is written directly into `out` (zero-copy). Otherwise,
-        a new tensor is allocated on CPU and, if necessary, moved to the
-        inferred device.
+        If `out` is provided and matches shape/dtype, data is written directly into `out`.
+        If targeting CUDA, reads directly into pinned memory via recv_into, then copies to GPU.
 
         Args:
-            out: Optional pre-allocated tensor to receive into. Must have
-                 matching shape, dtype, and device; otherwise it is ignored
-                 and a new tensor is allocated.
+            out: Optional pre-allocated tensor to receive into.
+            device: Target device if out is None (defaults to out.device or CPU).
+            stream: Optional CUDA stream for async host-to-device copy.
 
         Returns:
-            The received tensor (either `out` reused, or a newly allocated tensor).
+            The received tensor.
 
         Raises:
             NetTransportError: On framing/EOF/dtype errors.
@@ -272,32 +306,38 @@ class NetEndpoint:
         dtype = self._CODE_TO_DTYPE[dtype_code]
         shape = (d0, d1, d2, d3, d4)[:ndim]
 
-        # Determine device: prefer out's device, fall back to CPU
-        target_device = torch.device("cpu")
+        # Determine target device
         if out is not None:
             if out.shape != shape or out.dtype != dtype:
-                # Mismatch: discard out and allocate fresh
                 out = None
+                target_device = torch.device(device) if device else torch.device("cpu")
             else:
                 target_device = out.device
+        else:
+            target_device = torch.device(device) if device else torch.device("cpu")
 
         if out is None:
             out = torch.empty(shape, dtype = dtype, device = target_device)
 
-        # Receive payload
-        if out.numel() > 0:
-            host_out = out if out.device.type == "cpu" else torch.empty(
-                shape,
-                dtype = dtype,
-                device = torch.device("cpu"),
-            )
-            payload = self._recv_exact(payload_len)
-            host_out.view(-1).copy_(
-                torch.frombuffer(payload, dtype = dtype),
-                non_blocking = False,
-            )
-            if out.device.type == "cuda":
-                out.copy_(host_out, non_blocking = False)
+        if payload_len == 0:
+            return out
+
+        if target_device.type == "cuda":
+            # Fast zero-copy path: recv directly into reusable pinned host buffer
+            staging = self._get_pinned_buffer(payload_len)
+            mv = memoryview(staging[:payload_len].view(torch.uint8).numpy())
+            self._recv_into_exact(mv)
+
+            host_view = staging[:payload_len].view(dtype).view(shape)
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    out.copy_(host_view, non_blocking = True)
+            else:
+                out.copy_(host_view, non_blocking = False)
+        else:
+            # CPU target: read directly into destination tensor buffer
+            mv = memoryview(out.view(torch.uint8).numpy())
+            self._recv_into_exact(mv)
 
         return out
 
@@ -367,6 +407,10 @@ class NetEndpoint:
     def close(self) -> None:
         """Close the underlying socket."""
         if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.sock.close()
 
     def _sendall(self, data: memoryview | bytes) -> None:
@@ -379,11 +423,9 @@ class NetEndpoint:
         Raises:
             NetTransportError: On socket errors.
         """
-        if isinstance(data, memoryview):
-            data = bytes(data)
-
         total_sent = 0
-        while total_sent < len(data):
+        total_len = len(data)
+        while total_sent < total_len:
             try:
                 sent = self.sock.send(data[total_sent:])
                 if sent == 0:
@@ -394,7 +436,7 @@ class NetEndpoint:
 
     def _recv_exact(self, n: int) -> bytes:
         """
-        Receive exactly n bytes from the socket, looping until complete.
+        Receive exactly n bytes from the socket into a new bytes object.
 
         Args:
             n: Exact number of bytes to receive.
@@ -405,19 +447,34 @@ class NetEndpoint:
         Raises:
             NetTransportError: On EOF (partial read) or socket errors.
         """
-        data = b""
-        while len(data) < n:
+        data = bytearray(n)
+        mv = memoryview(data)
+        self._recv_into_exact(mv)
+        return bytes(data)
+
+    def _recv_into_exact(self, buffer: memoryview) -> None:
+        """
+        Receive exactly len(buffer) bytes directly into an existing memoryview.
+        Avoids extra memory allocations and copying.
+
+        Args:
+            buffer: Writable memoryview.
+
+        Raises:
+            NetTransportError: On EOF or socket errors.
+        """
+        n = len(buffer)
+        pos = 0
+        while pos < n:
             try:
-                chunk = self.sock.recv(n - len(data))
-                if not chunk:
+                nbytes = self.sock.recv_into(buffer[pos:])
+                if nbytes == 0:
                     raise NetTransportError(
-                        f"EOF while expecting {n} bytes (got {len(data)})"
+                        f"EOF while expecting {n} bytes (got {pos})"
                     )
-                data += chunk
+                pos += nbytes
             except socket.error as e:
                 raise NetTransportError(f"Recv failed: {e}") from e
-
-        return data
 
     def _get_pinned_buffer(self, size: int) -> torch.Tensor:
         """
@@ -432,7 +489,6 @@ class NetEndpoint:
             torch.Tensor (pinned, uint8) of at least `size` bytes.
         """
         if self._pinned_buffer is None or self._pinned_size < size:
-            # Allocate with some headroom to avoid frequent reallocations
             new_size = int(size * 1.5) + 1024
             self._pinned_buffer = torch.empty(
                 new_size,

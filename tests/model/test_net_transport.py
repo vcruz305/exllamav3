@@ -421,10 +421,41 @@ def test_cuda_staging_consecutive_sends():
     print("PASS: CUDA staging, consecutive sends")
 
 
+def test_dtype_roundtrip_float8():
+    """Test that FP8 (float8_e4m3fn) round-trips correctly if supported by torch."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("SKIP: FP8 not supported in this torch build")
+        return
+    port = find_free_port()
+    # Create uint8 raw bytes and view as float8_e4m3fn
+    raw = torch.randint(0, 256, (10, 20), dtype=torch.uint8)
+    sent_tensor = raw.view(torch.float8_e4m3fn)
+    received_tensor = [None]
+
+    def server():
+        ep = NetEndpoint.listen("127.0.0.1", port, timeout=5.0)
+        received_tensor[0] = ep.recv_tensor()
+        ep.close()
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+
+    ep = NetEndpoint.connect("127.0.0.1", port, timeout=5.0)
+    ep.send_tensor(sent_tensor)
+    ep.close()
+
+    thread.join(timeout=5.0)
+    assert received_tensor[0] is not None
+    assert received_tensor[0].dtype == torch.float8_e4m3fn
+    assert torch.equal(sent_tensor.view(torch.uint8), received_tensor[0].view(torch.uint8))
+    print("PASS: dtype round trip (float8_e4m3fn)")
+
+
 if __name__ == "__main__":
     # Run all tests
     test_dtype_roundtrip_float16()
     test_dtype_roundtrip_bfloat16()
+    test_dtype_roundtrip_float8()
     test_dtype_roundtrip_float32()
     test_dtype_roundtrip_int32()
     test_dtype_roundtrip_int64()
