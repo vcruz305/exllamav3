@@ -111,6 +111,9 @@ class NetEndpoint:
         # Pinned staging buffer for CUDA <-> host transfers (reused across calls)
         self._pinned_buffer = None
         self._pinned_size = 0
+        # Event recorded after an asynchronous host-to-device copy out of the staging buffer
+        # (recv_tensor with a stream). The buffer must not be overwritten until it completes
+        self._staging_event = None
 
     @classmethod
     def listen(
@@ -332,6 +335,10 @@ class NetEndpoint:
             if stream is not None:
                 with torch.cuda.stream(stream):
                     out.copy_(host_view, non_blocking = True)
+                # The copy may still be reading the staging buffer when this returns; the next
+                # send/recv that reuses the buffer waits for this event first
+                self._staging_event = torch.cuda.Event()
+                self._staging_event.record(stream)
             else:
                 out.copy_(host_view, non_blocking = False)
         else:
@@ -488,6 +495,9 @@ class NetEndpoint:
         Returns:
             torch.Tensor (pinned, uint8) of at least `size` bytes.
         """
+        if self._staging_event is not None:
+            self._staging_event.synchronize()
+            self._staging_event = None
         if self._pinned_buffer is None or self._pinned_size < size:
             new_size = int(size * 1.5) + 1024
             self._pinned_buffer = torch.empty(
