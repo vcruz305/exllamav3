@@ -71,8 +71,25 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # than the unified kernel's, so outputs are not bit-identical to it. EXL3_COOPMK_PLAN selects the
 # kernel variant set (1 all-K, 2 split by decode kind, 3 all-K capped at 64 registers, 4 split
 # capped at 64); 3 was fastest per call on the tested pack
-COOP_MIXEDK = os.environ.get("EXL3_MOE_COOP_MIXEDK", "0") == "1"
+#
+# Unset, it defaults to on for sm_121 (GB10 / DGX Spark) only. Measured there on GLM-5.3 EXL3 3.38bpw
+# (mixed-K mul1 experts), single-token decode: routed MoE 111 -> 59 ms per token summed over 78
+# layers, host syncs ~110 -> 3 per step, teacher-forced decode NLL unchanged (1.245 vs 1.257 unified,
+# prefill reference 1.248). Plans 1/2 were ~7% slower than 3; 4 tied 3. EXL3_MOE_COOP_MIXEDK=0/1
+# overrides the default on any GPU
+_COOP_MIXEDK_ENV = os.environ.get("EXL3_MOE_COOP_MIXEDK")
+COOP_MIXEDK = _COOP_MIXEDK_ENV == "1"
 COOPMK_PLAN = int(os.environ.get("EXL3_COOPMK_PLAN", "3"))
+
+
+def _coop_mixedk_enabled(device) -> bool:
+    """EXL3_MOE_COOP_MIXEDK if set, else on for sm_121 devices"""
+    if _COOP_MIXEDK_ENV is not None:
+        return _COOP_MIXEDK_ENV == "1"
+    try:
+        return torch.device(device).type == "cuda" and torch.cuda.get_device_capability(device) == (12, 1)
+    except Exception:
+        return False
 _coopmk_warned = False
 
 
@@ -889,11 +906,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def _coopmk_setup(self):
         """Bind the cooperative runtime-K decode kernels to this unified mixed-K layer
-        (EXL3_MOE_COOP_MIXEDK=1). self.coopmk stays None, and the layer keeps the unified mixed-K
-        path, whenever the layer is outside what the kernels implement"""
+        (EXL3_MOE_COOP_MIXEDK=1, default on sm_121). self.coopmk stays None, and the layer keeps the
+        unified mixed-K path, whenever the layer is outside what the kernels implement"""
         self.coopmk = None
         self.coopmk_out = None
-        if not (COOP_MIXEDK and getattr(self, "mixedk_unified", False)):
+        if not getattr(self, "mixedk_unified", False):
+            return
+        if not _coop_mixedk_enabled(self.device):
             return
         # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
         # requires the last), whole expert range on this device
