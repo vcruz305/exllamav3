@@ -50,7 +50,7 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 # compile-time"), so it cannot unroll the trellis decode loop. Row tiles amortize that at prefill
 # but not at one token. 0 leaves the EXL3_MIXEDK_LEGACY behaviour unchanged
 MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
-# Sync-free unified mixed-K decode (default off). When every expert's row count is bounded by the
+# Sync-free unified mixed-K decode. When every expert's row count is bounded by the
 # m16 tier (num_tokens <= MTILE_T1) and top_k is at least the temp-buffer concurrency, the unified
 # mixed-K dispatch needs no host readback: assignments are counted on the device with a scatter-add
 # (torch.bincount reads input.max() back to the host), the kernel is launched with the buffer
@@ -59,10 +59,16 @@ MIXEDK_MIN_ROWS = int(os.environ.get("EXL3_MOE_MIXEDK_MIN_ROWS", 0))
 # skipped. The kernel sizes its grid as min(concurrency, MOE_MAX_GROUPS, num_active) groups, so
 # the launch is unchanged whenever the true active count is >= the concurrency, which top_k >=
 # concurrency guarantees (every token picks top_k distinct experts). Output is bit-identical.
-# The uniform fused path's bincount (all-fused decode, run_fused(-1)) gets the same scatter-add.
-MIXEDK_NOSYNC = os.environ.get("EXL3_MOE_MIXEDK_NOSYNC", "0") == "1"
+# EXL3_MOE_MIXEDK_NOSYNC: unset (default) applies this to unified mixed-K layers only, so packs
+# without mixed-K layers are untouched; 0 turns it off; 1 also gives the uniform fused path's
+# bincount (all-fused decode, run_fused(-1)) the same scatter-add.
+_MIXEDK_NOSYNC_ENV = os.environ.get("EXL3_MOE_MIXEDK_NOSYNC", "")
+MIXEDK_NOSYNC = _MIXEDK_NOSYNC_ENV != "0"
+MIXEDK_NOSYNC_FUSED = _MIXEDK_NOSYNC_ENV == "1"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
-# Cooperative decode kernels for unified mixed-K layers (default off). At decode and verify shapes
+# Cooperative decode kernels for unified mixed-K layers (default on, EXL3_MOE_COOP_MIXEDK=0 opts
+# out). Only layers whose experts mix bit widths can bind, so uniform-K packs keep their existing
+# path whatever the setting. At decode and verify shapes
 # (bsz <= MAX_BSZN) a mixed-K layer runs through the two-stage cooperative kernels the uniform-K
 # layers use (exl3_moe_coop), with each expert's gate / up / down bitrate read from a device table
 # instead of fixed per launch (ext.CoopMK): no sort, count, slot tables or gather, and no host
@@ -71,22 +77,38 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # than the unified kernel's, so outputs are not bit-identical to it. EXL3_COOPMK_PLAN selects the
 # kernel variant set (1 all-K, 2 split by decode kind, 3 all-K capped at 64 registers, 4 split
 # capped at 64); 3 was fastest per call on the tested pack
-COOP_MIXEDK = os.environ.get("EXL3_MOE_COOP_MIXEDK", "0") == "1"
+COOP_MIXEDK = os.environ.get("EXL3_MOE_COOP_MIXEDK", "1") != "0"
 COOPMK_PLAN = int(os.environ.get("EXL3_COOPMK_PLAN", "3"))
 _coopmk_warned = False
+_coopmk_announced = False
 
 
 def _coopmk_module():
     """The extension module with the CoopMK kernels, or None for a build without them. Only
-    consulted when EXL3_MOE_COOP_MIXEDK=1"""
+    consulted for unified mixed-K layers while EXL3_MOE_COOP_MIXEDK is not 0"""
     global _coopmk_warned
     if hasattr(ext, "CoopMK"):
         return ext
     if not _coopmk_warned:
         _coopmk_warned = True
-        print(" !! EXL3_MOE_COOP_MIXEDK=1 but this exllamav3_ext build has no CoopMK kernels; "
-              "mixed-K layers keep the unified path")
+        print(" !! Cooperative mixed-K decode is enabled but this exllamav3_ext build has no CoopMK "
+              "kernels; mixed-K layers keep the unified path")
     return None
+
+
+def _coopmk_announce():
+    """One startup line, printed by the first unified mixed-K layer, stating which decode path
+    mixed-K layers take and how to switch it"""
+    global _coopmk_announced
+    if _coopmk_announced:
+        return
+    _coopmk_announced = True
+    if COOP_MIXEDK:
+        print(" -- Mixed-K layers: cooperative decode kernels on (default), sync-free unified path "
+              f"{'on' if MIXEDK_NOSYNC else 'off'}; EXL3_MOE_COOP_MIXEDK=0 restores the unified kernel")
+    else:
+        print(" -- Mixed-K layers: cooperative decode kernels off (EXL3_MOE_COOP_MIXEDK=0), sync-free "
+              f"unified path {'on' if MIXEDK_NOSYNC else 'off'}")
 
 @dataclass
 class FusedBuffers:
@@ -889,11 +911,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def _coopmk_setup(self):
         """Bind the cooperative runtime-K decode kernels to this unified mixed-K layer
-        (EXL3_MOE_COOP_MIXEDK=1). self.coopmk stays None, and the layer keeps the unified mixed-K
-        path, whenever the layer is outside what the kernels implement"""
+        (default on, EXL3_MOE_COOP_MIXEDK=0 opts out). self.coopmk stays None, and the layer keeps
+        the unified mixed-K path, whenever the layer is outside what the kernels implement"""
         self.coopmk = None
         self.coopmk_out = None
-        if not (COOP_MIXEDK and getattr(self, "mixedk_unified", False)):
+        if not getattr(self, "mixedk_unified", False):
+            return
+        _coopmk_announce()
+        if not COOP_MIXEDK:
             return
         # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
         # requires the last), whole expert range on this device
@@ -1282,7 +1307,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
         # Unified mixed-K layer at a decode / verify shape: cooperative runtime-K kernels
-        # (EXL3_MOE_COOP_MIXEDK=1; self.coopmk is only bound when the layer qualifies)
+        # (default on, EXL3_MOE_COOP_MIXEDK=0 opts out; self.coopmk is only bound when the
+        # layer qualifies)
         elif (
             self.coopmk is not None and bsz <= MAX_BSZN and y.dtype == torch.half and
             selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
@@ -1350,7 +1376,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Same device-side count for the uniform fused path when it runs all-fused
                 # (run_fused(-1): no count readback follows), e.g. a uniform-K MTP layer
                 _nosync_fused = (
-                    MIXEDK_NOSYNC and not mixedk_unified_ok and
+                    MIXEDK_NOSYNC_FUSED and not mixedk_unified_ok and
                     self.fused_mode_buffers is not None and
                     self.num_local_experts == self.num_experts and
                     num_tokens * top_k <= self.fused_rows

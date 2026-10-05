@@ -567,6 +567,36 @@ read.
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
 
+## Mixed-K MoE layers
+
+These apply only to MoE layers whose experts mix bit widths (a "mixed-K" pack, where the loader
+prints `Mixed-K UNIFIED kernel enabled in ...`). Layers with a single bit width, and therefore
+whole uniform-K packs, never reach them.
+
+### `EXL3_MOE_COOP_MIXEDK` (default: on)
+
+At decode and MTP/DFlash verify shapes (bsz <= 8) a mixed-K layer runs through the two-stage
+cooperative kernels the uniform-K layers use, with each expert's gate/up/down bit width read from
+a device table (`CoopMK`): no sort, count, slot tables or host synchronization. Prefill and larger
+batches keep the unified mixed-K kernel. At load, the first mixed-K layer prints one line naming
+the active path, and every layer that binds prints `Mixed-K coop decode kernels in ...`. The routed
+sum is accumulated in a different order than the unified kernel's, so outputs are close but not
+bit-identical to `EXL3_MOE_COOP_MIXEDK=0`, which restores the unified kernel at every shape.
+`EXL3_MIXEDK_LEGACY=1` (per-K-group dispatch) also disables it, since the unified layer state is
+what binds.
+
+### `EXL3_MOE_MIXEDK_NOSYNC` (default: on for mixed-K layers)
+
+Sync-free unified mixed-K dispatch for small row counts (at most 16 tokens): expert counts stay on
+the device and the per-layer host readbacks are skipped. Bit-identical output. With the cooperative
+kernels on it only covers the shapes they do not take. Unset applies it to mixed-K layers only;
+`0` turns it off; `1` additionally applies the same device-side count to the uniform fused path.
+
+### `EXL3_COOPMK_PLAN` (default: `3`)
+
+Kernel variant set for the cooperative mixed-K kernels: `1` all-K, `2` split by decode kind, `3`
+all-K capped at 64 registers, `4` split and capped at 64.
+
 ## Model loading
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
