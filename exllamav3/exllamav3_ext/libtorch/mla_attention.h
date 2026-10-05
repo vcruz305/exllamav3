@@ -97,6 +97,7 @@ struct BC_MLAttention
     // DSA lightning indexer (set_indexer): 0 = none, 1 = full, 2 = shared
     int idx_mode = 0;
     std::shared_ptr<BC_LinearEXL3> idx_wq_b;   // full only, quantized (q_lora_rank -> H_i * D_i)
+    c10::optional<at::Tensor> idx_wq_b_w;      // full only, fp16 (q_lora_rank, H_i * D_i) alternative
     c10::optional<at::Tensor> idx_wk_w;        // (hidden, D_i) fp16, full only
     c10::optional<at::Tensor> idx_k_norm_w;    // (D_i,) fp16
     c10::optional<at::Tensor> idx_k_norm_b;    // (D_i,) fp16
@@ -224,6 +225,10 @@ struct BC_MLAttention
         c10::optional<at::Tensor> kpool_ape = {},
         c10::optional<at::Tensor> kpool_plane = {}
     );
+
+    // Unquantized indexer wq_b (packs that keep it fp16, e.g. RED-SNOW GLM-5.3-Flash): call
+    // before set_indexer, which then accepts wq_b = None
+    void set_indexer_wq_b_fp16(at::Tensor w);
 
     bool needs_configure(int bsz, int q_len, int regime);
 

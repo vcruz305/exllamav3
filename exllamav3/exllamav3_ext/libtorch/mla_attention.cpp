@@ -102,7 +102,7 @@ void BC_MLAttention::set_indexer
 )
 {
     TORCH_CHECK(mode == 1 || mode == 2, "BC_MLAttention: indexer mode must be 1 (full) or 2 (shared)");
-    TORCH_CHECK(mode != 1 || (wq_b && wk_w && k_norm_w && k_norm_b && weights_w && kidx),
+    TORCH_CHECK(mode != 1 || ((wq_b || idx_wq_b_w) && wk_w && k_norm_w && k_norm_b && weights_w && kidx),
                 "BC_MLAttention: full indexer requires all indexer tensors");
     TORCH_CHECK(!kpool || mode != 1 || (gate_w && kpool_ape && kpool_plane),
                 "BC_MLAttention: kpool full indexer requires gate weight, APE and pooled plane");
@@ -121,6 +121,13 @@ void BC_MLAttention::set_indexer
     idx_gate_w = std::move(gate_w);
     idx_kpool_ape = std::move(kpool_ape);
     cache_kpool = std::move(kpool_plane);
+}
+
+void BC_MLAttention::set_indexer_wq_b_fp16(at::Tensor w)
+{
+    TORCH_CHECK(w.dtype() == at::kHalf && w.dim() == 2 && w.is_contiguous(),
+                "BC_MLAttention: fp16 wq_b must be a contiguous (in, out) half matrix");
+    idx_wq_b_w = std::move(w);
 }
 
 bool BC_MLAttention::needs_configure(int bsz, int q_len, int regime)
@@ -600,9 +607,12 @@ void BC_MLAttention::run_gr
         }
         if (idx_mode == 1)
         {
-            exl3_gemm_gr(s.q_a, idx_wq_b->trellis, s.qidx, idx_wq_b->suh,
-                         xh.view({-1}).narrow(0, 0, (int64_t) R * q_lora_rank).view({R, q_lora_rank}),
-                         idx_wq_b->svh, -1, idx_wq_b->mcg, idx_wq_b->mul1, 0, graph);
+            if (idx_wq_b)
+                exl3_gemm_gr(s.q_a, idx_wq_b->trellis, s.qidx, idx_wq_b->suh,
+                             xh.view({-1}).narrow(0, 0, (int64_t) R * q_lora_rank).view({R, q_lora_rank}),
+                             idx_wq_b->svh, -1, idx_wq_b->mcg, idx_wq_b->mul1, 0, graph);
+            else
+                hgemm_gr(s.q_a, idx_wq_b_w.value(), s.qidx, graph);
             if (rope_active)
             {
                 c10::optional<at::Tensor> no_k = {};

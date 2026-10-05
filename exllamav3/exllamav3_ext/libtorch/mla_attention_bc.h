@@ -61,6 +61,7 @@ py::class_<BC_MLAttention, std::shared_ptr<BC_MLAttention>>(m, "BC_MLAttention")
     py::arg("xh"),
     py::arg("h32")
 )
+.def("set_indexer_wq_b_fp16", &BC_MLAttention::set_indexer_wq_b_fp16, py::arg("w"))
 .def("set_indexer", &BC_MLAttention::set_indexer,
     py::arg("mode"),
     py::arg("wq_b"),

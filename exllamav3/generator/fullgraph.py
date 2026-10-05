@@ -192,7 +192,24 @@ class ForwardGraphs:
         del params["prefill"]
         return None
 
+    def _bc_ready(self) -> bool:
+        """Every MLA layer must run its graphed BC block: the eager dispatch path branches on host
+        cache lengths (pool completion, regime) and would be frozen into the capture"""
+        from ..modules.mla_attn import MLAttention
+        for m in self.model.modules:
+            attn = getattr(m, "attn", None)
+            if isinstance(attn, MLAttention):
+                bc = [v for k, v in attn.dispatch_cache.items() if isinstance(k, tuple) and k[0] == "bcm"]
+                if not bc or not all(bc):
+                    return False
+        return True
+
     def _capture(self, key, kind, input_ids, params, host_len, extra):
+        if not self._bc_ready():
+            self.disabled = True
+            print(f" !! [fullgraph {self.tag}] disabled: an MLA layer runs the eager dispatch path "
+                  f"(BC declined; EXL3_BC_MLA_FP16_WQB=1 admits fp16 indexer wq_b)", flush = True)
+            return None
         dev = self.device
         e = _Entry()
         e.ids = input_ids.to(dev).clone()

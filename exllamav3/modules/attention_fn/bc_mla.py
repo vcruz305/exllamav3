@@ -11,6 +11,21 @@ import os as _os
 # each step) instead of patched host scalars, so a graph captured around the whole forward
 # (EXL3_FULL_GRAPH) stays valid at every context length. Same kernels, same arithmetic
 _dsa_devpos = _os.environ.get("EXL3_DSA_DEVPOS", "0") == "1"
+
+# EXL3_BC_MLA_FP16_WQB=1: admit full-indexer layers whose indexer wq_b is stored unquantized
+# (fp16, e.g. RED-SNOW GLM-5.3-Flash) into the graphed BC path (hgemm in place of the EXL3
+# GEMM). Without it those layers decline BC and run the eager dispatch path, which syncs on
+# host lengths and cannot be captured. Changes the MLA numerics (BC vs dispatch kernels)
+_bc_fp16_wqb = _os.environ.get("EXL3_BC_MLA_FP16_WQB", "0") == "1"
+
+
+def _wqb_fp16_ok(p, in_features):
+    w = getattr(getattr(p, "inner", None), "weight", None)
+    return (
+        _bc_fp16_wqb and p is not None and p.quant_type != "exl3" and w is not None and
+        w.dtype == torch.half and w.dim() == 2 and w.shape[0] == in_features and
+        getattr(p.inner, "bias", None) is None
+    )
 from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
     MAX_BSZ, MAX_QLEN
 
@@ -142,9 +157,13 @@ class BCMLA:
                 self.idx_gate_w = m.idx_kpool_gate.data.T.contiguous()
             else:
                 self.cache_kpool = self.idx_gate_w = None
+            wqb_q = m.idx_wq_b.quant_type == "exl3"
+            if not wqb_q:
+                self.idx_wq_b_w = m.idx_wq_b.inner.weight.contiguous()
+                self.bc.set_indexer_wq_b_fp16(self.idx_wq_b_w)
             self.bc.set_indexer(
                 mode = 1,
-                wq_b = m.idx_wq_b.inner.bc,
+                wq_b = m.idx_wq_b.inner.bc if wqb_q else None,
                 wk_w = m.idx_wk.inner.weight,
                 k_norm_w = m.idx_k_norm.weight.data.half().contiguous(),
                 k_norm_b = m.idx_k_norm.bias.data.half().contiguous(),
@@ -616,7 +635,8 @@ def build_bc_mla(module, layer):
                 ))
             )) and
             (m.indexer_mode == "shared" or (
-                m.q_lora_rank and _proj_ok(m.idx_wq_b, in_features = m.q_lora_rank) and
+                m.q_lora_rank and (_proj_ok(m.idx_wq_b, in_features = m.q_lora_rank) or
+                                   _wqb_fp16_ok(m.idx_wq_b, m.q_lora_rank)) and
                 getattr(m.idx_wk.inner, "weight", None) is not None and
                 m.idx_wk.inner.weight.dtype == torch.half and
                 getattr(m.idx_weights.inner, "weight", None) is not None and
