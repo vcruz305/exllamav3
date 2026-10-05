@@ -8,7 +8,7 @@ from ..model.model import Model
 from ..modules import RMSNorm, Embedding, TransformerBlock, MLAttention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
-from ..ext import exllamav3_ext as ext
+from ..util.draft_head import pruned_logits
 import os as _os
 # EXL3_GLM5_MTP_HEAD_N: draft-only lm_head column slice width (0 = full head, the default)
 _GLM5_MTP_HEAD_N = int(_os.environ.get("EXL3_GLM5_MTP_HEAD_N", "0"))
@@ -236,18 +236,9 @@ class Glm5NextMTPModel(Model):
             # slice of the shared lm_head. Draft-only (verification uses the full head, so the
             # verified output is unchanged; a draft whose argmax lies past the slice is a reject)
             if _GLM5_MTP_HEAD_N > 0 and not params.get("export_draft_conf"):
-                ph = self._pruned_head(lm, logits.device)
-                if ph is not None:
-                    tr, svh, n2 = ph
-                    inner = lm.inner
-                    b, q, k = logits.shape
-                    x = logits.reshape(b * q, k)
-                    if x.dtype != torch.half: x = x.half()
-                    x = x.contiguous()
-                    xh = torch.empty_like(x)
-                    y = torch.empty((b * q, n2), dtype = torch.half, device = x.device)
-                    ext.exl3_gemm(x, tr, y, inner.suh, xh, svh, -1, inner.mcg, inner.mul1, 0)
-                    return torch.argmax(y, dim = -1).view(b, q)
+                y = pruned_logits(lm, logits, _GLM5_MTP_HEAD_N)
+                if y is not None:
+                    return torch.argmax(y, dim = -1)
             logits = lm.forward(logits, params)
             if params.get("export_draft_conf"):
                 # Per-position confidence for the generator's draft truncation: the argmax logit
@@ -263,23 +254,3 @@ class Glm5NextMTPModel(Model):
             state = self.attached_model().tp_producer.send(state)
             return self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
 
-
-    def _pruned_head(self, lm, device):
-        cached = getattr(self, "_pruned_head_cache", None)
-        if cached is not None:
-            return cached if cached is not False else None
-        inner = getattr(lm, "inner", None)
-        tr = getattr(inner, "trellis", None)
-        if tr is None or getattr(inner, "bias", None) is not None or not hasattr(inner, "svh"):
-            self._pruned_head_cache = False
-            return None
-        n_full = tr.shape[1] * 16
-        n2 = min(_GLM5_MTP_HEAD_N, n_full) // 128 * 128
-        if n2 <= 0 or n2 >= n_full:
-            self._pruned_head_cache = False
-            return None
-        tr2 = tr[:, :n2 // 16, :].contiguous().to(device)
-        svh2 = inner.svh[:n2].contiguous().to(device)
-        self._pruned_head_cache = (tr2, svh2, n2)
-        print(f" -- GLM5 MTP pruned draft head: {n2}/{n_full} columns", flush = True)
-        return self._pruned_head_cache
