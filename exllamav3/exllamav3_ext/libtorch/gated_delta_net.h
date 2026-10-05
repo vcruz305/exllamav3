@@ -156,6 +156,16 @@ struct BC_GatedDeltaNetSplit
     at::Tensor g_a_weight_t;      // (Hv, hidden) half
     at::Tensor g_b_weight_t;      // (Nv*Hv, Hv) half
 
+    // Fused low-rank GEMVs (set_kda_fused, opt-in): concatenated transposed weights
+    bool kda_fused = false;
+    at::Tensor lr_a_weight_t;     // (Nv + Hk + Hv, hidden) half: b | f_a | g_a
+    at::Tensor lr_b_weight_t;     // (Nv*Hk + Nv*Hv, Hk) half: f_b | g_b (Hk == Hv)
+    void set_kda_fused(at::Tensor lr_a, at::Tensor lr_b);
+
+    // Deferred state commit (set_kda_deferred, opt-in): see kda_deferred_gr in gdn.cu
+    bool kda_deferred = false;
+    void set_kda_deferred(bool on) { kda_deferred = on; }
+
     struct Slot
     {
         bool configured = false;

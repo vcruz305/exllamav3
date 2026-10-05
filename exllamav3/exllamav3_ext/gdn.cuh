@@ -248,3 +248,17 @@ struct StateRewindJob
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
+
+// KDA fused low-rank GEMVs (EXL3_KDA_FUSED_GEMV, gdn.cu): b/f_a/g_a as one launch over a
+// concatenated weight, f_b/g_b as one launch
+void kda_lr_a_gr(const at::Tensor& x, const at::Tensor& w, at::Tensor& out_b, at::Tensor& out_fa,
+                 at::Tensor& out_ga, Graph* graph);
+void kda_lr_b_gr(const at::Tensor& xa, const at::Tensor& xb, const at::Tensor& w, at::Tensor& out1,
+                 at::Tensor& out2, Graph* graph);
+
+// KDA deferred state commit (EXL3_KDA_DEFERRED, gdn.cu)
+void kda_deferred_gr(const at::Tensor& mixed_qkv, const at::Tensor& g, const at::Tensor& beta,
+                     at::Tensor& recurrent_state, at::Tensor& core_attn_out, const at::Tensor& slots, Graph* graph);
+void kda_deferred_flush(at::Tensor& recurrent_state, const at::Tensor& slots);
+void kda_pending_rewind(const at::Tensor& metas, int n);
+int64_t kda_pending_meta_offset(const at::Tensor& recurrent_state, int slot);

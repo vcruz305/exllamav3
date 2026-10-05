@@ -644,6 +644,28 @@ vocabulary. Verification keeps the full head, so verified output is unchanged; a
 argmax lies past the slice simply gets rejected. Saves head bandwidth per draft step but lowers
 acceptance on some content (math dropped about 10% at N=98304 on a short sample).
 
+### `EXL3_KDA_FUSED_GEMV` (default: `0`)
+
+KDA layers (GLM-5.3 / Kimi Linear) in the graph-captured decode path: the three fp16 GEMVs that
+read the layer input (`b`, `f_a`, `g_a`) run as one launch over a concatenated weight, each weight
+row read once for all input rows, and the two low-rank second stages (`f_b`, `g_b`) as a second
+launch. Needs head dims of 128. Costs about 6.5 MB of extra fp16 weights per layer. On RED-SNOW
+2.49 bpw (CoopMK, MTP ndt 2) the verify round went from 76.8 to 76.2 ms.
+
+### `EXL3_KDA_DEFERRED` (default: `0`)
+
+Deferred recurrent-state commit for KDA layers in the graph-captured decode/verify path. The
+history-mode rule kernel normally writes one fp32 state per verify row so a rejected draft can be
+rewound; with this switch a forward writes the state at most once (committing the previous
+forward's kept rows first), and a rewind only lowers a pending row count. Prefill, the torch path
+and state stashing flush the pending rows first. Same per-row arithmetic as the history kernel. On
+RED-SNOW 2.49 bpw, together with `EXL3_KDA_FUSED_GEMV=1`, the verify round went from 76.8 to
+74.9 ms.
+
+Teacher-forced gate for both switches on RED-SNOW (809 verify rows, q=3, Q4 KV, vs the oracle):
+top-1 0.9567, KL64 0.0106, NLL 1.9332 (no-flags 0.9555 / 0.0122 / 1.9349); the deferred commit
+gives exactly the same rows as the fused GEMVs alone. Golden prompts pass.
+
 ### `EXL3_ADAPTIVE_DRAFT` (default: `0`), `EXL3_ADAPTIVE_DRAFT_ADD` (default: `2`)
 
 MTP draft window = the previous round's accepted drafts + `EXL3_ADAPTIVE_DRAFT_ADD`, capped at
