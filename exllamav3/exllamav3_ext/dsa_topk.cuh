@@ -49,5 +49,6 @@ void dsa_seq_state_gr
     at::Tensor& arr,
     int bsz,
     int q_len,
-    Graph* graph
+    Graph* graph,
+    int bound_div = 1
 );

@@ -578,14 +578,21 @@ void BC_MLAttention::run_gr
         // device state array, filled here from cache_seqlens; the single-job slots patch the
         // host scalars instead
         bool multirow = bsz > 1;
+        // EXL3_DSA_DEVPOS (bc_mla.py hands a state array to a single-job full-indexer slot): the
+        // scan width, causal clamps and the k-pool expand position come from device memory
+        // like the batched slots, so nothing position-dependent is patched per call and a
+        // graph captured around this step stays valid at every context length. Same kernels
+        // and arithmetic as the scalar path (MULTIROW with one job), so bit-identical output
+        bool devpos = !multirow && idx_mode == 1 && s.dsa_arr.defined();
         int* arr_pos = nullptr;
         int* arr_bound = nullptr;
         c10::optional<at::Tensor> arr_bound_t;
         // Only the scoring/top-k stages consume the state array; shared-indexer slots
         // gather through an external selection and need none of it
-        if (multirow && idx_mode == 1)
+        if ((multirow || devpos) && idx_mode == 1)
         {
-            dsa_seq_state_gr(cache_seqlens, s.dsa_arr, bsz, q_len, graph);
+            dsa_seq_state_gr(cache_seqlens, s.dsa_arr, bsz, q_len, graph,
+                             devpos && index_kpool ? index_kpool : 1);
             dbg("seq_state");
             arr_pos = (int*) s.dsa_arr.data_ptr();
             arr_bound = arr_pos + (int) s.dsa_arr.size(1);
@@ -614,6 +621,7 @@ void BC_MLAttention::run_gr
                 // kpool: score over the pooled plane; scan width and causal bound count in
                 // POOL units (the kernel's compress_rate handles the per-row token bound)
                 int64_t t_scan = index_kpool ? t_total / index_kpool : t_total;
+                bool dev_args = multirow || devpos;
                 std::vector<void*> args =
                 {
                     (void*) s.qidx.data_ptr(),
@@ -621,10 +629,10 @@ void BC_MLAttention::run_gr
                     index_kpool ? (void*) cache_kpool.value().data_ptr()
                                 : (void*) cache_kidx.value().data_ptr(),
                     (void*) s.scores.data_ptr(),
-                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
+                    dev_args ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
                     (void*) (uintptr_t) (uint32_t) R,
-                    multirow ? (void*) arr_pos : (void*) (uintptr_t) (uint32_t) (int) position,
-                    multirow ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
+                    dev_args ? (void*) arr_pos : (void*) (uintptr_t) (uint32_t) (int) position,
+                    dev_args ? (void*) arr_bound : (void*) (uintptr_t) (uint32_t) (int) t_scan,
                     (void*) block_table.data_ptr(),
                     (void*) (uintptr_t) (uint32_t) (multirow ? (int) block_table.size(1) : 0),
                 };
@@ -632,7 +640,7 @@ void BC_MLAttention::run_gr
                 dbg("fewq");
                 if (graph)
                 {
-                    if (!multirow)
+                    if (!dev_args)
                     {
                         graph->record_param(s.k_fewq->handle(), GP_dsa_T, 4, 4);
                         graph->record_param(s.k_fewq->handle(), GP_dsa_qpos, 6, 4);
@@ -645,29 +653,36 @@ void BC_MLAttention::run_gr
                 }
             }
             // Batched: the per-job bound rides as a device pointer (t_seq = q_len), so the
-            // top-k needs no scan-width patch and only reads freshly written score rows
+            // top-k needs no scan-width patch and only reads freshly written score rows.
+            // Device-position single job: the scan width is the device scalar (t_seq = 0
+            // keeps the same top-k variant as the patched-scalar path)
             if (multirow)
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, q_len);
             else if (index_kpool)
             {
                 // Select pools, then expand to raw token indices (x P) and append the query's
                 // incomplete tail pool per row
-                dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph);
+                if (devpos)
+                    dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph, arr_bound_t, 0);
+                else
+                    dsa_topk_gr(s.scores, s.pool_idx, index_topk / index_kpool, graph);
                 dbg("pool_topk");
                 std::vector<void*> args =
                 {
                     (void*) s.pool_idx.data_ptr(),
                     (void*) s.indices.data_ptr(),
-                    (void*) (uintptr_t) (uint32_t) (int) position,
+                    devpos ? (void*) arr_pos : (void*) (uintptr_t) (uint32_t) (int) position,
                 };
                 int k_pad = (int) s.indices.size(1);
                 s.k_pool_expand->launch(R, CEIL_DIVIDE(k_pad, 256), 1, args, stream);
-                if (graph)
+                if (graph && !devpos)
                 {
                     graph->record_param(s.k_pool_expand->handle(), GP_dsa_qpos, 2, 4);
                     graph->record_param(s.k_pool_expand->handle(), GP_end, 0);
                 }
             }
+            else if (devpos)
+                dsa_topk_gr(s.scores, s.indices, index_topk, graph, arr_bound_t, 0);
             else
                 dsa_topk_gr(s.scores, s.indices, index_topk, graph);
         dbg("topk");
@@ -929,13 +944,14 @@ void BC_MLAttention::run
     if (regime == 1)
     {
         bool multirow = bsz > 1;
+        bool devpos = !multirow && idx_mode == 1 && s.dsa_arr.defined();
         if (idx_mode == 1)
         {
             // qidx rope, then per mode: the batched slots derive their scoring bounds on
             // device (dsa_seq_state reads cache_seqlens) and the top-k bound is a device
             // pointer, so only the pointer-typed params patch; the single-job slots patch
-            // the scalar scan width and clamps
-            if (multirow)   // seq-state derive precedes the qidx stages in the graph
+            // the scalar scan width and clamps (device-position slots: nothing scalar)
+            if (multirow || devpos)   // seq-state derive precedes the qidx stages in the graph
                 params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
             if (rope_active)
             {
@@ -950,6 +966,8 @@ void BC_MLAttention::run
                 params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr()); // fewq
                 params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
             }
+            else if (devpos)
+                params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr()); // fewq
             else
             {
                 // kpool: fewq/topk scan widths in POOL units; the expand kernel's row-0

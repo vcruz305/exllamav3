@@ -4,6 +4,13 @@ from ...util.device_copy import to_device
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+import os as _os
+
+# EXL3_DSA_DEVPOS=1: single-job full-indexer sparse slots read the scoring scan width, causal
+# clamps and the k-pool expand position from a device state array (filled from cache_seqlens
+# each step) instead of patched host scalars, so a graph captured around the whole forward
+# (EXL3_FULL_GRAPH) stays valid at every context length. Same kernels, same arithmetic
+_dsa_devpos = _os.environ.get("EXL3_DSA_DEVPOS", "0") == "1"
 from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
     MAX_BSZ, MAX_QLEN
 
@@ -386,6 +393,7 @@ class BCMLA:
                 dict(page_size = PAGE_SIZE, P = P, D = Di, MAXPOOLS = q_len // P + 1), 2, 1)
 
         indices = dsa_arr = ws_ml = ws_acc = None
+        devpos = _dsa_devpos and bsz == 1 and full and regime == 1
         k_dsa_split = k_dsa_combine = None
         if regime == 1:
             if full:
@@ -410,7 +418,7 @@ class BCMLA:
                 scores.fill_(-float("inf"))
                 # Batched slots score in MULTIROW mode: T / q_pos0 / bound_max are per-job
                 # device pointers into the seq-state array, the block table one row per job
-                mr = 1 if bsz > 1 else 0
+                mr = 1 if (bsz > 1 or devpos) else 0
                 bnd_t = "*i32:16" if mr else "i32"
                 sig = {
                     "q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
@@ -437,13 +445,13 @@ class BCMLA:
                 from .dsa_triton import _dsa_pool_expand_kernel
                 pool_idx = sbuf("bcm_pool_idx", R, kp_pool, dtype = torch.int32)
                 k_pool_expand = _compile_kernel(dev, _dsa_pool_expand_kernel,
-                    {"pool_idx": "*i32", "out": "*i32", "q_pos0": "i32"}
+                    {"pool_idx": "*i32", "out": "*i32", "q_pos0": "*i32" if devpos else "i32"}
                     | {n: "constexpr" for n in (
                         "P", "SEL", "K_pad", "KP_pool", "TAIL", "SEQ", "MULTIROW", "BLOCK")},
                     dict(P = P, SEL = sel, K_pad = kp, KP_pool = kp_pool,
                          TAIL = 1 if m.index_kpool_tail else 0, SEQ = q_len,
-                         MULTIROW = 0, BLOCK = 256), 4, 1)
-            if bsz > 1:
+                         MULTIROW = 1 if devpos else 0, BLOCK = 256), 4, 1)
+            if bsz > 1 or devpos:
                 dsa_arr = g_tensor_cache.get(dev, (2, MAX_BSZ), torch.int32, "bcm_dsa_arr")
             # ws_acc rows are D_c wide: OUT_LATENT never accumulates the rope half
             ws_ml = sbuf("bcm_dsa_wsml", R * hb * N_SPLITS * BLOCK_H * 2, dtype = torch.float)

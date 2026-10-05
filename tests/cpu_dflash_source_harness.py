@@ -174,6 +174,9 @@ NS_GLOBALS = {
     "ThreadPoolExecutor": lambda **kw: None,
     "DraftConfidenceCalibrator": lambda confidence: NS(confidence=confidence),
     "ext": NS(BC_SAM=lambda: NS()), "cuda_sync_active": lambda: None,
+    # Opt-in generator levers (EXL3_FULL_GRAPH, EXL3_ADAPTIVE_DRAFT) stay off here
+    "_FULL_GRAPH": False, "_FULL_GRAPH_DRAFT": False, "ForwardGraphs": None,
+    "_ADAPTIVE_DRAFT": False, "_ADAPTIVE_DRAFT_ADD": 2,
     "tensor_hash_checksum": lambda tensor, prev: hashlib.blake2b(
         (prev or b"") + repr(tensor.tolist()).encode(), digest_size=16).digest(),
 }
