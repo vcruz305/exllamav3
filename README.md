@@ -10,6 +10,7 @@ ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs
 - **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
+- **Mixed-K MoE packs** - Layers whose experts mix bit widths decode through cooperative runtime-K kernels by default (`EXL3_MOE_COOP_MIXEDK=0` opts out, see [env_vars.md](doc/env_vars.md#mixed-k-moe-layers)).
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
 - **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
 

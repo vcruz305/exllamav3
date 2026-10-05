@@ -1,6 +1,10 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+import os as _os
+from ..util.draft_head import pruned_logits
+# EXL3_DFLASH2_HEAD_N: draft-only lm_head column slice width for the candidate selector (0 = off)
+_DFLASH2_HEAD_N = int(_os.environ.get("EXL3_DFLASH2_HEAD_N", "0"))
 import weakref
 
 from ..cache import Cache
@@ -270,7 +274,15 @@ class DFlash2Model(Model):
         target = self.attached_model()
         lm = target.modules[target.logit_layer_idx]
         logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
+        # EXL3_DFLASH2_HEAD_N > 0: candidates from a leading column slice of the target head
+        # (draft-only; the verifier keeps the full head, so verified output is unchanged)
+        vocab = target.config.vocab_size
+        sliced = pruned_logits(lm, logits, _DFLASH2_HEAD_N) if _DFLASH2_HEAD_N > 0 else None
+        if sliced is not None:
+            logits = sliced.float()
+            vocab = min(vocab, sliced.shape[-1])
+        else:
+            logits = lm.forward(logits, params)
 
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
@@ -284,7 +296,7 @@ class DFlash2Model(Model):
         out, confidence = self.selector.walk_block(
             to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
             return_confidence = export_conf,
-            vocab_size = target.config.vocab_size,
+            vocab_size = vocab,
             scale = self.config.output_multiplier,
             softcap = self.config.final_logit_softcapping,
         )

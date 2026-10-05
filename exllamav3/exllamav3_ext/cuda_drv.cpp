@@ -42,6 +42,7 @@ const CudaDrv& CudaDrv::instance()
         d.launch_kernel                     = (decltype(&cuLaunchKernel))                 drv_sym(lib, DRV_STR(cuLaunchKernel));
         d.graph_kernel_node_get_params      = (decltype(&cuGraphKernelNodeGetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeGetParams));
         d.graph_exec_kernel_node_set_params = (decltype(&cuGraphExecKernelNodeSetParams)) drv_sym(lib, DRV_STR(cuGraphExecKernelNodeSetParams));
+        d.graph_kernel_node_set_params      = (decltype(&cuGraphKernelNodeSetParams))     drv_sym(lib, DRV_STR(cuGraphKernelNodeSetParams));
         return d;
     }
     ();

@@ -16,6 +16,7 @@ struct CudaDrv
     decltype(&cuLaunchKernel)                   launch_kernel;
     decltype(&cuGraphKernelNodeGetParams)       graph_kernel_node_get_params;
     decltype(&cuGraphExecKernelNodeSetParams)   graph_exec_kernel_node_set_params;
+    decltype(&cuGraphKernelNodeSetParams)       graph_kernel_node_set_params;
 
     static const CudaDrv& instance();
 };

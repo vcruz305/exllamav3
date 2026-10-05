@@ -26,6 +26,11 @@ from ..util import profile_opt
 import os as _os
 _BATCH_VERIFY = _os.environ.get("EXL3_BATCH_VERIFY", "1") != "0"
 _MTP_DEVICE_DRAFT = _os.environ.get("EXL3_MTP_DEVICE_DRAFT", "1") != "0"
+# EXL3_ADAPTIVE_DRAFT=1: MTP draft window = previous round's accepted drafts + 2, capped at
+# num_draft_tokens (fixed depth stays the default)
+_ADAPTIVE_DRAFT = _os.environ.get("EXL3_ADAPTIVE_DRAFT", "0") == "1"
+_ADAPTIVE_DRAFT_ADD = int(_os.environ.get("EXL3_ADAPTIVE_DRAFT_ADD", "2"))
+from .fullgraph import FULL_GRAPH as _FULL_GRAPH, FULL_GRAPH_DRAFT as _FULL_GRAPH_DRAFT, ForwardGraphs
 
 class Generator:
 
@@ -273,6 +278,17 @@ class Generator:
         self.draft_confidence = draft_confidence
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+        # Whole-forward CUDA graphs (EXL3_FULL_GRAPH=1, see fullgraph.py)
+        self.fullgraph = ForwardGraphs(model, "target") if _FULL_GRAPH else None
+        self.fullgraph_draft = (
+            ForwardGraphs(draft_model, "draft")
+            if (_FULL_GRAPH and _FULL_GRAPH_DRAFT and self.mtp_draft) else None
+        )
+        if _FULL_GRAPH:
+            print(f" -- EXL3_FULL_GRAPH: target graphs {'on' if not self.fullgraph.disabled else 'DISABLED'}, "
+                  f"draft graphs {'on' if self.fullgraph_draft is not None else 'off'}, "
+                  f"adaptive draft {'on' if _ADAPTIVE_DRAFT else 'off'}", flush = True)
 
 
     def num_remaining_jobs(self):
@@ -777,6 +793,11 @@ class Generator:
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
         window = self.num_draft_tokens
+        if _ADAPTIVE_DRAFT:
+            prev = [getattr(job, "_last_accepted_drafts", None) for job in self.active_jobs if job.is_prefill_done()]
+            prev = [p for p in prev if p is not None]
+            if prev:
+                window = max(1, min(window, max(prev) + _ADAPTIVE_DRAFT_ADD))
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -790,7 +811,13 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
-            batch_state = self.draft_model.forward(batch_ids, params)
+            batch_state = None
+            if self.fullgraph_draft is not None and batch_size == 1 and cal is None:
+                batch_state = self.fullgraph_draft.run(
+                    "forward", batch_ids, params, int(cache_seqlens[0]), extra = ("target_hidden",)
+                )
+            if batch_state is None:
+                batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
@@ -1069,10 +1096,17 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        batch_logits = None
+        if (
+            self.fullgraph is not None and batch_size == 1 and len(batch_jobs) == 1 and
+            not active_embeddings and positions is None and batch_ids.dim() == 2
+        ):
+            batch_logits = self.fullgraph.run("forward", batch_ids, params, int(cache_seqlens[0]))
+        if batch_logits is None:
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.
@@ -1322,6 +1356,7 @@ class Generator:
                         ))
 
                 accepted_lengths.append(accepted_length)
+                job._last_accepted_drafts = accepted_length - 1
                 j += 1
 
         # Update the draft-confidence calibration with this round's verification outcomes (any
@@ -1382,16 +1417,22 @@ class Generator:
                 # Position K was drafted from the last target state already. Replace accepted
                 # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
                 if accepted_length > 1:
-                    self.draft_model.prefill(
-                        batch_ids[a_idx:b_idx, 1:accepted_length],
-                        {
-                            "attn_mode": "flash_attn",
-                            "block_table": block_index[a_idx:b_idx],
-                            "cache": self.draft_cache,
-                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
-                            "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
-                        },
-                    )
+                    pf_ids = batch_ids[a_idx:b_idx, 1:accepted_length]
+                    pf_params = {
+                        "attn_mode": "flash_attn",
+                        "block_table": block_index[a_idx:b_idx],
+                        "cache": self.draft_cache,
+                        "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
+                        "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
+                    }
+                    done_ = False
+                    if self.fullgraph_draft is not None and b_idx - a_idx == 1:
+                        done_ = self.fullgraph_draft.run(
+                            "prefill", pf_ids, pf_params, int(pf_params["cache_seqlens"][0]),
+                            extra = ("target_hidden",)
+                        ) is not None
+                    if not done_:
+                        self.draft_model.prefill(pf_ids, pf_params)
 
                 # The next unprocessed token is paired with the preceding target hidden state.
                 job.mtp_last_hidden = target_hidden[

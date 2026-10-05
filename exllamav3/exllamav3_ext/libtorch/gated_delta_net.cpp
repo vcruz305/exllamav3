@@ -213,6 +213,24 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     qkvz_mul1 = mul1;
 }
 
+void BC_GatedDeltaNetSplit::set_kda_fused(at::Tensor lr_a, at::Tensor lr_b)
+{
+    TORCH_CHECK(kda, "set_kda_fused: KDA layers only");
+    TORCH_CHECK(k_head_dim == v_head_dim && k_head_dim == 128, "set_kda_fused: needs Hk == Hv == 128");
+    TORCH_CHECK(lr_a.dtype() == at::kHalf && lr_a.dim() == 2 && lr_a.is_contiguous() &&
+                lr_a.size(0) == num_v_heads + k_head_dim + v_head_dim && lr_a.size(1) == b_weight_t.size(1),
+                "set_kda_fused: lr_a must be (Nv + Hk + Hv, hidden) half");
+    TORCH_CHECK(lr_b.dtype() == at::kHalf && lr_b.dim() == 2 && lr_b.is_contiguous() &&
+                lr_b.size(0) == num_v_heads * (k_head_dim + v_head_dim) && lr_b.size(1) == k_head_dim,
+                "set_kda_fused: lr_b must be (Nv*Hk + Nv*Hv, Hk) half");
+    for (auto* v : {&slots, &slots_hist})
+        for (auto& s : *v)
+            TORCH_CHECK(!s.configured || !s.graph || !s.graph->ready, "set_kda_fused: call before any graph capture");
+    lr_a_weight_t = std::move(lr_a);
+    lr_b_weight_t = std::move(lr_b);
+    kda_fused = true;
+}
+
 void BC_GatedDeltaNetSplit::run_bszN_gr
 (
     const at::Tensor& x,
@@ -252,11 +270,19 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     {
         // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
         // run entirely on graph statics. z (the sigmoid norm gate) is the g_b output
-        gdn_ba_gemv_gr(x, b_weight_t, {}, s.b_out, graph);
-        gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
-        gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
-        gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
-        gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        if (kda_fused)
+        {
+            kda_lr_a_gr(x, lr_a_weight_t, s.b_out, s.fa_out, s.ga_out, graph);
+            kda_lr_b_gr(s.fa_out, s.ga_out, lr_b_weight_t, s.fb_out, s.z_flat, graph);
+        }
+        else
+        {
+            gdn_ba_gemv_gr(x, b_weight_t, {}, s.b_out, graph);
+            gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
+            gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
+            gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
+            gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        }
         kda_gate_op_gr
         (
             s.qkv, s.b_out, s.fb_out,
@@ -300,6 +326,9 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         graph
     );
 
+    if (kda && kda_deferred)
+        kda_deferred_gr(s.conv_out, s.g, s.beta, recurrent_state, s.core_attn_out, slots, graph);
+    else
     cuda_recurrent_gated_delta_rule_gr
     (
         s.conv_out,
@@ -371,7 +400,18 @@ void BC_GatedDeltaNetSplit::run_bszN
     }
 
     std::vector<PPTR> args;
-    if (kda)
+    if (kda && kda_fused)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // fused b / f_a / g_a input
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else if (kda)
         args = std::vector<PPTR>
         {
             PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
@@ -407,6 +447,16 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
+    if (kda && kda_deferred)
+    {
+        for (size_t i = 0; i + 1 < args.size(); ++i)
+            if (std::get<0>(args[i]) == GP_gdn_rule_state && std::get<0>(args[i + 1]) == GP_gdn_rule_slots)
+            {
+                args.insert(args.begin() + i + 2, PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()));
+                args.insert(args.begin() + i + 2, PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()));
+                break;
+            }
+    }
     s.graph->launch(args, stream);
 }
 

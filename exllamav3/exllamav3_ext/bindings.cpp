@@ -233,6 +233,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<uintptr_t, uintptr_t, int64_t>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    m.def("kda_deferred_flush", &kda_deferred_flush, py::arg("recurrent_state"), py::arg("slots"));
+    m.def("kda_pending_rewind", &kda_pending_rewind, py::arg("metas"), py::arg("n"));
+    m.def("kda_pending_meta_offset", &kda_pending_meta_offset, py::arg("recurrent_state"), py::arg("slot"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

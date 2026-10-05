@@ -170,6 +170,36 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         if (n == graph_node_sites.size()) TORCH_CHECK(false, "Graph update failed");
     }
 
+    // Outer whole-forward capture (EXL3_FULL_GRAPH, generator/fullgraph.py): a graph exec cannot
+    // be launched into a capturing stream, so splice this graph into the capture as a child
+    // node instead. The child is a snapshot: the template nodes get the current parameter
+    // values first, and the outer graph replays them unchanged, so every per-call value must
+    // be constant for the outer graph's key (pointers to statics, device-side positions).
+    // node_needs_update stays set, so the next eager launch still refreshes the exec
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &cs));
+        if (cs == cudaStreamCaptureStatusActive)
+        {
+            for (auto& site : graph_node_sites)
+            {
+                int node_idx = std::get<0>(site);
+                if (node_is_driver[node_idx])
+                    cuda_check_drv(CudaDrv::instance().graph_kernel_node_set_params((CUgraphNode) nodes[node_idx], &node_params_drv[node_idx]));
+                else
+                    cuda_check(cudaGraphKernelNodeSetParams(nodes[node_idx], &node_params[node_idx]));
+            }
+            cudaGraph_t cap_graph;
+            const cudaGraphNode_t* deps = nullptr;
+            size_t num_deps = 0;
+            cuda_check(cudaStreamGetCaptureInfo(stream, &cs, nullptr, &cap_graph, &deps, nullptr, &num_deps));
+            cudaGraphNode_t child;
+            cuda_check(cudaGraphAddChildGraphNode(&child, cap_graph, deps, num_deps, graph));
+            cuda_check(cudaStreamUpdateCaptureDependencies(stream, &child, nullptr, 1, cudaStreamSetCaptureDependencies));
+            return;
+        }
+    }
+
     for (int n = 0; n < nodes.size(); ++n)
     {
         if (!node_needs_update[n]) continue;

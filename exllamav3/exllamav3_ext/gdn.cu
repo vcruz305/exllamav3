@@ -2008,3 +2008,649 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
         cuda_check(cudaPeekAtLastError());
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// KDA fused low-rank GEMVs (EXL3_KDA_FUSED_GEMV=1, see BC_GatedDeltaNetSplit::set_kda_fused).
+//
+// Stage A: b, f_a and g_a all read x, so their transposed fp16 weights are concatenated into one
+// (Nv + Hk + Hv, hidden) matrix and run as ONE launch. A warp owns one weight row, streams it once
+// with 16-byte loads and applies it to every input row (R <= 8), instead of one launch per
+// projection that re-reads each weight row once per input row. Per output the k order is fixed
+// (lane-strided chunks, then an xor butterfly), so a row's result does not depend on R.
+// Stage B: f_b (input f_a out) and g_b (input g_a out) share k = Hk = Hv and are concatenated into
+// one (Nv*Hk + Nv*Hv, Hk) matrix: half a warp per weight row (16 lanes x 8 halfs = 128), inputs
+// staged in shared memory, one launch.
+
+#define KDA_LR_MAXR 8
+#define KDA_LRA_WARPS 4
+
+__global__ __launch_bounds__(KDA_LRA_WARPS * 32)
+void kda_lr_a_kernel
+(
+    const half* __restrict__ x,         // [R, k]
+    const half* __restrict__ w,         // [n, k], n = nb + nfa + nga
+    float* __restrict__ out_b,          // [R, nb]
+    float* __restrict__ out_fa,         // [R, nfa]
+    float* __restrict__ out_ga,         // [R, nga]
+    const int R,
+    const int k,
+    const int nb,
+    const int nfa,
+    const int nga
+)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int j = blockIdx.x * KDA_LRA_WARPS + warp;
+    const int n = nb + nfa + nga;
+    if (j >= n) return;
+
+    const uint4* w4 = (const uint4*) (w + (size_t) j * k);
+    const int k8 = k / 8;
+    for (int r0 = 0; r0 < R; r0 += KDA_LR_MAXR, x += (size_t) KDA_LR_MAXR * k)
+    {
+    const int Rc = min(R - r0, KDA_LR_MAXR);
+    float acc[KDA_LR_MAXR];
+    #pragma unroll
+    for (int r = 0; r < KDA_LR_MAXR; ++r) acc[r] = 0.0f;
+
+    #pragma unroll 4
+    for (int i = lane; i < k8; i += 32)
+    {
+        uint4 wv = __ldcs(w4 + i);
+        const half2* wh = (const half2*) &wv;
+        float2 wf0 = __half22float2(wh[0]);
+        float2 wf1 = __half22float2(wh[1]);
+        float2 wf2 = __half22float2(wh[2]);
+        float2 wf3 = __half22float2(wh[3]);
+        #pragma unroll
+        for (int r = 0; r < KDA_LR_MAXR; ++r)
+        {
+            if (r >= Rc) break;
+            uint4 xv = __ldg(((const uint4*) (x + (size_t) r * k)) + i);
+            const half2* xh = (const half2*) &xv;
+            float2 x0 = __half22float2(xh[0]);
+            float2 x1 = __half22float2(xh[1]);
+            float2 x2 = __half22float2(xh[2]);
+            float2 x3 = __half22float2(xh[3]);
+            float s = acc[r];
+            s = fmaf(x0.x, wf0.x, s); s = fmaf(x0.y, wf0.y, s);
+            s = fmaf(x1.x, wf1.x, s); s = fmaf(x1.y, wf1.y, s);
+            s = fmaf(x2.x, wf2.x, s); s = fmaf(x2.y, wf2.y, s);
+            s = fmaf(x3.x, wf3.x, s); s = fmaf(x3.y, wf3.y, s);
+            acc[r] = s;
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < KDA_LR_MAXR; ++r)
+    {
+        if (r >= Rc) break;
+        float s = acc[r];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+        if (lane == 0)
+        {
+            const size_t rr = r0 + r;
+            if (j < nb)               out_b [rr * nb  + j]             = s;
+            else if (j < nb + nfa)    out_fa[rr * nfa + (j - nb)]      = s;
+            else                      out_ga[rr * nga + (j - nb - nfa)] = s;
+        }
+    }
+    }
+}
+
+void kda_lr_a_gr
+(
+    const at::Tensor& x,            // [.., hidden] half, R rows
+    const at::Tensor& w,            // [nb + nfa + nga, hidden] half
+    at::Tensor& out_b,              // [R, nb] float
+    at::Tensor& out_fa,             // [R, nfa] float
+    at::Tensor& out_ga,             // [R, nga] float
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(out_b, kFloat);
+    TORCH_CHECK_DTYPE(out_fa, kFloat);
+    TORCH_CHECK_DTYPE(out_ga, kFloat);
+    int k = x.size(-1);
+    int R = (int) (x.numel() / k);
+    int nb = (int) (out_b.numel() / R);
+    int nfa = (int) (out_fa.numel() / R);
+    int nga = (int) (out_ga.numel() / R);
+    TORCH_CHECK(R >= 1, "kda_lr_a: rows");
+    TORCH_CHECK(k % 8 == 0 && w.dim() == 2 && w.size(1) == k && w.size(0) == nb + nfa + nga, "kda_lr_a: shapes");
+    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out_b.is_contiguous() && out_fa.is_contiguous() && out_ga.is_contiguous(),
+                "kda_lr_a: tensors must be contiguous");
+    int n = nb + nfa + nga;
+    kda_lr_a_kernel<<<CEIL_DIVIDE(n, KDA_LRA_WARPS), KDA_LRA_WARPS * 32, 0, stream>>>
+    (
+        (const half*) x.data_ptr(), (const half*) w.data_ptr(),
+        (float*) out_b.data_ptr(), (float*) out_fa.data_ptr(), (float*) out_ga.data_ptr(),
+        R, k, nb, nfa, nga
+    );
+    if (graph)
+    {
+        graph->record_param((void*) &kda_lr_a_kernel, GP_gdn_ba_x, 0);
+        graph->record_param((void*) &kda_lr_a_kernel, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+#define KDA_LRB_WARPS 8
+#define KDA_LRB_K 128
+
+__global__ __launch_bounds__(KDA_LRB_WARPS * 32)
+void kda_lr_b_kernel
+(
+    const float* __restrict__ xa,       // [R, 128] (f_a out)
+    const float* __restrict__ xb,       // [R, 128] (g_a out)
+    const half* __restrict__ w,         // [n1 + n2, 128]
+    float* __restrict__ out1,           // [R, n1]
+    float* __restrict__ out2,           // [R, n2]
+    const int R,
+    const int n1,
+    const int n2
+)
+{
+    __shared__ float sh_x[2][KDA_LR_MAXR][KDA_LRB_K];
+    for (int r0 = 0; r0 < R; r0 += KDA_LR_MAXR)
+    {
+    const int Rc = min(R - r0, KDA_LR_MAXR);
+    __syncthreads();
+    for (int i = threadIdx.x; i < Rc * KDA_LRB_K; i += blockDim.x)
+    {
+        sh_x[0][i / KDA_LRB_K][i % KDA_LRB_K] = xa[(size_t) r0 * KDA_LRB_K + i];
+        sh_x[1][i / KDA_LRB_K][i % KDA_LRB_K] = xb[(size_t) r0 * KDA_LRB_K + i];
+    }
+    __syncthreads();
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int hl = lane & 15;               // lane within the half warp
+    const int n = n1 + n2;
+    const int per_iter = gridDim.x * KDA_LRB_WARPS * 2;
+
+    for (int j = (blockIdx.x * KDA_LRB_WARPS + warp) * 2 + (lane >> 4); j < n; j += per_iter)
+    {
+        const int src = j < n1 ? 0 : 1;
+        uint4 wv = __ldcs(((const uint4*) (w + (size_t) j * KDA_LRB_K)) + hl);
+        const half2* wh = (const half2*) &wv;
+        float wf[8];
+        #pragma unroll
+        for (int q = 0; q < 4; ++q)
+        {
+            float2 f = __half22float2(wh[q]);
+            wf[2 * q] = f.x; wf[2 * q + 1] = f.y;
+        }
+        #pragma unroll
+        for (int r = 0; r < KDA_LR_MAXR; ++r)
+        {
+            if (r >= Rc) break;
+            const float* xr = &sh_x[src][r][hl * 8];
+            float s = 0.0f;
+            #pragma unroll
+            for (int q = 0; q < 8; ++q) s = fmaf(xr[q], wf[q], s);
+            #pragma unroll
+            for (int o = 8; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+            if (hl == 0)
+            {
+                if (src == 0) out1[(size_t) (r0 + r) * n1 + j] = s;
+                else          out2[(size_t) (r0 + r) * n2 + (j - n1)] = s;
+            }
+        }
+    }
+    }
+}
+
+void kda_lr_b_gr
+(
+    const at::Tensor& xa,           // [R, 128] float
+    const at::Tensor& xb,           // [R, 128] float
+    const at::Tensor& w,            // [n1 + n2, 128] half
+    at::Tensor& out1,               // [R, n1] float
+    at::Tensor& out2,               // [R, n2] float
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(xa.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(xa, kFloat);
+    TORCH_CHECK_DTYPE(xb, kFloat);
+    TORCH_CHECK_DTYPE(w, kHalf);
+    TORCH_CHECK_DTYPE(out1, kFloat);
+    TORCH_CHECK_DTYPE(out2, kFloat);
+    TORCH_CHECK(xa.size(-1) == KDA_LRB_K && xb.size(-1) == KDA_LRB_K && w.size(1) == KDA_LRB_K, "kda_lr_b: k must be 128");
+    int R = (int) (xa.numel() / KDA_LRB_K);
+    TORCH_CHECK(R >= 1 && xb.numel() == xa.numel(), "kda_lr_b: rows");
+    int n1 = (int) (out1.numel() / R);
+    int n2 = (int) (out2.numel() / R);
+    TORCH_CHECK(w.size(0) == n1 + n2 && (n1 + n2) % 2 == 0, "kda_lr_b: shapes");
+    TORCH_CHECK(xa.is_contiguous() && xb.is_contiguous() && w.is_contiguous() && out1.is_contiguous() && out2.is_contiguous(),
+                "kda_lr_b: tensors must be contiguous");
+    int n = n1 + n2;
+    int blocks = std::min(CEIL_DIVIDE(n, KDA_LRB_WARPS * 2), 256);
+    kda_lr_b_kernel<<<blocks, KDA_LRB_WARPS * 32, 0, stream>>>
+    (
+        (const float*) xa.data_ptr(), (const float*) xb.data_ptr(), (const half*) w.data_ptr(),
+        (float*) out1.data_ptr(), (float*) out2.data_ptr(), R, n1, n2
+    );
+    cuda_check(cudaPeekAtLastError());
+}
+
+// ---------------------------------------------------------------------------------------------
+// KDA deferred state commit (EXL3_KDA_DEFERRED=1, BC decode/verify path only).
+//
+// The history-mode recurrent kernel writes one full fp32 state (Nv x 128 x 128) per verify row so
+// that a rejected draft can be rewound by copying a history state back. Instead, a forward here
+// writes the state at most ONCE and never for its own rows:
+//   commit (kernel A): replay the rows of the previous forward that were kept (pending count p,
+//                      their k / v / g / beta saved in a pending area) on the committed state and
+//                      write it back; p = 0 is a no-op
+//   forward (kernel B): run this forward's rows on the committed state held in registers, emit the
+//                      outputs, save the rows' k / v / g / beta into the pending area and set the
+//                      pending count to seqlen. Rewinding n rows is then pending -= n (no copy).
+// The per-row arithmetic is the same expression sequence as cuda_recurrent_gated_delta_rule_kernel_128
+// <*, *, true>, so outputs and committed states match the history path bit for bit.
+//
+// The pending area lives in history slot 1 of the recurrent_state buffer (unused by this scheme):
+//   int   meta[4]                      meta[0] = pending row count
+//   bf16  k[MAX_QLEN][Nv][128], v[MAX_QLEN][Nv][128], beta[MAX_QLEN][Nv]
+//   float g[MAX_QLEN][Nv][128]         (log decay, as passed to the rule kernel)
+
+#define KDA_DEF_MAXQ 16
+#define KDA_DEF_HD 128
+
+struct KdaPending
+{
+    int* meta;
+    bfloat16* k;
+    bfloat16* v;
+    bfloat16* beta;
+    float* g;
+};
+
+__device__ __forceinline__ KdaPending kda_pending(float* slot_state, size_t state_size, int nv)
+{
+    char* base = (char*) (slot_state + state_size);   // history slot 1
+    KdaPending p;
+    p.meta = (int*) base;
+    p.k = (bfloat16*) (base + 64);
+    p.v = p.k + (size_t) KDA_DEF_MAXQ * nv * KDA_DEF_HD;
+    p.beta = p.v + (size_t) KDA_DEF_MAXQ * nv * KDA_DEF_HD;
+    p.g = (float*) (((uintptr_t) (p.beta + (size_t) KDA_DEF_MAXQ * nv) + 255) & ~(uintptr_t) 255);
+    return p;
+}
+
+// One row's state update (and optionally its output) on registers st[] (rows bt*BTS.., column
+// v_start + t of this head). k_raw / v_raw / g / beta as in the history kernel. Same expression
+// order as cuda_recurrent_gated_delta_rule_kernel_128 with CHANNELWISE.
+template <int V_SPLIT, bool OUT>
+__device__ __forceinline__ void kda_def_row
+(
+    float (&st)[KDA_DEF_HD / SUBK],
+    float q_raw, float k_raw,
+    const bfloat16* gl_v,               // this head's v + v_start
+    const float* gl_g,                  // this head's 128 log decays
+    float beta_h,
+    bfloat16* out,                      // this head's out + v_start (OUT only)
+    float scale,
+    float (*sh_red)[KDA_DEF_HD / 32], float* sh_k, float* sh_q, float* sh_g,
+    float (*sh_dot1)[KDA_DEF_HD], float (*sh_dot2)[KDA_DEF_HD]
+)
+{
+    constexpr int HEAD_DIM = KDA_DEF_HD;
+    constexpr int V_CHUNK_DIM = HEAD_DIM / V_SPLIT;
+    constexpr int BTS = HEAD_DIM / SUBK;
+    const int t = threadIdx.x;
+    const int bt = threadIdx.y;
+    const int lane = t % 32;
+    const int warp = t / 32;
+
+    float q = q_raw;
+    float k = k_raw;
+    float sumq = q * q;
+    float sumk = k * k;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+        sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+    }
+    if (lane == 0)
+    {
+        sh_red[0][warp] = sumq;
+        sh_red[1][warp] = sumk;
+    }
+    __syncthreads();
+    sumq = lane < HEAD_DIM / 32 ? sh_red[0][lane] : 0.0f;
+    sumk = lane < HEAD_DIM / 32 ? sh_red[1][lane] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        sumq += __shfl_xor_sync(0xffffffff, sumq, offset);
+        sumk += __shfl_xor_sync(0xffffffff, sumk, offset);
+    }
+    q = q * rsqrtf(sumq + 1e-6f);
+    k = k * rsqrtf(sumk + 1e-6f);
+    if (bt == 0)
+    {
+        sh_k[t] = k;
+        sh_q[t] = q;
+        sh_g[t] = __expf(gl_g[t]);
+    }
+    __syncthreads();
+
+    if (t < V_CHUNK_DIM)
+    {
+        float sum = 0.0f;
+        const float* sh_k_rd = sh_k + bt * BTS;
+        const float* sh_g_rd = sh_g + bt * BTS;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+            sum = sum + sh_k_rd[i] * sh_g_rd[i] * st[i];
+        sh_dot1[bt][t] = sum;
+    }
+    __syncthreads();
+
+    if (t < V_CHUNK_DIM)
+    {
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < SUBK; ++s) dot1 += sh_dot1[s][t];
+        float v = __bfloat162float(gl_v[t]) - dot1 * 1.0f;
+        float v_out = 0.0f;
+        const float* sh_k_rd = sh_k + bt * BTS;
+        const float* sh_g_rd = sh_g + bt * BTS;
+        const float* sh_q_rd = sh_q + bt * BTS;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+        {
+            float state = st[i];
+            state = state * sh_g_rd[i] + sh_k_rd[i] * v * beta_h;
+            st[i] = state;
+            if constexpr (OUT) v_out = v_out + sh_q_rd[i] * state;
+        }
+        if constexpr (OUT) sh_dot2[bt][t] = v_out;
+    }
+    __syncthreads();
+
+    if constexpr (OUT)
+    {
+        if (t < V_CHUNK_DIM && bt == 0)
+        {
+            float v_out = 0.0f;
+            #pragma unroll
+            for (int s = 0; s < SUBK; ++s) v_out += sh_dot2[s][t];
+            out[t] = __float2bfloat16_rz(v_out * scale);
+        }
+    }
+}
+
+// Kernel A: commit the pending rows of each slot into the committed state
+template <int V_SPLIT>
+__global__ __launch_bounds__(KDA_DEF_HD * SUBK)
+void kda_deferred_commit_kernel
+(
+    float* __restrict__ recurrent_state,        // [num_slots, history_stride, Nv, 128, 128]
+    const int* __restrict__ slots,              // [bsz]
+    const int num_v_heads,
+    const int history_stride,
+    const int dummy
+)
+{
+    constexpr int HEAD_DIM = KDA_DEF_HD;
+    constexpr int V_CHUNK_DIM = HEAD_DIM / V_SPLIT;
+    constexpr int BTS = HEAD_DIM / SUBK;
+    const size_t state_size = (size_t) num_v_heads * HEAD_DIM * HEAD_DIM;
+    const int bi = blockIdx.x;
+    const int head = blockIdx.y;
+    const int v_start = blockIdx.z * V_CHUNK_DIM;
+    const int t = threadIdx.x;
+    const int bt = threadIdx.y;
+    float* slot_state = recurrent_state + (size_t) (slots ? slots[bi] : bi) * history_stride * state_size;
+    KdaPending pd = kda_pending(slot_state, state_size, num_v_heads);
+    const int p = *((volatile int*) pd.meta);
+    if (p <= 0) return;
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_g[HEAD_DIM];
+    __shared__ float sh_dot1[SUBK][HEAD_DIM];
+    __shared__ float sh_dot2[SUBK][HEAD_DIM];
+
+    float* hs = slot_state + (size_t) head * HEAD_DIM * HEAD_DIM;
+    float st[BTS];
+    if (t < V_CHUNK_DIM)
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) st[i] = hs[(size_t) (bt * BTS + i) * HEAD_DIM + v_start + t];
+
+    for (int r = 0; r < p; ++r)
+    {
+        const size_t ro = ((size_t) r * num_v_heads + head) * HEAD_DIM;
+        const float k_raw = __bfloat162float(pd.k[ro + t]);
+        kda_def_row<V_SPLIT, false>(st, 0.0f, k_raw, pd.v + ro + v_start, pd.g + ro,
+                                    __bfloat162float(pd.beta[(size_t) r * num_v_heads + head]),
+                                    nullptr, 0.0f, sh_red, sh_k, sh_q, sh_g, sh_dot1, sh_dot2);
+    }
+
+    if (t < V_CHUNK_DIM)
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) hs[(size_t) (bt * BTS + i) * HEAD_DIM + v_start + t] = st[i];
+}
+
+// Kernel B: this forward's rows on the committed state, outputs only; rows saved as pending
+template <int V_SPLIT>
+__global__ __launch_bounds__(KDA_DEF_HD * SUBK)
+void kda_deferred_forward_kernel
+(
+    const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, 3 * Nv * 128] (conv out)
+    const float* __restrict__ g,                // [bsz, seqlen, Nv, 128]
+    const bfloat16* __restrict__ beta,          // [bsz, seqlen, Nv]
+    float* __restrict__ recurrent_state,        // param 3
+    bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, Nv, 128]
+    const int seqlen,
+    const int num_v_heads,
+    const float scale,
+    const int history_stride,
+    const int dummy0,
+    const int dummy1,
+    const int dummy2,
+    const int* __restrict__ slots               // param 12
+)
+{
+    constexpr int HEAD_DIM = KDA_DEF_HD;
+    constexpr int V_CHUNK_DIM = HEAD_DIM / V_SPLIT;
+    constexpr int BTS = HEAD_DIM / SUBK;
+    const size_t state_size = (size_t) num_v_heads * HEAD_DIM * HEAD_DIM;
+    const int bi = blockIdx.x;
+    const int head = blockIdx.y;
+    const int v_chunk = blockIdx.z;
+    const int v_start = v_chunk * V_CHUNK_DIM;
+    const int t = threadIdx.x;
+    const int bt = threadIdx.y;
+    const int nk = num_v_heads;                 // KDA: num_k_heads == num_v_heads
+    const int row_dim = 3 * nk * HEAD_DIM;
+    float* slot_state = recurrent_state + (size_t) (slots ? slots[bi] : bi) * history_stride * state_size;
+    KdaPending pd = kda_pending(slot_state, state_size, num_v_heads);
+
+    __shared__ float sh_red[2][HEAD_DIM / 32];
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_q[HEAD_DIM];
+    __shared__ float sh_g[HEAD_DIM];
+    __shared__ float sh_dot1[SUBK][HEAD_DIM];
+    __shared__ float sh_dot2[SUBK][HEAD_DIM];
+
+    const float* hs = slot_state + (size_t) head * HEAD_DIM * HEAD_DIM;
+    float st[BTS];
+    if (t < V_CHUNK_DIM)
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) st[i] = hs[(size_t) (bt * BTS + i) * HEAD_DIM + v_start + t];
+
+    mixed_qkv += (size_t) bi * seqlen * row_dim;
+    g += (size_t) bi * seqlen * num_v_heads * HEAD_DIM;
+    beta += (size_t) bi * seqlen * num_v_heads;
+    core_attn_out += (size_t) bi * seqlen * num_v_heads * HEAD_DIM;
+
+    for (int s = 0; s < seqlen; ++s)
+    {
+        const bfloat16* row = mixed_qkv + (size_t) s * row_dim;
+        const bfloat16* gl_q = row + head * HEAD_DIM;
+        const bfloat16* gl_k = row + (nk + head) * HEAD_DIM;
+        const bfloat16* gl_v = row + 2 * nk * HEAD_DIM + head * HEAD_DIM;
+        const float* gl_g = g + ((size_t) s * num_v_heads + head) * HEAD_DIM;
+        const float beta_h = __bfloat162float(beta[(size_t) s * num_v_heads + head]);
+
+        // save the row for the next forward's commit
+        const size_t ro = ((size_t) s * num_v_heads + head) * HEAD_DIM;
+        if (bt == 0)
+        {
+            if (t < V_CHUNK_DIM) pd.v[ro + v_start + t] = gl_v[v_start + t];
+            if (v_chunk == 0)
+            {
+                pd.k[ro + t] = gl_k[t];
+                pd.g[ro + t] = gl_g[t];
+                if (t == 0) pd.beta[(size_t) s * num_v_heads + head] = beta[(size_t) s * num_v_heads + head];
+            }
+        }
+
+        kda_def_row<V_SPLIT, true>(st, __bfloat162float(gl_q[t]), __bfloat162float(gl_k[t]), gl_v + v_start, gl_g, beta_h,
+                                   core_attn_out + ((size_t) s * num_v_heads + head) * HEAD_DIM + v_start, scale,
+                                   sh_red, sh_k, sh_q, sh_g, sh_dot1, sh_dot2);
+    }
+    if (head == 0 && v_chunk == 0 && t == 0 && bt == 0) *pd.meta = seqlen;
+}
+
+static void kda_deferred_check(const at::Tensor& recurrent_state, int seqlen)
+{
+    TORCH_CHECK_DTYPE(recurrent_state, kFloat);
+    TORCH_CHECK(recurrent_state.dim() == 5 && recurrent_state.size(3) == KDA_DEF_HD && recurrent_state.size(4) == KDA_DEF_HD,
+                "kda_deferred: recurrent_state must be [slots, hist, Nv, 128, 128]");
+    TORCH_CHECK(recurrent_state.size(1) >= 2, "kda_deferred: needs max_history >= 1 (pending area in history slot 1)");
+    TORCH_CHECK(seqlen >= 1 && seqlen <= KDA_DEF_MAXQ, "kda_deferred: seqlen 1..16");
+    const int64_t nv = recurrent_state.size(2);
+    const int64_t need = 64 + 3 * KDA_DEF_MAXQ * nv * KDA_DEF_HD * 2 + KDA_DEF_MAXQ * nv * 2 + 256 + KDA_DEF_MAXQ * nv * KDA_DEF_HD * 4;
+    TORCH_CHECK(need <= nv * KDA_DEF_HD * KDA_DEF_HD * 4, "kda_deferred: pending area does not fit one state");
+}
+
+// Commit only (flush before any other consumer of the state: prefill, stash, non-BC paths)
+void kda_deferred_commit_gr
+(
+    at::Tensor& recurrent_state,
+    const at::Tensor& slots,
+    int bsz,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(recurrent_state.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    kda_deferred_check(recurrent_state, 1);
+    TORCH_CHECK_DTYPE(slots, kInt);
+    TORCH_CHECK(slots.numel() >= bsz, "kda_deferred_commit: slots");
+    const int nv = (int) recurrent_state.size(2);
+    const int v_split = (bsz == 1) ? 4 : 1;
+    dim3 blocks(bsz, nv, v_split);
+    dim3 threads(KDA_DEF_HD, SUBK);
+    const int hs = (int) recurrent_state.size(1);
+    if (v_split == 4)
+        kda_deferred_commit_kernel<4><<<blocks, threads, 0, stream>>>((float*) recurrent_state.data_ptr(), (const int*) slots.data_ptr(), nv, hs, 0);
+    else
+        kda_deferred_commit_kernel<1><<<blocks, threads, 0, stream>>>((float*) recurrent_state.data_ptr(), (const int*) slots.data_ptr(), nv, hs, 0);
+    if (graph)
+    {
+        void* k = v_split == 4 ? (void*) &kda_deferred_commit_kernel<4> : (void*) &kda_deferred_commit_kernel<1>;
+        graph->record_param(k, GP_gdn_rule_state, 0);
+        graph->record_param(k, GP_gdn_rule_slots, 1);
+        graph->record_param(k, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+void kda_deferred_gr
+(
+    const at::Tensor& mixed_qkv,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    at::Tensor& recurrent_state,
+    at::Tensor& core_attn_out,
+    const at::Tensor& slots,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    const int bsz = (int) mixed_qkv.size(0);
+    const int seqlen = (int) mixed_qkv.size(1);
+    const int nv = (int) recurrent_state.size(2);
+    kda_deferred_check(recurrent_state, seqlen);
+    TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
+    TORCH_CHECK_DTYPE(g, kFloat);
+    TORCH_CHECK_DTYPE(beta, kBFloat16);
+    TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
+    TORCH_CHECK_DTYPE(slots, kInt);
+    TORCH_CHECK(mixed_qkv.size(2) == 3 * nv * KDA_DEF_HD && g.dim() == 4 && g.size(3) == KDA_DEF_HD && g.size(2) == nv,
+                "kda_deferred: shapes");
+    TORCH_CHECK(mixed_qkv.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && core_attn_out.is_contiguous(),
+                "kda_deferred: contiguous inputs");
+
+    kda_deferred_commit_gr(recurrent_state, slots, bsz, graph);
+
+    const int v_split = (bsz == 1) ? 4 : 1;
+    dim3 blocks(bsz, nv, v_split);
+    dim3 threads(KDA_DEF_HD, SUBK);
+    const int hs = (int) recurrent_state.size(1);
+    const float scale = 1.0f / sqrtf((float) KDA_DEF_HD);
+    #define KDA_DEF_ARGS (const bfloat16*) mixed_qkv.data_ptr(), (const float*) g.data_ptr(), (const bfloat16*) beta.data_ptr(), \
+        (float*) recurrent_state.data_ptr(), (bfloat16*) core_attn_out.data_ptr(), seqlen, nv, scale, hs, 0, 0, 0, \
+        (const int*) slots.data_ptr()
+    void* k;
+    if (v_split == 4) { kda_deferred_forward_kernel<4><<<blocks, threads, 0, stream>>>(KDA_DEF_ARGS); k = (void*) &kda_deferred_forward_kernel<4>; }
+    else              { kda_deferred_forward_kernel<1><<<blocks, threads, 0, stream>>>(KDA_DEF_ARGS); k = (void*) &kda_deferred_forward_kernel<1>; }
+    #undef KDA_DEF_ARGS
+    if (graph)
+    {
+        graph->record_param(k, GP_gdn_rule_state, 3);
+        graph->record_param(k, GP_gdn_rule_slots, 12);
+        graph->record_param(k, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
+// pending -= n for every listed state buffer (int* meta addresses), one launch
+__global__ void kda_pending_rewind_kernel(const int64_t* __restrict__ metas, int count, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int* m = (int*) metas[i];
+    int v = *m - n;
+    *m = v > 0 ? v : 0;
+}
+
+void kda_pending_rewind(const at::Tensor& metas, int n)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(metas.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(metas, kLong);
+    int count = (int) metas.numel();
+    if (!count || n <= 0) return;
+    kda_pending_rewind_kernel<<<CEIL_DIVIDE(count, 128), 128, 0, stream>>>((const int64_t*) metas.data_ptr(), count, n);
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Eager flush for Python callers (prefill / stash / non-BC paths)
+void kda_deferred_flush(at::Tensor& recurrent_state, const at::Tensor& slots)
+{
+    kda_deferred_commit_gr(recurrent_state, slots, (int) slots.numel(), nullptr);
+}
+
+// Byte offset of slot `slot`'s pending meta int inside recurrent_state (history slot 1)
+int64_t kda_pending_meta_offset(const at::Tensor& recurrent_state, int slot)
+{
+    const int64_t state_size = recurrent_state.size(2) * KDA_DEF_HD * KDA_DEF_HD;
+    return ((int64_t) slot * recurrent_state.size(1) + 1) * state_size * 4;
+}

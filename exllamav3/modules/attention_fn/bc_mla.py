@@ -4,6 +4,28 @@ from ...util.device_copy import to_device
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+import os as _os
+
+# EXL3_DSA_DEVPOS=1: single-job full-indexer sparse slots read the scoring scan width, causal
+# clamps and the k-pool expand position from a device state array (filled from cache_seqlens
+# each step) instead of patched host scalars, so a graph captured around the whole forward
+# (EXL3_FULL_GRAPH) stays valid at every context length. Same kernels, same arithmetic
+_dsa_devpos = _os.environ.get("EXL3_DSA_DEVPOS", "0") == "1"
+
+# EXL3_BC_MLA_FP16_WQB=1: admit full-indexer layers whose indexer wq_b is stored unquantized
+# (fp16, e.g. RED-SNOW GLM-5.3-Flash) into the graphed BC path (hgemm in place of the EXL3
+# GEMM). Without it those layers decline BC and run the eager dispatch path, which syncs on
+# host lengths and cannot be captured. Changes the MLA numerics (BC vs dispatch kernels)
+_bc_fp16_wqb = _os.environ.get("EXL3_BC_MLA_FP16_WQB", "0") == "1"
+
+
+def _wqb_fp16_ok(p, in_features):
+    w = getattr(getattr(p, "inner", None), "weight", None)
+    return (
+        _bc_fp16_wqb and p is not None and p.quant_type != "exl3" and w is not None and
+        w.dtype == torch.half and w.dim() == 2 and w.shape[0] == in_features and
+        getattr(p.inner, "bias", None) is None
+    )
 from .bc_attn import bc_attn_enable, _trace_build, _compile_kernel, _get_sm_count, _is_pow2, \
     MAX_BSZ, MAX_QLEN
 
@@ -135,9 +157,13 @@ class BCMLA:
                 self.idx_gate_w = m.idx_kpool_gate.data.T.contiguous()
             else:
                 self.cache_kpool = self.idx_gate_w = None
+            wqb_q = m.idx_wq_b.quant_type == "exl3"
+            if not wqb_q:
+                self.idx_wq_b_w = m.idx_wq_b.inner.weight.contiguous()
+                self.bc.set_indexer_wq_b_fp16(self.idx_wq_b_w)
             self.bc.set_indexer(
                 mode = 1,
-                wq_b = m.idx_wq_b.inner.bc,
+                wq_b = m.idx_wq_b.inner.bc if wqb_q else None,
                 wk_w = m.idx_wk.inner.weight,
                 k_norm_w = m.idx_k_norm.weight.data.half().contiguous(),
                 k_norm_b = m.idx_k_norm.bias.data.half().contiguous(),
@@ -386,6 +412,7 @@ class BCMLA:
                 dict(page_size = PAGE_SIZE, P = P, D = Di, MAXPOOLS = q_len // P + 1), 2, 1)
 
         indices = dsa_arr = ws_ml = ws_acc = None
+        devpos = _dsa_devpos and bsz == 1 and full and regime == 1
         k_dsa_split = k_dsa_combine = None
         if regime == 1:
             if full:
@@ -410,7 +437,7 @@ class BCMLA:
                 scores.fill_(-float("inf"))
                 # Batched slots score in MULTIROW mode: T / q_pos0 / bound_max are per-job
                 # device pointers into the seq-state array, the block table one row per job
-                mr = 1 if bsz > 1 else 0
+                mr = 1 if (bsz > 1 or devpos) else 0
                 bnd_t = "*i32:16" if mr else "i32"
                 sig = {
                     "q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
@@ -437,13 +464,13 @@ class BCMLA:
                 from .dsa_triton import _dsa_pool_expand_kernel
                 pool_idx = sbuf("bcm_pool_idx", R, kp_pool, dtype = torch.int32)
                 k_pool_expand = _compile_kernel(dev, _dsa_pool_expand_kernel,
-                    {"pool_idx": "*i32", "out": "*i32", "q_pos0": "i32"}
+                    {"pool_idx": "*i32", "out": "*i32", "q_pos0": "*i32" if devpos else "i32"}
                     | {n: "constexpr" for n in (
                         "P", "SEL", "K_pad", "KP_pool", "TAIL", "SEQ", "MULTIROW", "BLOCK")},
                     dict(P = P, SEL = sel, K_pad = kp, KP_pool = kp_pool,
                          TAIL = 1 if m.index_kpool_tail else 0, SEQ = q_len,
-                         MULTIROW = 0, BLOCK = 256), 4, 1)
-            if bsz > 1:
+                         MULTIROW = 1 if devpos else 0, BLOCK = 256), 4, 1)
+            if bsz > 1 or devpos:
                 dsa_arr = g_tensor_cache.get(dev, (2, MAX_BSZ), torch.int32, "bcm_dsa_arr")
             # ws_acc rows are D_c wide: OUT_LATENT never accumulates the rope half
             ws_ml = sbuf("bcm_dsa_wsml", R * hb * N_SPLITS * BLOCK_H * 2, dtype = torch.float)
@@ -608,7 +635,8 @@ def build_bc_mla(module, layer):
                 ))
             )) and
             (m.indexer_mode == "shared" or (
-                m.q_lora_rank and _proj_ok(m.idx_wq_b, in_features = m.q_lora_rank) and
+                m.q_lora_rank and (_proj_ok(m.idx_wq_b, in_features = m.q_lora_rank) or
+                                   _wqb_fp16_ok(m.idx_wq_b, m.q_lora_rank)) and
                 getattr(m.idx_wk.inner, "weight", None) is not None and
                 m.idx_wk.inner.weight.dtype == torch.half and
                 getattr(m.idx_weights.inner, "weight", None) is not None and

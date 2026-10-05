@@ -881,14 +881,15 @@ __global__ void dsa_seq_state_kernel
     int* __restrict__ arr,               // (2, arr_stride) i32 out
     const int bsz,
     const int q_len,
-    const int arr_stride
+    const int arr_stride,
+    const int bound_div                  // 1, or the k-pool size (row 1 counts pools)
 )
 {
     int b = threadIdx.x;
     if (b >= bsz) return;
     int sl = seqlens[b];
     arr[b] = sl;
-    arr[arr_stride + b] = sl + q_len;
+    arr[arr_stride + b] = (sl + q_len) / bound_div;
 }
 
 void dsa_seq_state_gr
@@ -897,7 +898,8 @@ void dsa_seq_state_gr
     at::Tensor& arr,                     // (2, arr_stride) i32, device static
     int bsz,
     int q_len,
-    Graph* graph
+    Graph* graph,
+    int bound_div
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(cache_seqlens.device());
@@ -912,7 +914,7 @@ void dsa_seq_state_gr
     (
         (const int*) cache_seqlens.data_ptr(),
         (int*) arr.data_ptr(),
-        bsz, q_len, (int) arr.size(1)
+        bsz, q_len, (int) arr.size(1), bound_div
     );
     cuda_check(cudaPeekAtLastError());
     if (graph)

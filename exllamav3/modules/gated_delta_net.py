@@ -18,6 +18,16 @@ import os
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
+# Fused KDA low-rank GEMVs in the BC decode path (gdn.cu kda_lr_a/kda_lr_b), default off
+_kda_fused_gemv = os.environ.get("EXL3_KDA_FUSED_GEMV", "0") == "1"
+# Deferred KDA state commit in the BC decode/verify path (gdn.cu kda_deferred_*), default off: a
+# forward writes the fp32 state once (committing the previous forward's kept rows) instead of once
+# per verify row, and a rewind only lowers the pending row count
+_kda_deferred = os.environ.get("EXL3_KDA_DEFERRED", "0") == "1"
+
+
+def _kda_deferred_layer(l) -> bool:
+    return getattr(l.module, "kda_deferred", False) and l.recurrent_state.dim() == 5 and l.recurrent_state.shape[1] >= 2
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -40,7 +50,15 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     falls back to its own .rewind() call, unchanged."""
     jobs_by_device = {}
     for l in layers:
-        if isinstance(l, GDNLayerState):
+        if isinstance(l, GDNLayerState) and _kda_deferred_layer(l):
+            device_index = torch.device(l.device).index
+            conv_jobs, state_jobs = jobs_by_device.setdefault(device_index, ([], []))
+            cj = l.rewind_conv_job(slot, last_history, num_tokens)
+            if cj is not None:
+                conv_jobs.append(cj)
+            if num_tokens > 0:
+                state_jobs.append(("kda_meta", l.pending_meta_ptr(slot), num_tokens))
+        elif isinstance(l, GDNLayerState):
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -60,8 +78,15 @@ def _dispatch_rewind_jobs(jobs_by_device):
     for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
         if conv_jobs:
             ext.batched_conv_rewind(conv_jobs, device_index)
+        metas = [j for j in state_jobs if isinstance(j, tuple)]
+        state_jobs = [j for j in state_jobs if not isinstance(j, tuple)]
         if state_jobs:
             ext.batched_state_rewind(state_jobs, device_index)
+        if metas:
+            ns = {j[2] for j in metas}
+            assert len(ns) == 1
+            ptrs = torch.tensor([j[1] for j in metas], dtype = torch.long).to(f"cuda:{device_index}", non_blocking = True)
+            ext.kda_pending_rewind(ptrs, ns.pop())
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -235,7 +260,17 @@ class GDNLayerState:
         )
 
 
+    def pending_meta_ptr(self, slot: int) -> int:
+        return self.recurrent_state.data_ptr() + ext.kda_pending_meta_offset(self.recurrent_state, slot)
+
+    def flush_deferred(self, slot: int):
+        if self.device is not None and _kda_deferred_layer(self):
+            ext.kda_deferred_flush(self.recurrent_state, torch.tensor([slot], dtype = torch.int, device = self.device))
+
     def rewind(self, slot: int, last_history: int, num_tokens: int):
+        if _kda_deferred_layer(self):
+            _dispatch_rewind_jobs(_collect_rewind_jobs([self], slot, last_history, num_tokens))
+            return
         assert num_tokens <= last_history
         if num_tokens > 0:
             r_state = self.recurrent_state[slot, 0]
@@ -289,6 +324,7 @@ class GDNLayerState:
 
     def stash(self, slot, position: int = 0):
         cdim = self.module.conv_kernel_size
+        self.flush_deferred(slot)
         return (
             self.recurrent_state[slot, :1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
@@ -300,6 +336,8 @@ class GDNLayerState:
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
         self.conv_state[slot, :, :cdim].copy_(c)
+        if _kda_deferred_layer(self):
+            self.recurrent_state[slot, 1].view(-1)[:16].zero_()   # pending count lives here
 
 
     def tp_export(self, plan):
@@ -795,6 +833,10 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
             self.bc_split = True
+            self.kda_deferred = _kda_deferred and hasattr(self.bc, "set_kda_deferred") and \
+                self.k_head_dim == self.v_head_dim == 128 and self.num_k_heads == self.num_v_heads
+            if self.kda_deferred:
+                self.bc.set_kda_deferred(True)
 
 
     @override
@@ -1032,6 +1074,12 @@ class GatedDeltaNet(Module):
             self.kda_ga_t.copy_(self.g_a_proj.inner.get_weight_tensor().T)
             self.kda_gb_t.copy_(self.g_b_proj.inner.get_weight_tensor().T)
             self.ba_weight_filled = True
+            # Fused low-rank GEMVs (EXL3_KDA_FUSED_GEMV=1, default off): b | f_a | g_a and f_b | g_b
+            # as one launch each over concatenated copies (+~6.5 MB fp16 per layer)
+            if _kda_fused_gemv and hasattr(self.bc, "set_kda_fused") and self.k_head_dim == self.v_head_dim == 128:
+                self.kda_lr_a_t = torch.cat([self.kda_b_t, self.kda_fa_t, self.kda_ga_t], dim = 0).contiguous()
+                self.kda_lr_b_t = torch.cat([self.kda_fb_t, self.kda_gb_t], dim = 0).contiguous()
+                self.bc.set_kda_fused(self.kda_lr_a_t, self.kda_lr_b_t)
         elif self.bc_split and not self.ba_weight_filled:
             self.ba_weight_t.copy_(torch.cat([
                 self.b_proj.inner.get_weight_tensor(),
@@ -1065,6 +1113,10 @@ class GatedDeltaNet(Module):
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
+
+        # Deferred KDA commit: everything below reads the state directly, so commit pending rows
+        if getattr(self, "kda_deferred", False) and recurrent_state is not None and recurrent_state.shape[1] >= 2:
+            ext.kda_deferred_flush(recurrent_state, recurrent_slots)
 
         # Torch path
         # Qwen3.5 uses split projections (in_proj_qkv/in_proj_z/in_proj_b/in_proj_a),

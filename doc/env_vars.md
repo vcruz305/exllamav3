@@ -567,6 +567,111 @@ read.
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
 
+## Mixed-K MoE layers
+
+These apply only to MoE layers whose experts mix bit widths (a "mixed-K" pack, where the loader
+prints `Mixed-K UNIFIED kernel enabled in ...`). Layers with a single bit width, and therefore
+whole uniform-K packs, never reach them.
+
+### `EXL3_MOE_COOP_MIXEDK` (default: on)
+
+At decode and MTP/DFlash verify shapes (bsz <= 8) a mixed-K layer runs through the two-stage
+cooperative kernels the uniform-K layers use, with each expert's gate/up/down bit width read from
+a device table (`CoopMK`): no sort, count, slot tables or host synchronization. Prefill and larger
+batches keep the unified mixed-K kernel. At load, the first mixed-K layer prints one line naming
+the active path, and every layer that binds prints `Mixed-K coop decode kernels in ...`. The routed
+sum is accumulated in a different order than the unified kernel's, so outputs are close but not
+bit-identical to `EXL3_MOE_COOP_MIXEDK=0`, which restores the unified kernel at every shape.
+`EXL3_MIXEDK_LEGACY=1` (per-K-group dispatch) also disables it, since the unified layer state is
+what binds.
+
+### `EXL3_MOE_MIXEDK_NOSYNC` (default: on for mixed-K layers)
+
+Sync-free unified mixed-K dispatch for small row counts (at most 16 tokens): expert counts stay on
+the device and the per-layer host readbacks are skipped. Bit-identical output. With the cooperative
+kernels on it only covers the shapes they do not take. Unset applies it to mixed-K layers only;
+`0` turns it off; `1` additionally applies the same device-side count to the uniform fused path.
+
+### `EXL3_COOPMK_PLAN` (default: `3`)
+
+Kernel variant set for the cooperative mixed-K kernels: `1` all-K, `2` split by decode kind, `3`
+all-K capped at 64 registers, `4` split and capped at 64.
+
+## Opt-in decode levers
+
+All default off. Measured on RED-SNOW 5.3 Flash (glm5_next) EXL3 2.49 bpw on one DGX Spark (GB10).
+
+One served run with `EXL3_BC_MLA_FP16_WQB`, `EXL3_DSA_DEVPOS`, `EXL3_FULL_GRAPH` and
+`EXL3_GLM5_MTP_HEAD_N` all on lost about 6 GiB of available host memory when its first long
+(~2K-word) prompts arrived; which switch is responsible is not yet known. Watch memory when
+combining them on a unified-memory machine.
+
+### `EXL3_FULL_GRAPH` (default: `0`)
+
+Whole-forward CUDA graphs for a single job: target verify/decode and the MTP draft and draft
+prefill steps are captured once per shape key (rows, block-table width, DSA regime) and replayed
+(`generator/fullgraph.py`). Per-layer BC graphs are spliced into the capture as child graphs. The
+target capture is refused while any MLA layer runs the eager dispatch path (host-length branches),
+so on packs with an fp16 indexer `wq_b` it needs `EXL3_BC_MLA_FP16_WQB=1`; DSA sparse-regime steps
+stay eager unless `EXL3_DSA_DEVPOS=1`. Single GPU only (no TP, no layer split, no CPU MoE hosts).
+`EXL3_FULL_GRAPH_DRAFT=0` keeps the draft steps eager, `EXL3_FULL_GRAPH_WARM` (default `3`) sets
+the eager calls before a key is captured, `EXL3_FULL_GRAPH_MAX` (default `64`) caps the graph
+count, `EXL3_FULL_GRAPH_DEBUG=1` logs captures. Graphs on and off were token-identical on short
+prompts and on a 28K-token prompt.
+
+### `EXL3_DSA_DEVPOS` (default: `0`)
+
+Single-job DSA sparse slots of the BC MLA path read the scoring scan width, causal clamps and the
+k-pool expand position from a device state array instead of patched host scalars, so a captured
+step stays valid at every context length. Same kernels and arithmetic (bit-identical output).
+
+### `EXL3_BC_MLA_FP16_WQB` (default: `0`)
+
+Admit full-indexer MLA layers whose indexer `wq_b` is stored unquantized (fp16) into the
+graph-captured BC MLA path, using an fp16 GEMM for that projection. Without it such layers
+decline BC and run the eager dispatch path, which syncs on host lengths every step. It changes the
+numerics of the DSA indexer path (BC kernels instead of the dispatch kernels), so greedy text can
+differ. On RED-SNOW 2.49 bpw (teacher-forced verify windows, 809 rows, together with the other
+levers) the overall gate passed by a hair: top-1 vs oracle 0.9456 against a threshold of 0.9455,
+KL64 0.0116 (no-flags 0.0122), NLL 1.9324 (no-flags 1.9349), but top-1 on the chat subset fell from
+0.922 to 0.898 (-2.4 points). Opt in only after validating your pack.
+
+### `EXL3_GLM5_MTP_HEAD_N` (default: `0`), `EXL3_DFLASH2_HEAD_N` (default: `0`)
+
+Draft-only LM head slice: the GLM-5 MTP draft (or the DFlash2 candidate selector) takes its
+argmax over the first N columns (rounded down to 128) of the shared EXL3 head instead of the full
+vocabulary. Verification keeps the full head, so verified output is unchanged; a draft whose real
+argmax lies past the slice simply gets rejected. Saves head bandwidth per draft step but lowers
+acceptance on some content (math dropped about 10% at N=98304 on a short sample).
+
+### `EXL3_KDA_FUSED_GEMV` (default: `0`)
+
+KDA layers (GLM-5.3 / Kimi Linear) in the graph-captured decode path: the three fp16 GEMVs that
+read the layer input (`b`, `f_a`, `g_a`) run as one launch over a concatenated weight, each weight
+row read once for all input rows, and the two low-rank second stages (`f_b`, `g_b`) as a second
+launch. Needs head dims of 128. Costs about 6.5 MB of extra fp16 weights per layer. On RED-SNOW
+2.49 bpw (CoopMK, MTP ndt 2) the verify round went from 76.8 to 76.2 ms.
+
+### `EXL3_KDA_DEFERRED` (default: `0`)
+
+Deferred recurrent-state commit for KDA layers in the graph-captured decode/verify path. The
+history-mode rule kernel normally writes one fp32 state per verify row so a rejected draft can be
+rewound; with this switch a forward writes the state at most once (committing the previous
+forward's kept rows first), and a rewind only lowers a pending row count. Prefill, the torch path
+and state stashing flush the pending rows first. Same per-row arithmetic as the history kernel. On
+RED-SNOW 2.49 bpw, together with `EXL3_KDA_FUSED_GEMV=1`, the verify round went from 76.8 to
+74.9 ms.
+
+Teacher-forced gate for both switches on RED-SNOW (809 verify rows, q=3, Q4 KV, vs the oracle):
+top-1 0.9567, KL64 0.0106, NLL 1.9332 (no-flags 0.9555 / 0.0122 / 1.9349); the deferred commit
+gives exactly the same rows as the fused GEMVs alone. Golden prompts pass.
+
+### `EXL3_ADAPTIVE_DRAFT` (default: `0`), `EXL3_ADAPTIVE_DRAFT_ADD` (default: `2`)
+
+MTP draft window = the previous round's accepted drafts + `EXL3_ADAPTIVE_DRAFT_ADD`, capped at
+the configured draft count. Measured slower than a fixed depth on the tested pack, since each
+extra verify row costs about 13 ms there; kept for experiments only.
+
 ## Model loading
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
