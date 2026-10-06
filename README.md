@@ -224,7 +224,10 @@ decode default; these are included here.
 
 See the [multi-node guide](doc/multinode.md) for build/runtime identity, generic
 four-rank launch commands, memory and precision rules, historical short-context
-validation, and what remains outside this PR.
+validation, and what remains outside this PR. Read the
+[transport and driver limits](doc/multinode_pipeline_limits.md) before deployment:
+trusted fabric only, finite frame/I/O budgets, numeric fabric IPs for hard TCP
+connect deadlines, and no recurrent/hybrid model support in the manual PP loop.
 
 ## Architecture support
 

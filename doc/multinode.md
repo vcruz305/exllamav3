@@ -30,8 +30,9 @@ The tested four-host pipeline changes are included in PR #17:
   send synchronizes its D2H copy before writing the socket; it is not an async
   network-send API. Endpoints are not thread-safe.
 - `NcclEndpoint`: the same tensor/JSON interface using `torch.distributed` p2p,
-  byte-preserving payloads, NCCL on CUDA and Gloo for CPU tests. Its `stream`
-  parameter is accepted for API compatibility, not a custom-stream scheduler.
+  byte-preserving payloads, NCCL on CUDA and Gloo for CPU tests. It follows the
+  caller's current-stream contract; an explicit `stream` argument is rejected
+  **before wire activity**, not silently ignored or scheduled on another stream.
 - A slice-only loader and a check that GLM/DeepSeek DSA split boundaries start on
   a `full` indexer layer. Shared indexer selections stay local to the owning stage.
 - Cooperative mixed-K MoE decode enabled by default on sm_121. The unified path
@@ -43,6 +44,10 @@ Transport support for fp8 does **not** convert the pipeline's hidden states to
 fp8; tensor dtype is preserved. NCCL p2p is not a TP all-reduce backend.
 These transports have no authentication or encryption: use a trusted, isolated
 fabric, firewall job ports, and do not expose them to the public Internet.
+See [transport and driver limits](multinode_pipeline_limits.md) for finite frame
+limits, TCP I/O deadlines, endpoint poisoning and receive-layout handling.
+The manual loop rejects recurrent/hybrid model families before allocation or
+network setup; library model support is not qualification for this PP example.
 
 ## Build and runtime identity
 
@@ -89,7 +94,9 @@ weights; the last rank needs final norm/head weights. Full shards on every rank
 are acceptable. Check model/config/tokenizer hashes; never modify the original
 checkpoint or mix revisions to make a partial shard set load.
 
-Select reachable fabric addresses or DNS names in rank order. Inspect each host:
+Select reachable fabric addresses or DNS names in rank order. Use **numeric
+fabric IPs** when requiring a hard TCP connect budget: OS hostname resolution
+is outside Python's socket timeout. Inspect each host:
 
 ```bash
 ip -br addr
