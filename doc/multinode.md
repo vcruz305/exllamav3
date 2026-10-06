@@ -162,12 +162,18 @@ operator's job to free a port/GPU.
 
 ## Precision, context and memory safety
 
-The example creates `Cache(model, max_num_tokens=ctx)` with the default fp16
-cache (MLA stores fp16 latent/RoPE/indexer planes). It exposes **no `--kv_bits`,
-Q4, TP, CP, MTP or DFlash switch**. `--ctx` is allocated capacity, not the number
-of prompt tokens actually read. Use a multiple of 256, keep prompt plus decode
-within capacity, and start with short prompts. Increasing capacity is not a
-long-context correctness or throughput result.
+The default is `Cache(model, max_num_tokens=ctx)` with fp16 cache (MLA stores
+fp16 latent/RoPE/indexer planes). The explicit `--cache_quant 4` / `-cq 4` option
+selects the canonical quantized cache; `--cache_quant 4,6` sets separate K/V
+bitrates. It does not change weight precision or transport dtype. The cache helper
+and recurrent-state lifecycle were retained from the concurrent PR commit, but
+**Q4 PP and recurrent-family GPU quality are not qualified by the historical
+fp16 PP measurements**. Recurrent/hybrid families still fail early at the CLI;
+the retained state helper has CPU lifecycle tests, not a hardware qualification.
+There are no TP, CP, MTP or DFlash switches. `--ctx` is allocated capacity, not
+prompt tokens read. Use a multiple of 256, keep prompt plus decode within capacity,
+and start with short prompts. Increasing capacity is not a long-context
+correctness or throughput result.
 
 The separate Q4 MLA experiments used packed 4-bit latent values plus scale
 metadata, fp16 RoPE and separate indexer planes. In replicated TP every rank

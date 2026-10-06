@@ -32,10 +32,75 @@ import argparse, os, sys, time, json, math, threading
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
-from exllamav3 import Config, Model, Cache, Tokenizer
+from exllamav3 import Config, Model, Cache, CacheLayer_quant, Tokenizer
 from exllamav3.model.net_transport import NetEndpoint
+from exllamav3.cache.recurrent_util import advance_recurrent_states
 from exllamav3.util.memory import free_mem
 from exllamav3.util.tensor import g_tensor_cache
+
+def parse_cache_quant(cache_quant):
+    split = [int(bits) for bits in cache_quant.split(",")]
+    if len(split) == 1:
+        return split[0], split[0]
+    if len(split) == 2:
+        return tuple(split)
+    raise ValueError("Specify either one or two bitrates for cache quantization")
+
+def create_cache(model, max_num_tokens, cache_quant):
+    if cache_quant is None:
+        return Cache(model, max_num_tokens = max_num_tokens)
+    k_bits, v_bits = parse_cache_quant(cache_quant)
+    return Cache(
+        model,
+        max_num_tokens = max_num_tokens,
+        layer_type = CacheLayer_quant,
+        k_bits = k_bits,
+        v_bits = v_bits,
+    )
+
+class PipelineSlice:
+
+    def __init__(self, model, cache, fwd_modules, rank, max_num_tokens):
+        self.model = model
+        self.cache = cache
+        self.fwd_modules = fwd_modules
+        self.rank = rank
+        self.max_num_tokens = max_num_tokens
+        self.recurrent_states = None
+
+    def _free_recurrent_states(self):
+        if self.recurrent_states:
+            for state in self.recurrent_states:
+                state.free()
+        self.recurrent_states = None
+
+    def close(self):
+        self._free_recurrent_states()
+
+    def forward(self, ids, x, past_len, last_only):
+        if past_len == 0:
+            self._free_recurrent_states()
+        params = {
+            "attn_mode": "flash_attn",
+            "cache": self.cache,
+            "past_len": past_len,
+            "batch_shape": (1, self.max_num_tokens),
+        }
+        if self.recurrent_states is not None:
+            params["recurrent_states"] = self.recurrent_states
+        self.model.prepare_inputs(ids, params)
+        self.recurrent_states = params.get("recurrent_states")
+        if self.rank == 0:
+            x = ids
+        for module, instance, _ in self.fwd_modules:
+            params["layer_instance"] = instance
+            if module.caps.get("logits_output") and last_only:
+                x = x[..., -1:, :].contiguous()
+            x = module.prepare_for_device(x, params)
+            x = module.forward(x, params)
+        advance_recurrent_states(ids, params, self.model)
+        self.recurrent_states = params.get("recurrent_states")
+        return x
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m", "--model", required = True)
@@ -45,6 +110,8 @@ ap.add_argument("--splits", required = True, help = "comma-separated a:b layer r
 ap.add_argument("--port", type = int, default = 29650)
 ap.add_argument("--transport", choices = ["tcp", "nccl"], default = "tcp")
 ap.add_argument("--ctx", type = int, default = 8192)
+ap.add_argument("-cq", "--cache_quant", type = str,
+                help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
 ap.add_argument("--prompt", default = "Explain pipeline parallelism in three sentences.")
 ap.add_argument("--max_new", type = int, default = 200)
 ap.add_argument("--nll_file", default = None, help = "rank 0: text file to score (next-token NLL) before generating")
@@ -62,7 +129,8 @@ def validate_context(past_len, q_len):
 
 
 def validate_model_family(model):
-    # This manual stage loop has no persistent recurrent-state lifecycle.
+    # Recurrent helper lifecycle is CPU-tested, not family-qualified on GPUs.
+    # Keep the explicit gate until an exact-checkpoint hardware test passes.
     if model.caps.get("recurrent_states"):
         raise ValueError("multinode_pipeline does not support recurrent-state architectures (including Qwen3.5)")
 
@@ -91,7 +159,7 @@ if args.transport == "tcp":
     lt.start()
 
 # Load only this rank's slice of the full module list.
-cache = Cache(model, max_num_tokens = args.ctx)
+cache = create_cache(model, args.ctx, args.cache_quant)
 nl = config.num_hidden_layers
 fb = model.first_block_idx
 assert len(splits) == W and splits[0][0] == 0 and splits[-1][1] == nl
@@ -146,21 +214,13 @@ else:
 log(f"{args.transport} links up")
 
 stats = {"compute_ms": [], "steps": 0}
+pipeline_slice = PipelineSlice(model, cache, my_fwd, R, args.ctx)
 
 @torch.inference_mode()
 def run_slice(ids, x, past_len, last_only):
     validate_model_family(model)
     validate_context(past_len, ids.shape[-1])
-    params = {"attn_mode": "flash_attn", "cache": cache, "past_len": past_len, "batch_shape": (1, args.ctx)}
-    model.prepare_inputs(ids, params)
-    if R == 0:
-        x = ids
-    for module, instance, _ in my_fwd:
-        params["layer_instance"] = instance
-        if module.caps.get("logits_output") and last_only:
-            x = x[..., -1:, :].contiguous()
-        x = module.prepare_for_device(x, params)
-        x = module.forward(x, params)
+    x = pipeline_slice.forward(ids, x, past_len, last_only)
     torch.cuda.synchronize()
     return x
 
@@ -272,6 +332,7 @@ def drive():
 try:
     drive() if R == 0 else service()
 finally:
+    pipeline_slice.close()
     up.close(); down.close()
     if args.transport == "nccl":
         torch.distributed.destroy_process_group()

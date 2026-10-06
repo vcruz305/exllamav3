@@ -59,12 +59,15 @@ ordering from a tensor produced on an unrelated stream.
 
 ## Driver family and context limits
 
-The manual stage loop does **not** implement a persistent recurrent-state
-lifecycle. Models advertising `caps["recurrent_states"]` are rejected before
-cache allocation, weights, CUDA setup or network links. This includes Qwen3.5
-and other recurrent/hybrid families; a model supported by EXL3 is not necessarily
-supported by this example. Nonrecurrent models must also obey the existing DSA
-full-indexer split restrictions; this patch is not a new family qualification.
+The stage helper retains persistent recurrent state, advances it once per slice
+forward using the canonical library utility, and frees it on reset/shutdown; its
+lifecycle is covered on CPU. No recurrent family has an exact-checkpoint GPU
+qualification in this PP example, so models advertising
+`caps["recurrent_states"]` are deliberately rejected before cache allocation,
+weights, CUDA setup or network links. This includes Qwen3.5 and other
+recurrent/hybrid families; library model support is not qualification for this
+example. Nonrecurrent models must also obey the existing DSA full-indexer split
+restrictions; this patch is not a new family qualification.
 
 `ctx` and `chunk` must be positive and `max_new` nonnegative. Empty or over-context
 prompts are rejected. NLL inputs require 2..ctx tokens and are rejected rather
