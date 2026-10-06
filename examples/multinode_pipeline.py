@@ -13,19 +13,19 @@ earlier layer. For DeepSeek-V3.2 / GLM-5 DSA models that means an indexer "full"
 layers reuse the preceding full layer's top-k selection); the script checks this when the config
 has indexer_types.
 
-Example, four DGX Sparks on one QSFP switch (rank 0 last; it drives):
+Example, four hosts (start ranks 3, 2 and 1 before rank 0):
 
-    export NCCL_SOCKET_IFNAME=enp1s0f0np0 NCCL_IB_HCA=rocep1s0f0
+    # Set these from fabric discovery on each host, not from another cluster's names.
+    export NCCL_SOCKET_IFNAME="$FABRIC_IFACE" NCCL_IB_HCA="$RDMA_HCA"
     python examples/multinode_pipeline.py -m /models/GLM-5.3-EXL3 --rank 3 \\
-        --addrs 10.99.200.17,10.99.200.12,10.99.200.15,10.99.200.11 \\
+        --addrs rank0,rank1,rank2,rank3 \\
         --splits 0:26,26:46,46:62,62:78 --transport nccl
-    ... ranks 2 and 1 likewise ...
-    python examples/multinode_pipeline.py ... --rank 0 --prompt "Hello" --max_new 200
+    # Run the same command on ranks 2 and 1, changing --rank.
+    # On rank 0, change --rank to 0 and add --prompt "Hello" --max_new 200.
 
-Measured with that layout (GLM-5.3 EXL3 3.38bpw, GB10, greedy single-stream decode): ~113 ms per
-token, ~8.8 tok/s, of which ~3 ms is inter-node transfer and host overhead (NCCL); the same run over
-NetEndpoint/TCP spends ~4.6 ms there. A 4-stage pipeline runs one stage at a time, so decode speed is
-bounded by one GB10's memory bandwidth over the weights read per token (~11 tok/s for this pack).
+This is sequential layer-split PP, not cross-host tensor parallelism or an overlapped
+microbatch scheduler. See doc/multinode.md for setup, precision, memory safety, measured
+short-context results and the separate, unshipped TP/CP research paths.
 """
 
 import argparse, os, sys, time, json, math, threading

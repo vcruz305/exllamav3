@@ -3,7 +3,7 @@
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
-[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Multi-node](#multi-node-inference) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
@@ -210,6 +210,21 @@ python examples/chat.py -m <input_dir> -mode <prompt_mode>
 # Wealth of options
 python examples/chat.py -h
 ```
+
+## Multi-node inference
+
+[`examples/multinode_pipeline.py`](examples/multinode_pipeline.py) runs **sequential
+layer-split pipeline parallelism (PP)** across hosts, with TCP (`NetEndpoint`) or
+`torch.distributed` point-to-point transport (`NcclEndpoint`, NCCL/RoCE on CUDA).
+Each rank loads only its assigned layers. This is not the library's single-host
+TP worker system, an overlapped pipeline scheduler, or a packaged cross-host TP/CP
+server. The four-Spark GLM work recovered pinned-buffer lifetime fixes, byte-safe
+TCP staging, NCCL p2p, DSA-safe layer splits and the sm_121 cooperative mixed-K
+decode default; these are included here.
+
+See the [multi-node guide](doc/multinode.md) for build/runtime identity, generic
+four-rank launch commands, memory and precision rules, historical short-context
+validation, and what remains outside this PR.
 
 ## Architecture support
 
