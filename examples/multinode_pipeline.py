@@ -129,10 +129,15 @@ def validate_context(past_len, q_len):
 
 
 def validate_model_family(model):
-    # Recurrent helper lifecycle is CPU-tested, not family-qualified on GPUs.
-    # Keep the explicit gate until an exact-checkpoint hardware test passes.
-    if model.caps.get("recurrent_states"):
-        raise ValueError("multinode_pipeline does not support recurrent-state architectures (including Qwen3.5)")
+    architecture = getattr(getattr(model, "config", None), "architecture", None)
+    if (
+        model.caps.get("recurrent_states")
+        and architecture != "Glm5NextForConditionalGeneration"
+    ):
+        raise ValueError(
+            f"multinode_pipeline does not support recurrent-state architecture "
+            f"{architecture!r}; supported: Glm5NextForConditionalGeneration"
+        )
 
 R = args.rank
 addrs = args.addrs.split(",")

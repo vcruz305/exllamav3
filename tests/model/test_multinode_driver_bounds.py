@@ -14,9 +14,37 @@ def functions(namespace):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(PATH), 'exec'), namespace)
     return namespace
 
+def test_glm5_next_recurrent_family_is_allowed():
+    ns = functions({})
+    model = NS(
+        caps={'recurrent_states': True},
+        config=NS(architecture='Glm5NextForConditionalGeneration'),
+    )
+
+    ns['validate_model_family'](model)
+
+
+@pytest.mark.parametrize('model', [
+    NS(
+        caps={'recurrent_states': True},
+        config=NS(architecture='Qwen3_5ForConditionalGeneration'),
+    ),
+    NS(caps={'recurrent_states': True}),
+])
+def test_other_or_unknown_recurrent_family_is_rejected(model):
+    ns = functions({})
+
+    with pytest.raises(ValueError, match='recurrent-state architecture'):
+        ns['validate_model_family'](model)
+
+
 def test_recurrent_family_rejected_before_input_preparation():
     def forbidden(*args): raise AssertionError('recurrent input preparation reached')
-    ns = functions({'model': NS(caps={'recurrent_states': True}, prepare_inputs=forbidden),
+    ns = functions({'model': NS(
+                        caps={'recurrent_states': True},
+                        config=NS(architecture='Qwen3_5ForConditionalGeneration'),
+                        prepare_inputs=forbidden,
+                    ),
                     'cache': None, 'args': NS(ctx=256), 'R': 0, 'my_fwd': [], 'torch': torch})
     with pytest.raises(ValueError, match='recurrent'): ns['run_slice'](torch.ones((1,3), dtype=torch.long), None, 0, False)
 
@@ -27,10 +55,11 @@ def test_startup_rejects_recurrent_before_cache_loading_and_network():
     # parser/import leaves and actual weight load are intentionally not executed.
     start = next(i for i,n in enumerate(tree.body) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'R' for t in n.targets))
     end = next(i for i,n in enumerate(tree.body) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'my_files' for t in n.targets))
+    config = NS(architecture='Qwen3_5ForConditionalGeneration')
     ns = functions({'args': NS(rank=0, addrs='a,b', splits='0:1,1:2', model='fake', transport='tcp', ctx=256, port=1, chunk=64, max_new=3),
                     'torch': NS(device=forbidden, cuda=NS(set_device=forbidden)),
-                    'Config': NS(from_directory=lambda _: NS()),
-                    'Model': NS(from_config=lambda _: NS(caps={'recurrent_states': True})),
+                    'Config': NS(from_directory=lambda _: config),
+                    'Model': NS(from_config=lambda cfg: NS(caps={'recurrent_states': True}, config=cfg)),
                     'Cache': forbidden, 'NetEndpoint': NS(listen=forbidden),
                     'threading': NS(Thread=forbidden), 'time': NS(time=lambda: 0)})
     with pytest.raises(ValueError, match='recurrent'):
