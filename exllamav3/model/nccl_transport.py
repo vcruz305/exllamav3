@@ -109,13 +109,12 @@ class NcclEndpoint:
             **kwargs,
         )
 
-    def _send_header(self, msg_type: int, dtype_code: int, shape: tuple, payload_len: int):
+    def _prepare_header(self, msg_type: int, dtype_code: int, shape: tuple, payload_len: int):
         if len(shape) > 5:
             raise NcclTransportError(f"Tensor has {len(shape)} dimensions; max 5 supported")
         dims = list(shape) + [0] * (5 - len(shape))
         h = [self._MAGIC, msg_type, dtype_code, len(shape), *dims, payload_len]
         self._hdr_send.copy_(torch.tensor(h, dtype = torch.long))
-        dist.send(self._hdr_send, self.peer, group = self.group)
 
     def _recv_header(self, expect_type: int):
         self._ensure_open()
@@ -199,13 +198,23 @@ class NcclEndpoint:
             raise NcclTransportError(f"Unsupported dtype: {t.dtype}")
         self._ensure_open()
         payload_len = self._tensor_nbytes(tuple(t.shape), self._DTYPE_TO_CODE[t.dtype])
-        payload = t.contiguous()
-        if payload.device != self.comm_device:
-            payload = payload.to(self.comm_device)
-        self._send_header(self._MSG_TENSOR, self._DTYPE_TO_CODE[t.dtype], tuple(t.shape), payload_len)
-        if payload.numel() > 0:
-            # NCCL has no fp8/bool reductions but p2p is a byte copy: send as uint8
-            dist.send(payload.view(-1).view(torch.uint8), self.peer, group = self.group)
+        try:
+            payload = t.resolve_conj().resolve_neg().contiguous()
+            if payload.device != self.comm_device:
+                payload = payload.to(self.comm_device)
+            # Complete the byte view and header buffer before publishing anything.
+            payload = payload.view(-1).view(torch.uint8)
+            self._prepare_header(self._MSG_TENSOR, self._DTYPE_TO_CODE[t.dtype], tuple(t.shape), payload_len)
+        except Exception as e:
+            raise NcclTransportError(f"Tensor preparation failed: {e}") from e
+        try:
+            dist.send(self._hdr_send, self.peer, group = self.group)
+            if payload_len > 0:
+                # NCCL has no fp8/bool reductions but p2p is a byte copy: send as uint8
+                dist.send(payload, self.peer, group = self.group)
+        except Exception as e:
+            self.close()
+            raise NcclTransportError(f"Tensor send failed: {e}") from e
 
     def recv_tensor(self, out: torch.Tensor | None = None, device = None, stream = None) -> torch.Tensor:
         """Receive on the caller's current stream; matching strided outputs are copied."""
@@ -231,11 +240,20 @@ class NcclEndpoint:
         return buf
 
     def send_obj(self, obj: Any) -> None:
-        payload = self._encode_obj(obj)
-        self._send_header(self._MSG_OBJECT, 0, (), len(payload))
-        if payload:
+        self._ensure_open()
+        try:
+            payload = self._encode_obj(obj)
             t = torch.frombuffer(bytearray(payload), dtype = torch.uint8).to(self.comm_device)
-            dist.send(t, self.peer, group = self.group)
+            self._prepare_header(self._MSG_OBJECT, 0, (), len(payload))
+        except Exception as e:
+            raise NcclTransportError(f"Object preparation failed: {e}") from e
+        try:
+            dist.send(self._hdr_send, self.peer, group = self.group)
+            if payload:
+                dist.send(t, self.peer, group = self.group)
+        except Exception as e:
+            self.close()
+            raise NcclTransportError(f"Object send failed: {e}") from e
 
     def recv_obj(self) -> Any:
         h = self._recv_header(self._MSG_OBJECT)
