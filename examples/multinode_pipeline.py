@@ -51,10 +51,30 @@ ap.add_argument("--nll_file", default = None, help = "rank 0: text file to score
 ap.add_argument("--chunk", type = int, default = 512)
 args = ap.parse_args()
 
+def validate_driver_options(args):
+    if args.ctx <= 0 or args.chunk <= 0 or args.max_new < 0:
+        raise ValueError("ctx and chunk must be positive; max_new must be nonnegative")
+
+
+def validate_context(past_len, q_len):
+    if past_len < 0 or q_len <= 0 or past_len + q_len > args.ctx:
+        raise ValueError(f"forward exceeds context: past={past_len}, input={q_len}, ctx={args.ctx}")
+
+
+def validate_model_family(model):
+    # This manual stage loop has no persistent recurrent-state lifecycle.
+    if model.caps.get("recurrent_states"):
+        raise ValueError("multinode_pipeline does not support recurrent-state architectures (including Qwen3.5)")
+
 R = args.rank
 addrs = args.addrs.split(",")
 W = len(addrs)
 splits = [tuple(int(v) for v in s.split(":")) for s in args.splits.split(",")]
+# Reject unsupported families before cache allocation, weights, CUDA setup or links.
+validate_driver_options(args)
+config = Config.from_directory(args.model)
+model = Model.from_config(config)
+validate_model_family(model)
 dev = torch.device("cuda:0")
 torch.cuda.set_device(dev)
 T0 = time.time()
@@ -70,9 +90,7 @@ if args.transport == "tcp":
                           daemon = True)
     lt.start()
 
-# Build the full module list, load only this rank's slice
-config = Config.from_directory(args.model)
-model = Model.from_config(config)
+# Load only this rank's slice of the full module list.
 cache = Cache(model, max_num_tokens = args.ctx)
 nl = config.num_hidden_layers
 fb = model.first_block_idx
@@ -131,6 +149,8 @@ stats = {"compute_ms": [], "steps": 0}
 
 @torch.inference_mode()
 def run_slice(ids, x, past_len, last_only):
+    validate_model_family(model)
+    validate_context(past_len, ids.shape[-1])
     params = {"attn_mode": "flash_attn", "cache": cache, "past_len": past_len, "batch_shape": (1, args.ctx)}
     model.prepare_inputs(ids, params)
     if R == 0:
@@ -189,9 +209,11 @@ def service():
             down.send_obj(head_result(y, ids, msg, state))
 
 def drive():
+    validate_driver_options(args)
     tok = Tokenizer.from_config(config)
 
     def step(ids, past_len, mode, last_only):
+        validate_context(past_len, ids.shape[-1])
         y = timed(ids.to(dev), None, past_len, last_only)
         # token ids ride in the control message (one object + one tensor per hop)
         down.send_obj({"cmd": "fwd", "past_len": past_len, "mode": mode, "last_only": last_only,
@@ -200,7 +222,10 @@ def drive():
         return up.recv_obj()
 
     if args.nll_file:
-        ids = tok.encode(open(args.nll_file).read(), add_bos = False)[:, : args.ctx - 16]
+        with open(args.nll_file) as f:
+            ids = tok.encode(f.read(), add_bos = False)
+        if not 2 <= ids.shape[-1] <= args.ctx:
+            raise ValueError(f"NLL input must contain 2..{args.ctx} tokens; got {ids.shape[-1]}")
         tot = cnt = top1 = 0
         t = time.time()
         for p in range(0, ids.shape[-1], args.chunk):
@@ -214,25 +239,35 @@ def drive():
         try: stop_ids.add(tok.single_id(s))
         except Exception: pass
     ids = tok.encode(model.default_chat_prompt(args.prompt), add_bos = False, encode_special_tokens = True)
-    if ids.shape[-1] > 1:
+    if not 1 <= ids.shape[-1] <= args.ctx:
+        raise ValueError(f"prompt must contain 1..{args.ctx} tokens; got {ids.shape[-1]}")
+    if args.max_new and ids.shape[-1] > 1:
         step(ids[:, :-1], 0, "nll", False)
     past, cur, out, lat = ids.shape[-1] - 1, ids[:, -1:], [], []
+    finish = "max_new"
     for _ in range(args.max_new):
+        if past + cur.shape[-1] > args.ctx:
+            finish = "context_limit"
+            break
         t = time.perf_counter()
         r = step(cur, past, "gen", True)
         lat.append(time.perf_counter() - t)
         out.append(r["token"]); past += 1
         cur = torch.tensor([[r["token"]]], dtype = torch.long)
         if r["token"] in stop_ids:
+            finish = "eos"
             break
     print(tok.decode(torch.tensor([out]), decode_special_tokens = True)[0], flush = True)
     s = sorted(lat)
-    log(f"decode {len(lat)} tokens: {len(lat) / sum(lat):.2f} tok/s, per token p50 {1e3 * s[len(s) // 2]:.1f} ms")
+    log(f"finish={finish}")
+    p50 = 1e3 * s[len(s) // 2] if s else 0.0
+    rate = len(lat) / sum(lat) if lat and sum(lat) > 0 else 0.0
+    log(f"decode {len(lat)} tokens: {rate:.2f} tok/s, per token p50 {p50:.1f} ms")
     down.send_obj({"cmd": "stop", "ranks": [compute_summary()]})
     r = up.recv_obj()
     tot = sum(x["compute_ms_p50"] or 0 for x in r["ranks"])
     log(f"per-rank compute p50 (ms): {[x['compute_ms_p50'] for x in r['ranks']]}, sum {tot:.1f}; "
-        f"links + host ~ {1e3 * s[len(s) // 2] - tot:.1f} ms per token")
+        f"links + host ~ {p50 - tot:.1f} ms per token")
 
 try:
     drive() if R == 0 else service()

@@ -19,6 +19,8 @@ The transport layer handles:
 from __future__ import annotations
 
 import socket
+import time
+import math
 import struct
 import json
 import io
@@ -62,6 +64,10 @@ class NetEndpoint:
     # Message types
     _MSG_TENSOR = 0
     _MSG_OBJECT = 1
+    # Finite per-frame limits, configurable per endpoint. Empty shapes also bound
+    # their nonzero geometry to prevent torch stride/product overflow.
+    max_tensor_bytes = 1024 * 1024 * 1024
+    max_object_bytes = 16 * 1024 * 1024
 
     # Fixed header layout:
     # magic (4 bytes): 0xDEADBEEF
@@ -75,7 +81,9 @@ class NetEndpoint:
     _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
     _MAGIC = 0xDEADBEEF
 
-    def __init__(self, sock: socket.socket, is_server: bool = False, buffer_size: int = 4 * 1024 * 1024):
+    def __init__(self, sock: socket.socket, is_server: bool = False, buffer_size: int = 4 * 1024 * 1024,
+                 *, max_tensor_bytes: int = 1024 * 1024 * 1024, max_object_bytes: int = 16 * 1024 * 1024,
+                 io_timeout: float = 60.0):
         """
         Initialize endpoint with an existing socket.
 
@@ -83,8 +91,19 @@ class NetEndpoint:
             sock: Connected socket.socket instance.
             is_server: Whether this endpoint is the listening side (for logging/clarity).
             buffer_size: TCP send/recv buffer size in bytes (default 4MB for high-speed interconnects).
+            max_tensor_bytes: Finite tensor payload/geometry cap (default 1 GiB).
+            max_object_bytes: Finite JSON payload cap (default 16 MiB).
+            io_timeout: Finite deadline per header/payload I/O loop (default 60s).
+
+        TCP is unauthenticated: use only on an access-controlled trusted fabric.
+        close() can cancel blocked I/O. See doc/multinode_pipeline_limits.md.
         """
+        self.max_tensor_bytes = self._validate_limit(max_tensor_bytes)
+        self.max_object_bytes = self._validate_limit(max_object_bytes)
+        self._closed = False
+        self.io_timeout = self._validate_timeout(io_timeout)
         self.sock = sock
+        self.sock.settimeout(self.io_timeout)
         self.is_server = is_server
 
         # Low latency socket tuning
@@ -122,6 +141,9 @@ class NetEndpoint:
         port: int,
         timeout: float = 60.0,
         buffer_size: int = 4 * 1024 * 1024,
+        *, io_timeout: float = 60.0,
+        max_tensor_bytes: int = 1024 * 1024 * 1024,
+        max_object_bytes: int = 16 * 1024 * 1024,
     ) -> NetEndpoint:
         """
         Create a server endpoint that listens for and accepts one peer connection.
@@ -138,6 +160,12 @@ class NetEndpoint:
         Raises:
             NetTransportError: On socket/accept errors or timeout.
         """
+        cls._validate_timeout(timeout)
+        cls._validate_timeout(io_timeout)
+        cls._validate_limit(max_tensor_bytes)
+        cls._validate_limit(max_object_bytes)
+        server_sock = None
+        peer_sock = None
         try:
             server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -150,9 +178,15 @@ class NetEndpoint:
             finally:
                 server_sock.close()
 
-            return cls(peer_sock, is_server = True, buffer_size = buffer_size)
+            return cls(peer_sock, is_server = True, buffer_size = buffer_size, io_timeout = io_timeout,
+                       max_tensor_bytes = max_tensor_bytes, max_object_bytes = max_object_bytes)
         except Exception as e:
+            if peer_sock is not None:
+                peer_sock.close()
             raise NetTransportError(f"listen on {host}:{port} failed: {e}") from e
+        finally:
+            if server_sock is not None:
+                server_sock.close()
 
     @classmethod
     def connect(
@@ -161,6 +195,9 @@ class NetEndpoint:
         port: int,
         timeout: float = 60.0,
         buffer_size: int = 4 * 1024 * 1024,
+        *, io_timeout: float = 60.0,
+        max_tensor_bytes: int = 1024 * 1024 * 1024,
+        max_object_bytes: int = 16 * 1024 * 1024,
     ) -> NetEndpoint:
         """
         Create a client endpoint that connects to a listening peer.
@@ -179,30 +216,111 @@ class NetEndpoint:
         Raises:
             NetTransportError: If connection fails after timeout or on other errors.
         """
-        import time
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        start_time = time.time()
-        attempt = 0
+        cls._validate_timeout(timeout)
+        cls._validate_timeout(io_timeout)
+        cls._validate_limit(max_tensor_bytes)
+        cls._validate_limit(max_object_bytes)
+        deadline = time.monotonic() + timeout
+        backoff = 0.1
         last_error = None
-
-        while time.time() - start_time < timeout:
+        while time.monotonic() < deadline:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
+                remaining = min(timeout, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise socket.timeout("Connection deadline expired")
+                sock.settimeout(remaining)
                 sock.connect((host, port))
-                return cls(sock, is_server = False, buffer_size = buffer_size)
-            except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                if time.monotonic() >= deadline:
+                    raise socket.timeout("Connection completed after deadline")
+                return cls(sock, is_server = False, buffer_size = buffer_size, io_timeout = io_timeout,
+                           max_tensor_bytes = max_tensor_bytes, max_object_bytes = max_object_bytes)
+            except (socket.timeout, OSError) as e:
+                sock.close()
                 last_error = e
-                attempt += 1
-                backoff = min(0.1 * (2 ** attempt), 1.0)
-                remaining = timeout - (time.time() - start_time)
+                remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(backoff, remaining))
+                backoff = min(backoff * 2, 1.0)
+            except Exception:
+                sock.close()
+                raise
+        raise NetTransportError(f"connect to {host}:{port} failed after {timeout}s: {last_error}")
 
-        sock.close()
-        raise NetTransportError(
-            f"connect to {host}:{port} failed after {timeout}s: {last_error}"
-        )
+    @staticmethod
+    def _validate_timeout(value):
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise NetTransportError("Timeouts must be finite positive seconds")
+        return value
+
+    def _set_io_deadline(self, deadline):
+        self._ensure_open()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._fail("Socket I/O deadline expired")
+        self.sock.settimeout(remaining)
+
+    @staticmethod
+    def _validate_limit(n):
+        if type(n) is not int or not 0 < n <= (1 << 63) - 1:
+            raise NetTransportError("Byte limits must be positive integers no greater than int64 max")
+        return n
+
+    def _ensure_open(self):
+        if getattr(self, "_closed", False):
+            raise NetTransportError("Endpoint is closed or poisoned")
+
+    def _fail(self, message):
+        self.close()
+        raise NetTransportError(message)
+
+    def _tensor_nbytes(self, shape, dtype_code):
+        if not 0 <= len(shape) <= 5:
+            raise NetTransportError(f"Invalid tensor ndim: {len(shape)}")
+        if dtype_code not in self._CODE_TO_DTYPE:
+            raise NetTransportError(f"Unknown dtype code: {dtype_code}")
+        itemsize = (2, 2, 4, 4, 8, 1, 1, 1)[dtype_code]
+        product = 1
+        for d in shape:
+            if d < 0 or d > (1 << 63) - 1 or product > (self.max_tensor_bytes // itemsize) // max(1, d):
+                raise NetTransportError(f"Tensor shape exceeds byte limit or overflows: {shape}")
+            product *= max(1, d)
+        n = 0 if 0 in shape else product * itemsize
+        if n > self.max_tensor_bytes:
+            raise NetTransportError(f"Tensor exceeds byte limit: {n}")
+        return n
+
+    def _validate_tensor_header(self, ndim, dims, dtype_code, payload_len):
+        self._ensure_open()
+        try:
+            if not 0 <= ndim <= 5:
+                raise NetTransportError(f"Invalid tensor ndim: {ndim}")
+            shape = tuple(dims[:ndim])
+            expected = self._tensor_nbytes(shape, dtype_code)
+            if payload_len != expected:
+                raise NetTransportError(f"Payload length {payload_len} does not match shape {shape}")
+        except NetTransportError:
+            self.close()
+            raise
+        return shape, self._CODE_TO_DTYPE[dtype_code]
+
+    def _validate_object_length(self, n):
+        self._ensure_open()
+        if not 0 < n <= self.max_object_bytes:
+            self._fail(f"Object payload length exceeds byte limit or is invalid: {n}")
+
+    def _encode_obj(self, obj):
+        self._ensure_open()
+        payload = bytearray()
+        try:
+            for chunk in json.JSONEncoder().iterencode(obj):
+                chunk = chunk.encode("utf-8")
+                if len(payload) + len(chunk) > self.max_object_bytes:
+                    raise NetTransportError("Object exceeds byte limit")
+                payload.extend(chunk)
+        except (TypeError, ValueError) as e:
+            raise NetTransportError(f"Object not JSON-serializable: {e}") from e
+        return payload
 
     def send_tensor(self, t: torch.Tensor, stream: torch.cuda.Stream | None = None) -> None:
         """
@@ -218,9 +336,7 @@ class NetEndpoint:
         Raises:
             NetTransportError: If dtype is unsupported or send fails.
         """
-        if not t.is_contiguous():
-            t = t.contiguous()
-
+        self._ensure_open()
         dtype = t.dtype
         if dtype not in self._DTYPE_TO_CODE:
             raise NetTransportError(f"Unsupported dtype: {dtype}")
@@ -231,7 +347,9 @@ class NetEndpoint:
             raise NetTransportError(f"Tensor has {ndim} dimensions; max 5 supported")
 
         shape_tuple = tuple(t.shape) + (0,) * (5 - ndim)
-        payload_len = t.numel() * t.itemsize
+        payload_len = self._tensor_nbytes(tuple(t.shape), dtype_code)
+        if not t.is_contiguous():
+            t = t.contiguous()
 
         # Stage a CUDA tensor through the reused pinned buffer
         if t.is_cuda:
@@ -275,7 +393,8 @@ class NetEndpoint:
         """
         Receive a tensor from the peer.
 
-        If `out` is provided and matches shape/dtype, data is written directly into `out`.
+        If `out` matches shape/dtype, it is reused; strided CPU outputs receive via
+        a contiguous temporary and copy. All peer metadata is validated first.
         If targeting CUDA, reads directly into pinned memory via recv_into, then copies to GPU.
 
         Args:
@@ -300,14 +419,10 @@ class NetEndpoint:
         ) = struct.unpack(self._HEADER_FMT, header)
 
         if magic != self._MAGIC:
-            raise NetTransportError(f"Bad magic: {hex(magic)}")
+            self._fail(f"Bad magic: {hex(magic)}")
         if msg_type != self._MSG_TENSOR:
-            raise NetTransportError(f"Expected tensor message, got {msg_type}")
-        if dtype_code not in self._CODE_TO_DTYPE:
-            raise NetTransportError(f"Unknown dtype code: {dtype_code}")
-
-        dtype = self._CODE_TO_DTYPE[dtype_code]
-        shape = (d0, d1, d2, d3, d4)[:ndim]
+            self._fail(f"Expected tensor message, got {msg_type}")
+        shape, dtype = self._validate_tensor_header(ndim, (d0, d1, d2, d3, d4), dtype_code, payload_len)
 
         # Determine target device
         if out is not None:
@@ -342,9 +457,13 @@ class NetEndpoint:
             else:
                 out.copy_(host_view, non_blocking = False)
         else:
-            # CPU target: read directly into destination tensor buffer
-            mv = memoryview(out.view(torch.uint8).numpy()).cast("B")
+            # Scalar views must be flattened before changing element size. A strided
+            # output needs a contiguous receive buffer, then a stride-aware copy.
+            buf = out if out.is_contiguous() else torch.empty(shape, dtype = dtype, device = target_device)
+            mv = memoryview(buf.view(-1).view(torch.uint8).numpy()).cast("B")
             self._recv_into_exact(mv)
+            if buf is not out:
+                out.copy_(buf)
 
         return out
 
@@ -358,10 +477,7 @@ class NetEndpoint:
         Raises:
             NetTransportError: On serialization or send failure.
         """
-        try:
-            payload = json.dumps(obj).encode("utf-8")
-        except (TypeError, ValueError) as e:
-            raise NetTransportError(f"Object not JSON-serializable: {e}") from e
+        payload = self._encode_obj(obj)
 
         payload_len = len(payload)
 
@@ -400,19 +516,21 @@ class NetEndpoint:
         ) = struct.unpack(self._HEADER_FMT, header)
 
         if magic != self._MAGIC:
-            raise NetTransportError(f"Bad magic: {hex(magic)}")
+            self._fail(f"Bad magic: {hex(magic)}")
         if msg_type != self._MSG_OBJECT:
-            raise NetTransportError(f"Expected object message, got {msg_type}")
+            self._fail(f"Expected object message, got {msg_type}")
 
-        payload = self._recv_exact(payload_len) if payload_len > 0 else b""
+        self._validate_object_length(payload_len)
+        payload = self._recv_exact(payload_len)
 
         try:
             return json.loads(payload.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            raise NetTransportError(f"Object parse failed: {e}") from e
+            self._fail(f"Object parse failed: {e}")
 
     def close(self) -> None:
-        """Close the underlying socket."""
+        """Close the underlying socket and prevent further framing operations."""
+        self._closed = True
         if self.sock:
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
@@ -430,16 +548,19 @@ class NetEndpoint:
         Raises:
             NetTransportError: On socket errors.
         """
+        self._ensure_open()
+        deadline = time.monotonic() + self.io_timeout
         total_sent = 0
         total_len = len(data)
         while total_sent < total_len:
             try:
+                self._set_io_deadline(deadline)
                 sent = self.sock.send(data[total_sent:])
                 if sent == 0:
-                    raise NetTransportError("Socket send returned 0 (peer closed)")
+                    self._fail("Socket send returned 0 (peer closed)")
                 total_sent += sent
             except socket.error as e:
-                raise NetTransportError(f"Send failed: {e}") from e
+                self._fail(f"Send failed: {e}")
 
     def _recv_exact(self, n: int) -> bytes:
         """
@@ -454,6 +575,7 @@ class NetEndpoint:
         Raises:
             NetTransportError: On EOF (partial read) or socket errors.
         """
+        self._ensure_open()
         data = bytearray(n)
         mv = memoryview(data)
         self._recv_into_exact(mv)
@@ -470,18 +592,19 @@ class NetEndpoint:
         Raises:
             NetTransportError: On EOF or socket errors.
         """
+        self._ensure_open()
+        deadline = time.monotonic() + self.io_timeout
         n = len(buffer)
         pos = 0
         while pos < n:
             try:
+                self._set_io_deadline(deadline)
                 nbytes = self.sock.recv_into(buffer[pos:])
                 if nbytes == 0:
-                    raise NetTransportError(
-                        f"EOF while expecting {n} bytes (got {pos})"
-                    )
+                    self._fail(f"EOF while expecting {n} bytes (got {pos})")
                 pos += nbytes
             except socket.error as e:
-                raise NetTransportError(f"Recv failed: {e}") from e
+                self._fail(f"Recv failed: {e}")
 
     def _get_pinned_buffer(self, size: int) -> torch.Tensor:
         """
@@ -499,7 +622,7 @@ class NetEndpoint:
             self._staging_event.synchronize()
             self._staging_event = None
         if self._pinned_buffer is None or self._pinned_size < size:
-            new_size = int(size * 1.5) + 1024
+            new_size = min(self.max_tensor_bytes, size + size // 2 + 1024)
             self._pinned_buffer = torch.empty(
                 new_size,
                 dtype = torch.uint8,
