@@ -245,7 +245,8 @@ class NcclEndpoint:
         dist.recv(t, self.peer, group = self.group)
         try:
             return json.loads(bytes(t.cpu().numpy()).decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        except (ValueError, RecursionError, MemoryError) as e:
+            # ValueError includes JSON/UTF-8 errors and integer conversion limits.
             self._fail(f"Object parse failed: {e}")
 
     def close(self) -> None:

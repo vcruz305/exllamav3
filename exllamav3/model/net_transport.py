@@ -348,22 +348,32 @@ class NetEndpoint:
 
         shape_tuple = tuple(t.shape) + (0,) * (5 - ndim)
         payload_len = self._tensor_nbytes(tuple(t.shape), dtype_code)
-        if not t.is_contiguous():
-            t = t.contiguous()
+        try:
+            if not t.is_contiguous():
+                t = t.contiguous()
 
-        # Stage a CUDA tensor through the reused pinned buffer
-        if t.is_cuda:
-            staging = self._get_pinned_buffer(payload_len)
-            send_data = staging[:payload_len].view(t.dtype).view(t.shape)
-            if stream is not None:
-                with torch.cuda.stream(stream):
-                    send_data.copy_(t, non_blocking = True)
-                stream.synchronize()
+            # Stage a CUDA tensor through the reused pinned buffer
+            if t.is_cuda:
+                staging = self._get_pinned_buffer(payload_len)
+                send_data = staging[:payload_len].view(t.dtype).view(t.shape)
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        send_data.copy_(t, non_blocking = True)
+                    stream.synchronize()
+                else:
+                    send_data.copy_(t, non_blocking = False)
+                send_data = send_data.view(-1)
             else:
-                send_data.copy_(t, non_blocking = False)
-            send_data = send_data.view(-1)
-        else:
-            send_data = t.view(-1)
+                send_data = t.view(-1)
+
+            # Complete byte-view preparation before publishing any header. Contiguous
+            # CPU tensors can still carry lazy negative/conjugate view bits.
+            payload = None
+            if payload_len > 0:
+                send_data = send_data.resolve_conj().resolve_neg()
+                payload = memoryview(send_data.view(torch.uint8).numpy())
+        except Exception as e:
+            raise NetTransportError(f"Tensor payload preparation failed: {e}") from e
 
         # Build and send header
         header = struct.pack(
@@ -375,14 +385,12 @@ class NetEndpoint:
             *shape_tuple,
             payload_len,
         )
-        self._sendall(header)
-
-        # Send payload
-        if send_data.numel() > 0:
-            # send_data viewed as uint8 avoids numpy conversion issues with bfloat16 / fp8
-            u8_tensor = send_data.view(torch.uint8)
-            # Use buffer interface directly
-            self._sendall(memoryview(u8_tensor.numpy()))
+        try:
+            self._sendall(header)
+            if payload is not None:
+                self._sendall(payload)
+        except Exception as e:
+            self._fail(f"Tensor send failed after header publication began: {e}")
 
     def recv_tensor(
         self,
@@ -491,9 +499,12 @@ class NetEndpoint:
             0, 0, 0, 0, 0,
             payload_len,
         )
-        self._sendall(header)
-        if payload_len > 0:
-            self._sendall(payload)
+        try:
+            self._sendall(header)
+            if payload_len > 0:
+                self._sendall(payload)
+        except Exception as e:
+            self._fail(f"Object send failed after header publication began: {e}")
 
     def recv_obj(self) -> Any:
         """
@@ -525,7 +536,8 @@ class NetEndpoint:
 
         try:
             return json.loads(payload.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        except (ValueError, RecursionError, MemoryError) as e:
+            # ValueError includes JSON/UTF-8 errors and integer conversion limits.
             self._fail(f"Object parse failed: {e}")
 
     def close(self) -> None:
