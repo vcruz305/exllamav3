@@ -61,13 +61,15 @@ ordering from a tensor produced on an unrelated stream.
 
 The stage helper retains persistent recurrent state, advances it once per slice
 forward using the canonical library utility, and frees it on reset/shutdown; its
-lifecycle is covered on CPU. No recurrent family has an exact-checkpoint GPU
-qualification in this PP example, so models advertising
-`caps["recurrent_states"]` are deliberately rejected before cache allocation,
-weights, CUDA setup or network links. This includes Qwen3.5 and other
-recurrent/hybrid families; library model support is not qualification for this
-example. Nonrecurrent models must also obey the existing DSA full-indexer split
-restrictions; this patch is not a new family qualification.
+lifecycle is covered on CPU. The driver admits
+`Glm5NextForConditionalGeneration` automatically because that architecture uses
+this lifecycle. Its exact-checkpoint GPU quality is still unqualified until a
+matching hardware run compares multi-token prefill, decode and NLL against a
+trusted single-model baseline. Every other model advertising
+`caps["recurrent_states"]` is rejected before cache allocation, weights, CUDA
+setup or network links, including Qwen3.5 and unknown recurrent families.
+Nonrecurrent models must also obey the existing DSA full-indexer split
+restrictions; this change is not a general recurrent-family qualification.
 
 `ctx` and `chunk` must be positive and `max_new` nonnegative. Empty or over-context
 prompts are rejected. NLL inputs require 2..ctx tokens and are rejected rather
@@ -82,7 +84,8 @@ still sends the stop control message.
 
 ```bash
 python -m pytest tests/model/test_net_transport.py tests/model/test_nccl_transport.py \
-    tests/model/test_transport_bounds.py tests/model/test_multinode_driver_bounds.py -q
+    tests/model/test_transport_bounds.py tests/model/test_multinode_driver_bounds.py \
+    tests/model/test_multinode_pipeline.py -q
 ```
 
 These tests exercise real localhost TCP and two-process CPU Gloo round-trips,

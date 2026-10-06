@@ -46,8 +46,10 @@ These transports have no authentication or encryption: use a trusted, isolated
 fabric, firewall job ports, and do not expose them to the public Internet.
 See [transport and driver limits](multinode_pipeline_limits.md) for finite frame
 limits, TCP I/O deadlines, endpoint poisoning and receive-layout handling.
-The manual loop rejects recurrent/hybrid model families before allocation or
-network setup; library model support is not qualification for this PP example.
+The manual loop automatically supports recurrent state for
+`Glm5NextForConditionalGeneration` (GLM-5.3-Flash). Other recurrent/hybrid
+families are rejected before allocation or network setup; general library model
+support is not qualification for this PP example.
 
 ## Build and runtime identity
 
@@ -165,11 +167,13 @@ operator's job to free a port/GPU.
 The default is `Cache(model, max_num_tokens=ctx)` with fp16 cache (MLA stores
 fp16 latent/RoPE/indexer planes). The explicit `--cache_quant 4` / `-cq 4` option
 selects the canonical quantized cache; `--cache_quant 4,6` sets separate K/V
-bitrates. It does not change weight precision or transport dtype. The cache helper
-and recurrent-state lifecycle were retained from the concurrent PR commit, but
-**Q4 PP and recurrent-family GPU quality are not qualified by the historical
-fp16 PP measurements**. Recurrent/hybrid families still fail early at the CLI;
-the retained state helper has CPU lifecycle tests, not a hardware qualification.
+bitrates. It does not change weight precision or transport dtype. The stage loop
+keeps and advances recurrent state automatically for
+`Glm5NextForConditionalGeneration`. **Q4 PP and GLM-5.3-Flash recurrent GPU
+quality are not qualified by the historical fp16 GLM-5.3 PP measurements.** The
+state lifecycle has CPU regression coverage; this is not an exact-checkpoint
+hardware qualification. Other recurrent/hybrid families still fail early at the
+CLI.
 There are no TP, CP, MTP or DFlash switches. `--ctx` is allocated capacity, not
 prompt tokens read. Use a multiple of 256, keep prompt plus decode within capacity,
 and start with short prompts. Increasing capacity is not a long-context
