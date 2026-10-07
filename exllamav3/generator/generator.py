@@ -712,6 +712,26 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _mtp_window(self, batch_size: int) -> int:
+        """Keep a speculative verify near one stream's row count.
+
+        Unique experts scale almost one-for-one with rows, so a long draft
+        across a wide batch moves more weight than it accepts. One stream keeps
+        the full draft. EXL3_DRAFT_ROW_BUDGET caps batch * (draft + 1). Unset
+        or 0 leaves the full draft.
+        """
+        full = self.num_draft_tokens
+        if batch_size <= 1 or full <= 0:
+            return full
+        raw = _os.environ.get("EXL3_DRAFT_ROW_BUDGET", "")
+        if not raw:
+            return full
+        budget = int(raw)
+        if budget <= 0:
+            return full
+        return max(0, min(full, budget // batch_size - 1))
+
+
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -724,6 +744,9 @@ class Generator:
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
             batch_size += 1
         if batch_size == 0:
+            return None
+        mtp_window = self._mtp_window(batch_size)
+        if mtp_window <= 0:
             return None
 
         # Create block index table for batch. Keep draft staging separate from the target's
@@ -775,8 +798,9 @@ class Generator:
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
-        # below the confidence target, keeping the first low-confidence token as the label probe
-        window = self.num_draft_tokens
+        # below the confidence target, keeping the first low-confidence token as the label probe.
+        # The width is already capped for this batch; see _mtp_window.
+        window = mtp_window
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
