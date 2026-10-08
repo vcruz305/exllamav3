@@ -183,7 +183,7 @@ Sequence = extract_class("exllamav3/generator/pagetable.py", "Sequence",
                          ["prepare", "allocate_pages", "build_block_index_tensor"], NS_GLOBALS)
 JobMethods = extract_class("exllamav3/generator/job.py", "Job",
                            ["prepare_for_queue", "receive_sample", "prepare_for_requeue",
-                            "is_prefill_done", "get_max_seq_len", "get_input_ids_list"],
+                            "is_prefill_done", "get_max_seq_len", "get_input_ids_list", "_check_banned_strings"],
                            NS_GLOBALS, requeue_prefix=True)
 InputLayer = extract_class("exllamav3/modules/arch_specific/dflash.py", "DFlashInputLayer", ["forward"], NS_GLOBALS)
 
@@ -220,6 +220,7 @@ class CPUJob(JobMethods):
         self.time_enqueued = self.time_prefill = self.time_generate = 0
         self.accepted_draft_tokens = self.rejected_draft_tokens = 0
         self.rq_prompt_tokens = self.rq_cached = None
+        self.rq_new_tokens = kwargs.get("rq_state", {}).get("rq_new_tokens", 0)
         self.cached_pages = self.cached_tokens = 0
         self.sam = self.forced_ids = None
         self.forced_index = 0

@@ -9,6 +9,7 @@ from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
@@ -16,7 +17,9 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
-_qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+# (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+# the cooperative GEMM)
+_qkv_slice_enable = QKV_SLICE
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -170,6 +173,7 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int = -1,
         window_right: int = 0,
+        sink_key0: bool = False,
         logit_softcapping: float = 0.0,
         q_norm: RMSNorm | LayerNorm | None = None,
         k_norm: RMSNorm | LayerNorm | None = None,
@@ -214,9 +218,10 @@ class Attention(Module):
         self.register_submodule(qsa_indexer)
         self.out_dtype = out_dtype
         self.sliding_window = sliding_window
-        # Keys after the query position that a sliding window admits (0 = causal-shaped). Lets a
-        # block of queries attend to each other while staying bounded on the left
+        # Keys ahead of the query a windowed row may attend to; 0 = the usual past-only window
         self.window_right = window_right
+        # Sinks as a bias on the first key of each (varlen) segment rather than an extra logit
+        self.sink_key0 = sink_key0
         self.logit_softcapping = logit_softcapping
         self.interleaved_gate = interleaved_gate
         self.use_cu_seqlens = use_cu_seqlens
@@ -228,6 +233,36 @@ class Attention(Module):
             "Attn: gate_softplus is not implemented for the interleaved gate"
         self.key_sinks = key_sinks
         self.sinks = None
+
+        # Runtime and TP bookkeeping; set before the zero-head early return below (forward(), unload()
+        # and the TP import glue touch these on ranks that hold none of this layer's heads)
+        self.cache_layers = []
+        self.tp_cache_lookup = {}
+        self.multi_kv = None
+        self.multi_qg = None
+        self.tp_reduce = False
+        self.dispatch_cache = {}
+        self.bc_attn = {}
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
+
+        self.has_split_cache = False
+
+        # TP-aware span_heads norm support
+        self.tp_span_heads_norm = False
+        self.q_global_dim = 0
+        self.k_global_dim = 0
+
+        self.prealloc_qgh_1 = None
+        self.prealloc_qg_1 = None
+        self.prealloc_kvh_1 = None
+        self.prealloc_kv_1 = None
+        self.multi_qkv = None
+        self.prealloc_qkvh_1 = None
+        self.prealloc_qkv_out_1 = None
+        self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_carrier = None
 
         if self.num_kv_heads == 0:
             return
@@ -386,34 +421,6 @@ class Attention(Module):
             "kv_cache": True
         })
 
-        self.cache_layers = []
-        self.tp_cache_lookup = {}
-        self.multi_kv = None
-        self.multi_qg = None
-        self.tp_reduce = False
-        self.dispatch_cache = {}
-        self.bc_attn = {}
-
-        self.q_norm_tensor = None
-        self.k_norm_tensor = None
-
-        self.has_split_cache = False
-
-        # TP-aware span_heads norm support
-        self.tp_span_heads_norm = False
-        self.q_global_dim = 0
-        self.k_global_dim = 0
-
-        self.prealloc_qgh_1 = None
-        self.prealloc_qg_1 = None
-        self.prealloc_kvh_1 = None
-        self.prealloc_kv_1 = None
-        self.multi_qkv = None
-        self.prealloc_qkvh_1 = None
-        self.prealloc_qkv_out_1 = None
-        self.prealloc_qkv_cptrs_1 = None
-        self.prealloc_qkv_carrier = None
-
 
     @override
     def optimizer_targets(self):
@@ -441,7 +448,7 @@ class Attention(Module):
 
         if self.key_sinks:
             self.sinks = self.config.stc.get_tensor(
-                f"{self.key}.{self.key_sinks}", device, no_defer = True
+                f"{self.key}.{self.key_sinks}", device, no_defer = True, arena = False
             ).float().contiguous()
 
         # Test if K and V proj can be fused
@@ -929,7 +936,9 @@ class Attention(Module):
                 max_seqlen = max_seqlen,
                 causal = causal,
                 sm_scale = self.sm_scale,
-                window_size = self.window_arg(),
+                window_size = self.sliding_window,
+                window_right = self.window_right,
+                sink_key0 = self.sink_key0,
                 softcap = self.logit_softcapping,
                 sinks = self.sinks,
                 dispatch_cache = self.dispatch_cache,
@@ -993,22 +1002,31 @@ class Attention(Module):
         return CacheLayer_qsa, kwargs
 
 
-    def autosplit_extra_measure(self, params):
+    def _autosplit_layer(self, params):
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
-            return
-        if self.qsa_indexer is None or self.device is None:
-            return
+            return None
+        if self.device is None:
+            return None
         cache = params.get("cache")
         if cache is None:
-            return
+            return None
         from ..cache import CacheLayer, CacheLayer_quant
         from ..cache.qsa import QSAPlanes
         layer = cache if isinstance(cache, CacheLayer) else \
             cache.layers[self.layer_idx, params.get("layer_instance") or 0]
-        if not isinstance(layer, QSAPlanes):
-            return
         quant = isinstance(layer, CacheLayer_quant)
-        chunk = params["batch_shape"][1]
+        return layer, quant
+
+    def autosplit_prepare(self, params):
+        """QSA decode slot statics for the whole (bsz, q_len) family, allocated before the
+        loader's measuring window (they stay resident)"""
+        found = self._autosplit_layer(params)
+        if found is None:
+            return
+        layer, quant = found
+        from ..cache.qsa import QSAPlanes
+        if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
+            return
 
         # Decode statics: every buffer the (bsz <= MAX_BSZ, q_len <= MAX_QLEN) slot family
         # can request, both regimes (sparse slots are single-job, and the regime-1 score
@@ -1026,6 +1044,30 @@ class Attention(Module):
                 for q in (1, _bc_max_qlen):
                     bca._configure(1, q, True, 1)
 
+
+    def autosplit_extra_measure(self, params):
+        found = self._autosplit_layer(params)
+        if found is None:
+            return
+        layer, quant = found
+        from ..cache.qsa import QSAPlanes
+
+        # Quantized cache, unbounded prefill: the two-pass prefill stages the referenced window
+        # as fp16 K/V in a per-call transient, which spans the whole pool for a job at full
+        # context. The (1, chunk)-at-context-0 measuring pass only sees a chunk of it, so
+        # allocate (and drop) the worst case here for the device budget. QSA bounds its dense
+        # prefill and stages a small window; MLA/DSA caches have their own measure
+        if quant and not isinstance(layer, QSAPlanes) and self.qsa_indexer is None:
+            from .attention_fn.triton_paged import _qc_staging
+            if _qc_staging == 1:
+                n = 2 * layer.qk.shape[0] * PAGE_SIZE * layer.token_dim
+                t = torch.empty((n,), dtype = torch.half, device = self.device)
+                del t
+            return
+
+        if self.qsa_indexer is None or not isinstance(layer, QSAPlanes):
+            return
+        chunk = params["batch_shape"][1]
         # Sparse prefill at maximum context. Synthetic state: every block-table entry aliases
         # page 0, zeroed so the math stays finite
         num_pages = (layer.qk if quant else layer.k).shape[0]
@@ -1133,6 +1175,14 @@ class Attention(Module):
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            # Prefill-sized chunks otherwise take the bound from the host copy of cache_seqlens when
+            # the caller has one (the generator builds it on the CPU, so no sync): the kernels' fallback
+            # bound is the block table's width plus the chunk, which counts the chunk twice once the
+            # table covers it and can push a short context into the kv-split regime
+            if max_kv_len is None and seqlen > 16:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             o = attn_dispatch(
                 q = q,
                 k = k,
@@ -1144,7 +1194,8 @@ class Attention(Module):
                 cache_seqlens = cache_seqlens,
                 causal = causal,
                 sm_scale = self.sm_scale,
-                window_size = self.window_arg(),
+                window_size = self.sliding_window,
+                window_right = self.window_right,
                 softcap = self.logit_softcapping,
                 non_causal_spans = non_causal_spans,
                 sinks = self.sinks,
@@ -1205,7 +1256,9 @@ class Attention(Module):
             channels_to_split = 1
             max_devices = 1
         else:
-            while channel_width * self.head_dim < 128:
+            # EXL3 tensors split on 128-channel boundaries: widen the unit to as many K/V heads as
+            # it takes for the K/V slice width to be a multiple of 128 (e.g. head_dim 192 -> pairs)
+            while (channel_width * self.head_dim) % 128 != 0:
                 assert channels_to_split % 2 == 0, \
                     "Model's K/V heads cannot divide into 128-channel tensors"
                 channel_width *= 2
@@ -1250,10 +1303,13 @@ class Attention(Module):
                 "layer_idx": self.layer_idx,
                 "hidden_size": self.hidden_size,
                 "head_dim": self.head_dim,
+                "v_head_dim": self.v_head_dim,
                 "rope_settings": self.rope_settings,
                 "sm_scale": self.sm_scale,
                 "out_dtype": self.out_dtype,
                 "sliding_window": self.sliding_window,
+                "window_right": self.window_right,
+                "sink_key0": self.sink_key0,
                 "logit_softcapping": self.logit_softcapping,
                 "tp_split_norm": self.tp_split_norm,
                 "use_k_as_v": self.use_k_as_v,
@@ -1316,7 +1372,10 @@ class Attention(Module):
                 if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \
             if num_kv_heads else None
-        o_split = (False, first * head_dim * n_gqa, last * head_dim * n_gqa) \
+        # o_proj consumes v_head_dim lanes per query head (asymmetric V is zero-padded to head_dim
+        # only inside the cache)
+        v_head_dim = exported["kwargs"].get("v_head_dim") or head_dim
+        o_split = (False, first * v_head_dim * n_gqa, last * v_head_dim * n_gqa) \
             if num_kv_heads else None
         # For span_heads norms, we need element indices (head_idx * head_dim)
         # For regular norms, we use head indices
