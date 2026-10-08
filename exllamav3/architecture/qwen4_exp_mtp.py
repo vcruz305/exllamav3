@@ -112,6 +112,7 @@ class Qwen4ExpMTPModel(Model):
             ),
         )
         self.modules.append(self.stack_out)
+        GatedResidual.link_sites(self.modules)
 
         self.caps.update({
             "supports_tp": False,
@@ -177,9 +178,8 @@ class Qwen4ExpMTPModel(Model):
         stack = to_device(state, mixer.device).view(bsz, seq, mixer.hc_mult, mixer.hidden_size)
         state = mixer.forward(stack, params)
         if self.attached_model().loaded_tp:
-            # The target's lm_head lives in the TP workers (sharded): argmax over the shards
-            state = self.attached_model().tp_producer.send(state)
-            return self.attached_model().tp_dispatch_lm_head_argmax((state, {}))
+            # Upstream's unified sampler also exports confidence from TP-sharded heads.
+            return self.attached_model().lm_head_argmax(state, params)
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         state = lm.prepare_for_device(state, params)
@@ -204,13 +204,7 @@ class Qwen4ExpMTPModel(Model):
                     params["draft_conf"] = conf.view(b, q)
                     return ids.view(b, q)
                 return torch.argmax(y, dim = -1).view(b, q)
-        logits = lm.forward(state, params)
-        if params.get("export_draft_conf"):
-            logits = logits[..., :self.attached_model().config.vocab_size]
-            conf, ids = torch.max(logits, dim = -1)
-            params["draft_conf"] = conf
-            return ids
-        return torch.argmax(logits, dim = -1)
+        return self.attached_model().lm_head_argmax(state, params)
 
     def _pruned_head(self, lm, device):
         cached = getattr(self, "_pruned_head_cache", None)
@@ -222,7 +216,7 @@ class Qwen4ExpMTPModel(Model):
             self._pruned_head_cache = False
             return None
         n_full = tr.shape[1] * 16
-        n2 = min(_MTP_HEAD_N, n_full) // 128 * 128
+        n2 = min(_MTP_HEAD_N, n_full, self.attached_model().config.vocab_size) // 128 * 128
         if n2 <= 0 or n2 >= n_full:
             self._pruned_head_cache = False
             return None

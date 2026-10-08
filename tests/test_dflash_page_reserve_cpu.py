@@ -20,13 +20,13 @@ class NativeBlockReservationTests(unittest.TestCase):
             if job.accept_one():
                 break
             self.assertLess(job.new_tokens, 20)
-        self.assertEqual(job.new_tokens, 10)
+        self.assertEqual(job.new_tokens, 17)
         self.assertEqual(job.max_rq_tokens, 16)
-        self.assertEqual(gen.draft_model.calls[-1]["end_exclusive"], 256)
+        self.assertEqual(gen.draft_model.calls[-1]["end_exclusive"], 263)
         requeued = job.prepare_for_requeue()
         self.assertIs(requeued, job)
         self.assertEqual(requeued.serial_number, 17)
-        self.assertEqual(requeued.last_init_kwargs["max_new_tokens"], 990)
+        self.assertEqual(requeued.last_init_kwargs["max_new_tokens"], 983)
         self.assertEqual(requeued.last_init_kwargs["max_rq_tokens"], 16)
         self.assertFalse(requeued.last_init_kwargs["token_healing"])
         allocate(gen, requeued)
@@ -113,7 +113,7 @@ class NativeBlockReservationTests(unittest.TestCase):
 
 
 class CompatibilityTests(unittest.TestCase):
-    """Behavioral controls must pass unchanged on BOTH pinned source and candidate."""
+    """Default response budgets remain stable; explicit requeue lands on a full page."""
 
 
 def compatibility_case(mode, ndt, prompt, max_new, max_rq):
@@ -132,8 +132,10 @@ def compatibility_case(mode, ndt, prompt, max_new, max_rq):
             (prompt-1+max_rq+255)//256*256-prompt)
         self.assertEqual(job.max_new_tokens, expected_new)
         self.assertEqual(job.max_rq_tokens, expected_budget)
-        self.assertEqual(len(job.sequences[0].allocated_pages), (prompt+expected_budget+255)//256)
-        job.new_tokens = expected_budget-expected_ndt-1
+        headroom = expected_ndt if max_rq is not None else 0
+        margin = 0 if max_rq is not None else expected_ndt
+        self.assertEqual(len(job.sequences[0].allocated_pages), (prompt+expected_budget+headroom+255)//256)
+        job.new_tokens = expected_budget-margin-1
         self.assertFalse(job.accept_one())
         self.assertTrue(job.accept_one())
     return test

@@ -25,18 +25,20 @@ def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
     input_ids = torch.tensor([[42]])
-    params = {}
     prepared = object()
 
-    # Same setup as the DFlash v1 drafter: bidirectional block (causal = False) through the
-    # standard attention input preparation, plus the anchor ids for the selector walk
-    with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
-        actual = DFlash2Model.prepare_inputs(model, input_ids, params)
-
-    assert actual is prepared
-    assert params["dflash2_anchor_ids"] is input_ids
-    assert params["causal"] is False
-    prepare.assert_called_once_with(input_ids, params)
+    # Same setup as the DFlash v1 drafter: the kernel-level causal flag follows the checkpoint's
+    # is_causal (windowed layers carry their own bounds), through the standard attention input
+    # preparation, plus the anchor ids for the selector walk
+    for is_causal, expected in ((None, False), (False, False), (True, True)):
+        model.config = SimpleNamespace(is_causal = is_causal)
+        params = {}
+        with patch.object(arch, "prepare_for_attn", return_value = prepared) as prepare:
+            actual = DFlash2Model.prepare_inputs(model, input_ids, params)
+        assert actual is prepared
+        assert params["dflash2_anchor_ids"] is input_ids
+        assert params["causal"] is expected
+        prepare.assert_called_once_with(input_ids, params)
 
 
 def test_input_embedding_scale_is_applied():
@@ -135,7 +137,7 @@ def test_grouped_dynamic_convolve_torch_matches_reference():
 
 
 def test_grouped_dynamic_convolve_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(1)
@@ -153,7 +155,7 @@ def test_grouped_dynamic_convolve_cuda_matches_torch():
 
 
 def test_grouped_dynamic_convolve_cuda_handles_odd_geometry():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(2)
@@ -169,7 +171,7 @@ def test_grouped_dynamic_convolve_cuda_handles_odd_geometry():
 
 
 def test_grouped_dynamic_convolve_cuda_preserves_fp32_finish():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     hidden = torch.full((1, 8, 96), 1.5e5, dtype = torch.float32, device = "cuda")
@@ -186,7 +188,7 @@ def test_grouped_dynamic_convolve_cuda_preserves_fp32_finish():
 
 
 def test_grouped_dynamic_convolve_cuda_fused_residual():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
 
     torch.manual_seed(3)
@@ -205,7 +207,7 @@ def test_grouped_dynamic_convolve_cuda_fused_residual():
 
 
 def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     import pytest
     hidden = torch.randn(1, 4, 96, dtype = torch.float16, device = "cuda")
@@ -221,7 +223,7 @@ def test_grouped_dynamic_convolve_cuda_rejects_bad_geometry():
 
 
 def test_selector_walk_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     from exllamav3.modules.arch_specific.dflash2 import DFlash2Selector
     torch.manual_seed(5)
@@ -255,7 +257,7 @@ def test_selector_walk_cuda_matches_torch():
 
 
 def test_topk_cuda_matches_torch():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
         return
     torch.manual_seed(6)
     for k in (8, 16, 32):
@@ -273,9 +275,12 @@ def test_topk_cuda_matches_torch():
             ref_v, ref_i = torch.topk(ref, k, dim = -1)
             for b in range(2):
                 for r in range(7):
-                    assert sorted(indices[b, r].tolist()) == sorted(ref_i[b, r].tolist()), (k, dtype, b, r)
-                    got = values[b, r][indices[b, r].argsort()]
-                    exp = ref_v[b, r][ref_i[b, r].argsort()]
+                    # Compared by value: fp16 inputs tie exactly at the k-th place often enough, and which
+                    # of the tied ids torch.topk keeps is unspecified. Every kept id must carry its value
+                    assert len(set(indices[b, r].tolist())) == k, (k, dtype, b, r)
+                    torch.testing.assert_close(values[b, r], ref[b, r][indices[b, r]], rtol = 1e-5, atol = 1e-5)
+                    got = values[b, r].sort(descending = True).values
+                    exp = ref_v[b, r].sort(descending = True).values
                     torch.testing.assert_close(got, exp, rtol = 1e-5, atol = 1e-5)
             # every kept id is inside the valid vocab
             assert int(indices.max()) < vocab
@@ -416,6 +421,39 @@ def test_sample_exports_selector_confidence_for_dynamic_drafting():
     assert params["draft_conf"].tolist() == [[0.0, 7.5, 4.25]]
 
 
+def test_walk_block_takes_the_generators_strided_state():
+    """Batched drafting hands walk_block state[:, 1:] and logits[:, 1:] of fp16 tensors: strided
+    views once there is more than one row"""
+    if not torch.cuda.is_available() or not ext.HAS_DFLASH2:
+        return
+    from exllamav3.modules.quant import LinearFP16
+    torch.manual_seed(7)
+    bsz, block, hidden_size, rank, vocab, k = 3, 8, 256, 128, 5000, 16
+    selector = DFlash2Selector(
+        SimpleNamespace(), "selector", vocab_size = vocab, hidden_size = hidden_size, rank = rank, top_k = k)
+    weight = (torch.randn(hidden_size, rank, device = "cuda") * 0.1).half()
+    selector.hidden_proj.inner = LinearFP16(hidden_size, rank, weight, None, hidden_size, rank, 0, 0)
+    selector.pred_codebook = (torch.randn(vocab, rank, device = "cuda") * 0.1).half()
+    selector.succ_codebook = (torch.randn(vocab, rank, device = "cuda") * 0.1).half()
+
+    state = torch.randn(bsz, block, hidden_size, device = "cuda").half()
+    logits = torch.randn(bsz, block, vocab, device = "cuda").half()
+    anchor = torch.randint(0, vocab, (bsz,), device = "cuda")
+    hidden = state[:, 1:]
+    assert not hidden.is_contiguous() and hidden.half() is hidden
+
+    out, conf = selector.walk_block(hidden, logits[:, 1:], anchor, return_confidence = True)
+    out_ref, conf_ref = selector.walk_block(
+        hidden.contiguous(), logits[:, 1:].contiguous(), anchor, return_confidence = True)
+    assert out.shape == (bsz, block)
+    assert out.tolist() == out_ref.tolist()
+    assert torch.equal(conf, conf_ref)
+    # Rows are independent: each matches its own single-row walk
+    for b in range(bsz):
+        out_b, _ = selector.walk_block(state[b : b + 1, 1:], logits[b : b + 1, 1:], anchor[b : b + 1])
+        assert out_b.tolist() == out[b : b + 1].tolist()
+
+
 class _Projection:
     def forward(self, hidden, params):
         return torch.ones((*hidden.shape[:-1], 1), device = hidden.device)
@@ -451,5 +489,6 @@ if __name__ == "__main__":
     test_dflash2_block_keeps_fp32_residual_and_fp16_branches()
     test_candidate_logit_scale_and_softcap_are_applied()
     test_sample_exports_selector_confidence_for_dynamic_drafting()
+    test_walk_block_takes_the_generators_strided_state()
     test_selector_chains_candidates_from_anchor_and_returns_scores()
     print("DFlash2 tests passed")

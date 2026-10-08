@@ -69,7 +69,10 @@ def isolated_attn():
     _module(PREFIX + ".util.tensor", g_tensor_cache=None,
             get_for_device=lambda params, key, device, default=None: params.get(key, default),
             to2=lambda x, *args: x)
-    _module(PREFIX + ".util", profile_opt=None)
+    sys.modules[PREFIX + ".util"].profile_opt = None
+    _module(PREFIX + ".util.backend", ROCM=False, ATTN_SPLIT_WARPS_STAGES=(4, 2),
+            attn_decode_config=lambda *args, **kwargs: None, QKV_SLICE=True)
+    _module(PREFIX + ".modules.attention_fn.smem", smem_limit=lambda *args: 98304)
     _module(PREFIX + ".constants", PAGE_SIZE=256)
     _module(PREFIX + ".modules.multilinear", MultiLinear=object, SlicedMultiLinear=object)
     ext = types.SimpleNamespace(

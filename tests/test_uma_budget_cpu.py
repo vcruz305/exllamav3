@@ -18,7 +18,7 @@ SOURCE = Path(os.environ.get("EXL3_TEST_MEMORY_SOURCE", HERE.parent / "exllamav3
 def load_budget_functions():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     names = {"touch_device", "set_memory_fraction_use", "set_memory_fraction_reserve",
-             "uma_memory_headroom", "unset_memory_fraction"}
+             "uma_memory_headroom", "unset_memory_fraction", "device_mem_info", "is_integrated_device"}
     nodes = [node for node in tree.body if
              isinstance(node, ast.FunctionDef) and (node.name in names or node.name.startswith("_uma_"))
              or isinstance(node, (ast.Import, ast.ImportFrom)) and
@@ -34,7 +34,7 @@ class BudgetTests(unittest.TestCase):
         self.ns = load_budget_functions()
         self.env = {"EXL3_UMA": "1"}
         self.props = SimpleNamespace(name="NVIDIA GB10", total_memory=128 * GIB,
-                                     major=12, minor=1, integrated=True)
+                                     major=12, minor=1, integrated=True, is_integrated=False)
         self.current = 0
         self.free = 20 * GIB
         self.device_count = 1
@@ -61,6 +61,7 @@ class BudgetTests(unittest.TestCase):
                 set_per_process_memory_fraction=lambda fraction, device: self.fractions.append((fraction, device)),
             )),
             touch_device=lambda device: self.touches.append(device),
+            host_memory_available=lambda: 118 * GIB,
             open=self.read,
         )
 

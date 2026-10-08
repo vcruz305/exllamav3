@@ -10,6 +10,10 @@ from ..modules import (
 )
 from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
+from .mimo_v2_mtp import MiMoV2MTPModel
+from .mimo_v2_vision import MiMoV2VisionModel, read_mimo_v2_vision_config
+from .qwen2_5_vl import read_qwen2_5_vl_pp_config
+import os, json
 
 # MiMo-V2's fused qkv_proj is stored as the concatenation of `ckpt_tp` tensor-parallel shards,
 # each laid out [q_shard; k_shard; v_shard], and its FP8 weight_scale_inv grid is computed per
@@ -84,12 +88,30 @@ class MiMoV2Config(Config):
     ):
         super().__init__(
             directory,
-            {"text": MiMoV2Model},
+            {"text": MiMoV2Model, "mtp": MiMoV2MTPModel, "vision": MiMoV2VisionModel},
             **kwargs
         )
 
         self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
+        # Next-token prediction heads (model.mtp.layers.*), loaded as the "mtp" component
+        self.mtp_num_layers = self.read_cfg(int, "num_nextn_predict_layers", 0)
+        if self.mtp_num_layers == 0:
+            self.model_classes.pop("mtp", None)
+
+        # Vision tower (visual.*), loaded as the "vision" component. The audio encoder and its
+        # speech embeddings are not supported
+        vision_config = self.read_cfg(dict, "vision_config", None)
+        prep_path = os.path.join(self.directory, "preprocessor_config.json")
+        if vision_config and os.path.exists(prep_path):
+            self.vision = read_mimo_v2_vision_config(vision_config)
+            with open(prep_path, encoding = "utf8") as f:
+                self.vision_pp = read_qwen2_5_vl_pp_config(json.load(f))
+            self.vision_start_token_id = self.read_cfg(int, ["vision_start_token_id", "processor_config->vision_start_token_id"], 151652)
+            self.vision_end_token_id = self.read_cfg(int, ["vision_end_token_id", "processor_config->vision_end_token_id"], 151653)
+        else:
+            self.vision = None
+            self.model_classes.pop("vision", None)
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # Attention geometry. Q/K run at head_dim (192) while V runs at v_head_dim (128) on every
@@ -170,9 +192,20 @@ class MiMoV2Config(Config):
             theta_key = ["swa_rope_theta", "rope_theta", "rope_parameters->rope_theta"],
         )
 
+        # Attn and MLP skips
+        self.skip_attention = set(self.read_cfg(list, "skip_attention", {}))
+        self.skip_mlp = set(self.read_cfg(list, "skip_mlp", {}))
+
 
     def qkv_dequant(self, layer_idx: int):
-        swa = self.hybrid_layer_pattern[layer_idx] == 1
+        return self._qkv_dequant(self.hybrid_layer_pattern[layer_idx] == 1)
+
+
+    def qkv_dequant_swa(self):
+        return self._qkv_dequant(True)
+
+
+    def _qkv_dequant(self, swa: bool):
         return _mimo_v2_qkv_dequant(
             self.qkv_ckpt_tp,
             self.swa_num_q_heads if swa else self.num_q_heads,
@@ -236,7 +269,9 @@ class MiMoV2Model(Model):
                 out_dtype = torch.float,
                 select_hq_bits = 2,
             )
-            if swa and not swa_full:
+            if idx in config.skip_attention:
+                attn = None
+            elif swa and not swa_full:
                 # 39 of 48 layers only ever look 128 tokens back. On the paged full cache they
                 # would still cost 8 * 192 * 2 halves per token each (~240 KB/token for the
                 # stack); the window ring makes them a fixed per-slot allocation instead.
@@ -249,16 +284,19 @@ class MiMoV2Model(Model):
                     sliding_window = config.sliding_window - 1 if swa else -1,
                     **attn_kwargs,
                 )
-            # The fused qkv tensor is TP-shard-interleaved and its FP8 scale grid is per shard;
-            # neither is expressible with the generic fused-tensor paths. One reader shared by
-            # the three Linears that slice out of it
-            qkv_reader = config.qkv_dequant(idx)
-            for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
-                proj.fdequant = qkv_reader
-            # attention_value_scale multiplies V before the cache write; fold it into o_proj
-            attn.o_proj.weight_scale = config.attention_value_scale
+            if attn:
+                # The fused qkv tensor is TP-shard-interleaved and its FP8 scale grid is per shard;
+                # neither is expressible with the generic fused-tensor paths. One reader shared by
+                # the three Linears that slice out of it
+                qkv_reader = config.qkv_dequant(idx)
+                for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
+                    proj.fdequant = qkv_reader
+                # attention_value_scale multiplies V before the cache write; fold it into o_proj
+                attn.o_proj.weight_scale = config.attention_value_scale
 
-            if config.moe_layer_freq[idx]:
+            if idx in config.skip_mlp:
+                mlp = None
+            elif config.moe_layer_freq[idx]:
                 mlp = BlockSparseMLP(
                     config = config,
                     key = f"{key_prefix}.layers.{idx}.mlp",
@@ -306,13 +344,13 @@ class MiMoV2Model(Model):
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.input_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if attn else None,
                     attn = attn,
                     mlp_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.post_attention_layernorm",
                         rms_norm_eps = config.rms_norm_eps,
-                    ),
+                    ) if mlp else None,
                     mlp = mlp,
                 )
             ]
@@ -347,9 +385,8 @@ class MiMoV2Model(Model):
         # Activate all experts during H capture pass in quantization
         self.calibration_all_experts = True
 
-        # TP would have to split the fused qkv reader and the V padding across ranks
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
         })
 
         # SWA layers keep their KV in a per-slot window ring rather than the paged cache
@@ -372,9 +409,10 @@ class MiMoV2Model(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        # MiMo's template joins turns without a newline after <|im_end|>
         p = ""
         if system_prompt:
-            p += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            p += f"<|im_start|>system\n{system_prompt}<|im_end|>"
+        p += f"<|im_start|>user\n{prompt}<|im_end|>"
         p += f"<|im_start|>assistant\n"
         return p
