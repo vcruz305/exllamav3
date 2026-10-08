@@ -859,6 +859,14 @@ class Generator:
             ddev = temp_hidden.device
             batch_ids = torch.cat(input_ids_list, dim = 0).to(ddev, non_blocking = True)
             dev_draft_ids = torch.empty((batch_size, mtp_window), dtype = torch.long, device = ddev)
+            # Each pinned source must remain unchanged until its asynchronous H2D read
+            # completes. Device-resident drafting has no per-step sync, so an in-place
+            # increment of one shared cache_seqlens buffer races with those reads.
+            # Build immutable per-step rows once; the final token readback fences reuse.
+            cache_seqlens_steps = self._staging("draft_chain_seqlens", mtp_window, batch_size)
+            cache_seqlens_steps.copy_(
+                cache_seqlens[None, :] + torch.arange(mtp_window, dtype = torch.int32)[:, None]
+            )
         else:
             batch_ids = self.draft_input_ids_pinned[:batch_size, :]
             batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
@@ -876,7 +884,7 @@ class Generator:
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
                 "cache": self.draft_cache,
-                "cache_seqlens": cache_seqlens,
+                "cache_seqlens": cache_seqlens_steps[idx] if dev_draft else cache_seqlens,
                 "draft_step": idx,   # heads specialized per depth pick their head from this
             }
             if cal is not None:
@@ -891,7 +899,8 @@ class Generator:
             else:
                 self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
                 batch_ids.copy_(new_ids)
-            cache_seqlens += 1
+            if not dev_draft:
+                cache_seqlens += 1
             temp_hidden = batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:

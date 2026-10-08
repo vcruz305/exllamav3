@@ -267,3 +267,43 @@ def test_skipped_round_handoff_does_not_resurrect_rewound_carry():
     assert probe.active_jobs[0].mtp_last_hidden is None
     assert probe.draft_model.written[probe.active_jobs[0].token] == set(range(4))
     assert probe.draft_model.written[probe.active_jobs[1].token] == set(range(5))
+
+
+class PretendCudaTensor(torch.Tensor):
+    """Route the actual loop through device drafting using CPU-only operations."""
+    @property
+    def is_cuda(self):
+        return True
+
+
+class DeferredPositionDraft:
+    """Record host sources as async DMA would, reading them after submission."""
+    def __init__(self):
+        self.sources = []
+        self.last_ids = None
+
+    def forward(self, ids, params):
+        self.sources.append(params["cache_seqlens"])
+        self.last_ids = ids
+        return params["target_hidden"] + 0.125
+
+    def sample_from_state(self, state, params):
+        return self.last_ids
+
+
+@pytest.mark.parametrize("batch,window", [(1, 5), (2, 3), (4, 1)])
+def test_device_draft_positions_remain_immutable_until_final_readback(batch, window):
+    probe = _probe(batch)
+    probe.iterate_draftmodel_mtp_gen.__func__.__globals__["_MTP_DEVICE_DRAFT"] = True
+    for job in probe.active_jobs:
+        job.mtp_last_hidden = job.mtp_last_hidden.as_subclass(PretendCudaTensor)
+    probe.draft_model = DeferredPositionDraft()
+    result = probe.iterate_draftmodel_mtp_gen([])
+    assert result.shape[-1] == window
+    assert len(probe.draft_model.sources) == window
+    # Read the original host sources only after the whole chain was submitted.
+    # A single in-place-incremented source would now contain the final position
+    # for every step, corrupting asynchronous H2D reads queued behind GPU work.
+    for step, source in enumerate(probe.draft_model.sources):
+        assert source.tolist() == [4 + step] * batch
+    assert len({s.data_ptr() for s in probe.draft_model.sources}) == window

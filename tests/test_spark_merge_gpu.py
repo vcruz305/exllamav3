@@ -212,3 +212,61 @@ def test_runtime_mixedk_coop_matches_dense_and_reuses_scratch(hidden, intermedia
             assert torch.equal(first, out[:rows]), ("nondeterministic", rows, plan)
             err = relative_error(first, ref)
             assert err < 3e-3, (hidden, intermediate, activation, rows, plan, err)
+
+
+def test_device_mtp_keeps_pinned_positions_stable_during_async_uploads():
+    """A queued GPU delay exposes host-side staging overwrites deterministically."""
+    import importlib.util
+    from pathlib import Path
+
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("This torch build has no CUDA delay primitive for the race test")
+    path = Path(__file__).with_name("test_mtp_row_budget_cpu.py")
+    spec = importlib.util.spec_from_file_location("mtp_source_probe", path)
+    harness = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(harness)
+    probe = harness._probe(2)
+    probe.iterate_draftmodel_mtp_gen.__func__.__globals__["_MTP_DEVICE_DRAFT"] = True
+    for job in probe.active_jobs:
+        job.mtp_last_hidden = job.mtp_last_hidden.to(DEVICE)
+    probe.draft_ids_pinned = torch.zeros((2, 5), dtype=torch.long, pin_memory=True)
+    staging = {}
+
+    def stage(name, *shape):
+        key = (name, shape)
+        if key not in staging:
+            staging[key] = torch.zeros(shape, dtype=torch.int32, pin_memory=True)
+        return staging[key]
+    probe._staging = stage
+
+    class AsyncDraft:
+        def __init__(self):
+            self.positions = []
+            self.last_ids = None
+            self.delay = False
+
+        def forward(self, ids, params):
+            # Queue delay after the initial pageable input-ID upload, which may
+            # synchronize host staging and otherwise accidentally hide the race.
+            if self.delay:
+                torch.cuda._sleep(10_000_000)
+            self.positions.append(params["cache_seqlens"].to(DEVICE, non_blocking=True))
+            self.last_ids = ids
+            return params["target_hidden"] + 0.125
+
+        def sample_from_state(self, state, params):
+            return self.last_ids
+
+    probe.draft_model = AsyncDraft()
+    # Warm allocations first: pinning memory for the first time can itself
+    # synchronize CUDA and hide the race this test is intended to expose.
+    probe.iterate_draftmodel_mtp_gen([])
+    torch.cuda.synchronize()
+    probe.draft_model.positions.clear()
+    probe.draft_model.delay = True
+    stream = torch.cuda.Stream(device=DEVICE)
+    with torch.cuda.stream(stream):
+        result = probe.iterate_draftmodel_mtp_gen([])
+    stream.synchronize()
+    assert result.shape[-1] == 3
+    assert [p.cpu().tolist() for p in probe.draft_model.positions] == [[4, 4], [5, 5], [6, 6]]
