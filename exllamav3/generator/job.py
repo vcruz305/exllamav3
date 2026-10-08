@@ -179,6 +179,7 @@ class Job:
         self.filters_suspended = rq_state.get("filters_suspended", False)
         self.token_budget = rq_state.get("token_budget")
         self.token_budget_error = None
+        self._token_budget_failed = False
 
         # Sampling state
         self.held_text = rq_state.get("held_text", "")
@@ -954,6 +955,7 @@ class Job:
         if self.token_budget_error is not None:
             error = self.token_budget_error
             self.token_budget_error = None
+            self._token_budget_failed = True
             self.is_finished = True
             result = {
                 "job": self, "stage": "error", "eos": True,
@@ -1131,6 +1133,7 @@ class Job:
                     # A failed phase transition must not sample with partially restored
                     # constraints or kill unrelated jobs in the same generator batch.
                     self.token_budget = None
+                    self._token_budget_failed = True
                     self.is_finished = True
                     requeue_now = False
                     emit_eos = True

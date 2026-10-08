@@ -1448,7 +1448,8 @@ class Generator:
                 conf = st["conf"][row]
                 ids_full = st["ids"][row]
                 row += 1
-                if id(job) in rewound_jobs:
+                # A pre-sample budget error has no target choice to train against.
+                if id(job) in rewound_jobs or getattr(job, "_token_budget_failed", False):
                     continue
                 a = accepted_length - 1
                 for i in range(a):
@@ -1484,10 +1485,10 @@ class Generator:
                 accepted_length = accepted_lengths[accepted_idx]
                 accepted_idx += 1
 
-                # A banned-string rewind invalidated this job's carry; leave it unset so drafting pauses until the
-                # next target forward provides a fresh one, and don't propagate hidden states from the abandoned
-                # window into the draft cache
-                if id(job) in rewound_jobs:
+                # A banned-string rewind invalidated this job's carry. A failed budget transition also ends
+                # the job without a usable continuation (possibly before any token was sampled).
+                # Do not propagate either abandoned window into the draft cache.
+                if id(job) in rewound_jobs or getattr(job, "_token_budget_failed", False):
                     continue
 
                 # A missing carry paused drafting for the whole batch. Position K

@@ -572,6 +572,52 @@ def test_guard_exception_is_contained_at_each_boundary(boundary):
         assert job.sampler.calls == [] and "token_ids" not in rows[-1]
 
 
+def test_failed_budget_job_does_not_train_calibration_or_publish_mtp_carry():
+    failed = make_job()
+
+    def guard(_):
+        raise RuntimeError("cannot decide phase boundary")
+
+    arm(failed, 0, guard=guard)
+    state = run_mtp(failed, [1, 1])
+    assert failed._token_budget_failed and failed.new_tokens == 0
+
+    peer = make_job()
+    peer_state = run_mtp(peer, [1, 1])
+    labels = []
+    cal = NS(add_label=lambda confidence, accepted: labels.append((confidence, accepted)),
+             decay_step=lambda: None)
+    state["self"].active_jobs = [failed, peer]
+    state["self"].draft_calibrator = cal
+    state["self"]._draft_conf_round = {
+        "conf": torch.tensor([[0.1, 0.2], [0.7, 0.8]]),
+        "ids": torch.ones((2, 2), dtype=torch.long),
+    }
+    state["accepted_lengths"] = [1, peer_state["accepted_lengths"][0]]
+    state["logit_mapping"] = [0, 1, 2]
+    calibrate = next(n for n in _generator_node("iterate_gen").body
+                     if isinstance(n, ast.If) and ast.unparse(n.test)
+                     == "self.draft_calibrator is not None and self._draft_conf_round is not None")
+    _compile([calibrate], GEN_PATH, state)
+    assert len(labels) == 2
+    assert [accepted for _, accepted in labels] == [True, True]
+    assert [confidence for confidence, _ in labels] == pytest.approx([0.7, 0.8])
+
+    handoff = next(n for n in _generator_node("iterate_gen").body
+                   if isinstance(n, ast.If) and ast.unparse(n.test) == "self.mtp_draft")
+    writes = []
+    state["self"].active_jobs = [failed]
+    state["self"].mtp_draft = True
+    state["self"]._mtp_skipped_round = False
+    state["self"].draft_model = NS(prefill=lambda *args: writes.append(args))
+    state["self"].draft_cache = object()
+    state.update(p_export_states=[torch.arange(6, dtype=torch.float).view(1, 3, 2)],
+                 accepted_lengths=[1], logit_mapping=[0, 1])
+    assert failed.mtp_last_hidden is None
+    _compile([handoff], GEN_PATH, state)
+    assert failed.mtp_last_hidden is None and writes == []
+
+
 @pytest.mark.parametrize("result", [None, 1, "yes", torch.tensor(True)])
 def test_non_bool_guard_return_fails_closed(result):
     job = make_job()
