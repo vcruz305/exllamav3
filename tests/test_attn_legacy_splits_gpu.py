@@ -29,7 +29,7 @@ GOLDEN_SHA256 = {
     "baseline": "0315b952b17d079fca1cdb481ee9ca814cf8707a895b6f75db3ac8518c870fd1",
 }
 NAMES = {
-    "_rot_h32", "_qc_plane_kt", "_qc_plane_v", "_qc_load_kt", "_qc_load_v",
+    "_get_h32", "_rot_h32", "_qc_plane_kt", "_qc_plane_v", "_qc_load_kt", "_qc_load_v",
     "_paged_attn_decode_split_kernel", "_paged_attn_decode_combine_kernel",
     "decode_row_layout", "decode_split_programs", "combine_subtiles",
 }
@@ -50,7 +50,7 @@ def load_source(path: Path, label: str):
     module.__file__ = str(path)
     import triton
     import triton.language as tl
-    module.__dict__.update(torch=torch, triton=triton, tl=tl, _decode_legacy_splits=False)
+    module.__dict__.update(torch=torch, triton=triton, tl=tl, _decode_legacy_splits=False, _h32_cache={})
     sys.modules[name] = module
     exec(compile(tree, str(path), "exec"), module.__dict__)
     return module
@@ -92,10 +92,11 @@ def aot_launch(fn, runtime, constants, signature, grid, warps, stages, aligned):
     compiled[grid](*[bound[name] for name in fn.arg_names])
 
 
-def run(module, label, enabled, q, kc, vc, block, seqlens):
+def run(module, label, enabled, q, kc, vc, block, seqlens, qc=None, kv_heads_override=None):
     import triton
     batch, q_len, q_heads, hd = q.shape
-    kv_heads = kc.shape[2]
+    kv_heads = kc.shape[2] if qc is None else kv_heads_override
+    assert kv_heads is not None
     group = q_heads // kv_heads
     hp = triton.next_power_of_2(hd)
     if label == "legacy":
@@ -118,8 +119,13 @@ def run(module, label, enabled, q, kc, vc, block, seqlens):
     out = torch.full_like(q, float("nan"))
     po = torch.empty(programs * cap * rows * hp, device=q.device, dtype=torch.float32)
     ml = torch.empty(programs * cap * rows * 2, device=q.device, dtype=torch.float32)
+    if qc is None:
+        sk, sv, qck, qcv, h32 = q, q, 0, 0, q
+    else:
+        sk, sv, qck, qcv = qc
+        h32 = module._get_h32(q.device)
     runtime = dict(q=q, k_cache=kc, v_cache=vc, block_table=block, cache_seqlens=seqlens,
-                   out=out, partial_o=po, partial_ml=ml, k_scales=q, v_scales=q, h32=q,
+                   out=out, partial_o=po, partial_ml=ml, k_scales=sk, v_scales=sv, h32=h32,
                    split_len=span, num_pages_per_seq=block.shape[1], num_splits=splits, sinks=q)
     signature = {
         "q": "*fp16", "k_cache": "*fp16", "v_cache": "*fp16",
@@ -128,8 +134,10 @@ def run(module, label, enabled, q, kc, vc, block, seqlens):
         "v_scales": "*fp16", "h32": "*fp16", "split_len": "i32",
         "num_pages_per_seq": "i32", "num_splits": "i32", "sinks": "*fp32",
     }
+    if qc is not None:
+        signature.update(k_cache="*i32", v_cache="*i32")
     constants = dict(
-        QCK=0, QCV=0, q_len=q_len, kv_append_len=q_len, n_q_heads=q_heads,
+        QCK=qck, QCV=qcv, q_len=q_len, kv_append_len=q_len, n_q_heads=q_heads,
         n_kv_heads=kv_heads, page_size=256, head_dim=hd, HD_PAD=hp,
         scale=hd ** -.5, CAUSAL=True, WINDOW_LEFT=-1, WINDOW_RIGHT=-1,
         SOFTCAP=0., FINAL=False, HAS_SINKS=False, BLOCK_ROWS=rows, BLOCK_N=bn,
@@ -141,7 +149,7 @@ def run(module, label, enabled, q, kc, vc, block, seqlens):
     rs, ds = module.combine_subtiles(rows, hp)
     c_runtime = {k: runtime[k] for k in ("partial_o", "partial_ml", "out", "h32", "num_splits", "sinks")}
     c_signature = {k: signature[k] for k in c_runtime}
-    c_constants = dict(QCV=0, HAS_SINKS=False, q_len=q_len, n_q_heads=q_heads,
+    c_constants = dict(QCV=qcv, HAS_SINKS=False, q_len=q_len, n_q_heads=q_heads,
                        n_kv_heads=kv_heads, head_dim=hd, HD_PAD=hp,
                        BLOCK_ROWS=rows, ROWS_SUB=rs, D_SUB=ds)
     if label == "legacy":
@@ -195,3 +203,43 @@ def test_actual_old_aot_numerics(sources, batch, q_len, prefix, group, hd):
         f"Historical split plan did not preserve original AOT output: {changed} changed, maxabs={max_abs}")
     if (batch, q_len, prefix, group, hd) == (1, 6, 1023, 12, 256) and old_plan["sms"] == 48:
         assert not torch.equal(old, baseline), "Fixture must expose the old/new partition-rounding difference"
+
+
+@pytest.mark.parametrize("batch,q_len,prefix", [
+    (1, 1, 1023), (1, 6, 255), (1, 6, 1023), (4, 6, 1023),
+], ids=["q8_q1", "q8_q6_page_boundary", "q8_q6", "q8_batch4_q6"])
+@torch.inference_mode()
+def test_actual_old_aot_q8_cache_numerics(sources, batch, q_len, prefix):
+    from exllamav3.ext import exllamav3_ext as ext
+    kv_heads, group, hd, bits = 2, 12, 256, 8
+    pages = (max(prefix + q_len, 1072) + 255) // 256
+    gen = torch.Generator().manual_seed(841603 + batch + q_len + prefix)
+    q = torch.randn(batch, q_len, kv_heads * group, hd, generator=gen).half().cuda()
+    kc = torch.randn(batch * pages, 256, kv_heads, hd, generator=gen).half().cuda()
+    vc = torch.randn(batch * pages, 256, kv_heads, hd, generator=gen).half().cuda()
+    block = torch.randperm(batch * pages, generator=gen).reshape(batch, pages).int().cuda()
+    seqlens = torch.full((batch,), prefix, dtype=torch.int32, device="cuda")
+    def quantize(cache):
+        rows = batch * pages * 256
+        packed = torch.empty(rows, kv_heads * hd // 32 * bits, dtype=torch.int32, device="cuda")
+        scales = torch.empty(rows, kv_heads * hd // 32, dtype=torch.float16, device="cuda")
+        # Same native quantizer/zero companding as CacheLayer_quant(K8,V8).
+        ext.quant_cache_cont(cache.view(rows, kv_heads * hd), packed, scales, 0.)
+        return packed.view(batch * pages, 256, -1), scales.view(batch * pages, 256, -1)
+    pk, sk = quantize(kc)
+    pv, sv = quantize(vc)
+    kw = {"qc": (sk, sv, bits, bits), "kv_heads_override": kv_heads}
+    old, old_plan = run(sources["legacy"], "legacy", False, q, pk, pv, block, seqlens, **kw)
+    baseline, baseline_plan = run(sources["baseline"], "baseline", False, q, pk, pv, block, seqlens, **kw)
+    off, off_plan = run(sources["candidate"], "candidate", False, q, pk, pv, block, seqlens, **kw)
+    compatible, compatible_plan = run(sources["candidate"], "candidate", True, q, pk, pv, block, seqlens, **kw)
+    assert off_plan == baseline_plan and torch.equal(off, baseline), "Disabled option changed frozen4b Q8"
+    assert compatible_plan["cap"] == old_plan["cap"]
+    assert compatible_plan["splits"] == old_plan["splits"]
+    assert compatible_plan["span"] == old_plan["span"]
+    assert compatible_plan["programs"] == baseline_plan["programs"]
+    changed = int((compatible != old).sum())
+    max_abs = float((compatible.float() - old.float()).abs().max())
+    print(f"K8/V8 b{batch} q{q_len} p{prefix}: compatible changed={changed}/{old.numel()}, "
+          f"maxabs={max_abs}, default changed={int((baseline != old).sum())}", flush=True)
+    assert torch.equal(compatible, old), f"Q8 original-output mismatch: {changed} changed, maxabs={max_abs}"
