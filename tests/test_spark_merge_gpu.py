@@ -76,7 +76,7 @@ def test_gr_int8_preserves_folded_tables_and_kernel_math(monkeypatch, combine):
 
     original_projection = torch.cat([down.half()] + ([] if inject is None else [inject.half()]))
     folded = (original_projection.float()
-              * (site.norm_w_raw.float() + 1)).half().float()
+              * site.w_h.float()).half().float()
     scale = folded.abs().amax(1).clamp_min(1e-8) / 127
     quant = (folded / scale[:, None]).round().clamp(-128, 127).to(torch.int8)
     assert torch.equal(site.fn_q, quant)

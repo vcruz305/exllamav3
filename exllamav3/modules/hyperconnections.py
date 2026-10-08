@@ -447,7 +447,10 @@ class GatedResidual(Module):
         from those on each call.
         """
         qmax = 127.0
-        f = (self.proj_h[:self.proj_m].float() * self.norm_w.flatten()).half().float()
+        # The old preparation folds w_h, whose norm coefficients were already
+        # rounded to fp16. Using norm_w (fp32) here changes the quantized bytes
+        # near rounding thresholds and can accumulate across the 97 GR sites.
+        f = (self.proj_h[:self.proj_m].float() * self.w_h.float()).half().float()
         fs = f.abs().amax(dim = 1).clamp_min(1e-8) / qmax
         self.fn_q = torch.round(f / fs[:, None]).clamp_(-128, 127).to(torch.int8).contiguous()
         self.fn_s = fs.contiguous()
