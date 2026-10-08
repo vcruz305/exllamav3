@@ -112,6 +112,21 @@ On ROCm both kernels run on RDNA's int8 WMMA instructions (`rocm/det_gemm_rocm.c
 per-chunk integer sums are exact and the fp32 combination keeps the same fixed order, so ranks
 agree across RDNA generations as well.
 
+### `EXL3_GR_INT8` (fork default: `1`)
+
+Use the fork's derived int8 gated-residual projection tables for decode-sized
+mixes (up to eight rows) on supported CUDA shapes. This preserves the established
+GB10 decode path. It quantizes the norm-folded projection and repacked up table;
+this is a numerical approximation, so compare model logits and task quality when
+changing it. Set to `0` to use upstream's fp16 decode representation.
+
+Both settings retain upstream's **unfolded fp16** tables for deterministic tiled
+prefill. The int8 decode copies are additional resident memory, and never replace
+or fold the tables used by prefill. The weighted-stream handoff between adjacent
+sites is used only when the receiving site takes the fp16 decode path. Targeted
+merge checks are in `tests/test_spark_merge_gpu.py`; run the upstream fp16 parity
+tests with `EXL3_GR_INT8=0`.
+
 ### `EXL3_BC_GDN` (default: `1`)
 
 Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL3_BC_ATTN`:

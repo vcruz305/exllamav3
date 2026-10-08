@@ -115,6 +115,8 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
+        self._gpu_mirror = None
+        self._gpu_mirror_dev = None
         stc = self.config.stc
         table = RowTable.find(stc, self.key, "trellis") if self.allow_table else None
         infer_params = getattr(self.config, "infer_params", None)
