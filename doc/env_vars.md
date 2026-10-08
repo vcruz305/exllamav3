@@ -312,6 +312,33 @@ same distribution. Stacks the collapse does not recognize fall back to the step-
 design. Set to `0` to disable collapsing entirely, e.g. for A/B validation against the
 reference implementation.
 
+## MTP drafting
+
+### `EXL3_DRAFT_ROW_BUDGET` (default: `0`, disabled)
+
+Experimental cap for multi-sequence MTP verification work. The generator limits the
+proposal window to `min(num_draft_tokens, max(0, budget // batch_size - 1))` when
+more than one sequence is decoding. Single-sequence drafting keeps its configured
+window; confidence-based early stopping can shorten either window further.
+A `Generator(draft_row_budget=...)` argument overrides the environment variable.
+Use a nonnegative integer; invalid values raise an error at generator creation.
+
+For a configured window of five, a budget of eight proposes five tokens at batch
+one, three at batch two, one at batch four, and zero at batch eight. The budget is
+a tuning target, not a limit on batch size: the target model must still verify
+one row per active sequence if the batch itself is wider than the budget.
+
+A zero-proposal round still writes the current MTP cache position with an
+unsampled prefill. This is necessary when a wide batch later shrinks and resumes
+drafting; skipping that write would leave holes in the draft cache. Draft-head
+evaluation and sampling are skipped for that round. Full native draft headroom
+remains reserved for page allocation, because batch size may change at any step.
+
+Adapted from the row-budget proposal in fork PR #18, with the cache-continuity
+fix tested in `tests/test_mtp_row_budget_cpu.py`. This switch stays off until an
+actual concurrent workload shows a throughput or latency improvement. Measure
+accepted tokens per target pass as well as total tokens per second.
+
 ## CPU MoE offload
 
 Experimental: `-mcl`/`--moe_cpu_offload` (main model) and `-dmcl`/`--draft_moe_cpu_layers`

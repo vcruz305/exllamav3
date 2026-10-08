@@ -51,6 +51,7 @@ class Generator:
         draft_confidence: float | None = None,
         record_draft_stats: bool = False,
         ngram_corpus: str | None = None,
+        draft_row_budget: int | None = None,
         **kwargs
     ):
         """
@@ -114,6 +115,12 @@ class Generator:
             target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
             n-gram drafting. None (default) reads EXL3_DRAFT_CONFIDENCE from the environment, else 0.4, so
             API servers that do not expose this knob (e.g. TabbyAPI) can still be tuned per deployment.
+
+        :param draft_row_budget:
+            Optional cap on batch_size * (draft_window + 1) for multi-sequence MTP verifies.
+            Single-stream drafting is unchanged. Zero disables the cap; None reads
+            EXL3_DRAFT_ROW_BUDGET (default 0). A zero-proposal round still prefills the
+            current MTP position so subsequent rounds never read unwritten draft cache.
 
         :param record_draft_stats:
             Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
@@ -194,6 +201,14 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
+        if draft_row_budget is None:
+            try:
+                draft_row_budget = int(_os.environ.get("EXL3_DRAFT_ROW_BUDGET", "0"))
+            except ValueError as e:
+                raise ValueError("EXL3_DRAFT_ROW_BUDGET must be a nonnegative integer") from e
+        if type(draft_row_budget) is not int or draft_row_budget < 0:
+            raise ValueError("draft_row_budget must be a nonnegative integer")
+        self.draft_row_budget = draft_row_budget
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
         # Chunking/partitioning
@@ -758,6 +773,14 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _mtp_window(self, batch_size: int) -> int:
+        """Bound MTP verify rows while preserving the single-stream draft length."""
+        full = self.num_draft_tokens
+        if batch_size <= 1 or full <= 0 or self.draft_row_budget == 0:
+            return full
+        return max(0, min(full, self.draft_row_budget // batch_size - 1))
+
+
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
@@ -771,6 +794,7 @@ class Generator:
             batch_size += 1
         if batch_size == 0:
             return None
+        mtp_window = self._mtp_window(batch_size)
 
         # Create block index table for batch. Keep draft staging separate from the target's
         # in-flight buffers; pageable uploads would block each draft step.
@@ -807,6 +831,22 @@ class Generator:
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+        if mtp_window == 0:
+            # iterate_gen assumes position K has been written by the MTP pass. A wide
+            # batch may propose no tokens, but it must still commit that position before
+            # the target advances: otherwise a later smaller batch resumes with holes in
+            # the draft KV cache. No draft head or draft sampling runs on this path.
+            self.draft_model.prefill(
+                torch.cat(input_ids_list, dim = 0),
+                {
+                    "target_hidden": temp_hidden,
+                    "attn_mode": "flash_attn",
+                    "block_table": block_index,
+                    "cache": self.draft_cache,
+                    "cache_seqlens": cache_seqlens,
+                },
+            )
+            return None
         # Device-resident draft chain (EXL3_MTP_DEVICE_DRAFT): ids stay on the draft device
         # between steps (the Embedding mirrors its table there), so the window costs one
         # readback instead of one per drafted token
@@ -814,7 +854,7 @@ class Generator:
         if dev_draft:
             ddev = temp_hidden.device
             batch_ids = torch.cat(input_ids_list, dim = 0).to(ddev, non_blocking = True)
-            dev_draft_ids = torch.empty((batch_size, self.num_draft_tokens), dtype = torch.long, device = ddev)
+            dev_draft_ids = torch.empty((batch_size, mtp_window), dtype = torch.long, device = ddev)
         else:
             batch_ids = self.draft_input_ids_pinned[:batch_size, :]
             batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
@@ -822,7 +862,7 @@ class Generator:
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
-        window = self.num_draft_tokens
+        window = mtp_window
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
