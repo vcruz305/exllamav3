@@ -539,23 +539,25 @@ class Job:
 
     def set_token_budget(
         self,
-        max_tokens: int,
-        output: str | torch.Tensor,
+        max_tokens: int | None,
+        output: str | torch.Tensor | None = None,
         *,
         end_token_id: int,
         on_end = None,
         can_end = None,
     ):
         """
-        Bound one already-active output phase at the producer's accepted-token boundary.
+        Bound or observe one already-active phase at the producer's accepted-token boundary.
 
         Starting at the current accepted position, allow max_tokens more tokens, then inject
         output before sampling the next token. Prompt tokens and token healing do not count.
+        With max_tokens=None, observe natural closure only: output may be None and no
+        deadline or forced output is created. This does not change max_new_tokens or stops.
         A naturally accepted end_token_id disarms the budget early. This API deliberately
         accepts one native end token, not a text/partial-marker parser; callers must only arm
         a phase whose start is already known and whose closing marker is that token.
 
-        output follows constrain_output_now semantics and must contain end_token_id. The
+        When provided, output follows constrain_output_now and must contain end_token_id. The
         complete forced tail drains before on_end(self) runs, even if the end token occurs
         earlier in that tail. The callback is synchronous and runs after stop/rewind handling,
         before any following token is sampled; it can install the next phase's filters,
@@ -580,8 +582,8 @@ class Job:
         before the job's first iteration, for a boundary independent of consumer backpressure.
         """
         import inspect
-        if type(max_tokens) is not int or max_tokens < 0:
-            raise ValueError("max_tokens must be a nonnegative integer")
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 0):
+            raise ValueError("max_tokens must be a nonnegative integer or None")
         if type(end_token_id) is not int or end_token_id < 0:
             raise ValueError("end_token_id must be a nonnegative integer")
         for name, callback in (("on_end", on_end), ("can_end", can_end)):
@@ -589,20 +591,23 @@ class Job:
                 raise ValueError(f"{name} must be a synchronous callable")
         if self.generator is None or self.is_finished:
             raise ValueError("Token budgets require an enqueued, unfinished job")
-        if isinstance(output, torch.Tensor):
-            if output.dim() != 2 or output.shape[0] != 1 or output.numel() == 0:
-                raise ValueError("Budget output must have shape (1, S), S > 0")
-            ids = output.to("cpu", torch.long).contiguous().clone()
-        elif isinstance(output, str):
-            ids = self.generator.tokenizer.encode(
-                output, encode_special_tokens = True, add_bos = False,
-            ).to("cpu", torch.long).contiguous().clone()
-        else:
-            raise TypeError("Budget output must be text or token IDs")
-        if ids.numel() == 0 or end_token_id not in ids.view(-1).tolist():
-            raise ValueError("Budget output must contain its native end token")
+        ids = None
+        if max_tokens is not None or output is not None:
+            if isinstance(output, torch.Tensor):
+                if output.dim() != 2 or output.shape[0] != 1 or output.numel() == 0:
+                    raise ValueError("Budget output must have shape (1, S), S > 0")
+                ids = output.to("cpu", torch.long).contiguous().clone()
+            elif isinstance(output, str):
+                ids = self.generator.tokenizer.encode(
+                    output, encode_special_tokens = True, add_bos = False,
+                ).to("cpu", torch.long).contiguous().clone()
+            else:
+                raise TypeError("Budget output must be text or token IDs")
+            if ids.numel() == 0 or end_token_id not in ids.view(-1).tolist():
+                raise ValueError("Budget output must contain its native end token")
         self.token_budget = {
-            "deadline": self.rq_new_tokens + max(self.new_tokens, 0) + max_tokens,
+            "deadline": (self.rq_new_tokens + max(self.new_tokens, 0) + max_tokens
+                         if max_tokens is not None else None),
             "output": ids,
             "end_token_id": end_token_id,
             "on_end": on_end,
@@ -639,7 +644,8 @@ class Job:
     def _maybe_force_token_budget(self):
         budget = self.token_budget
         if (
-            budget is not None and not budget["injecting"] and not budget["end_seen"]
+            budget is not None and budget["deadline"] is not None
+            and not budget["injecting"] and not budget["end_seen"]
             and self.new_tokens >= 0 and self.forced_ids is None
             and self.rq_new_tokens + self.new_tokens >= budget["deadline"]
             and self._token_budget_can_end(budget)

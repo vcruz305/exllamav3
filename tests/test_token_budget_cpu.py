@@ -674,7 +674,7 @@ def test_requeue_during_forced_tail_retains_end_seen_and_remaining_ids():
     ("max_tokens", -1), ("max_tokens", True), ("max_tokens", 1.5),
     ("end_token_id", -1), ("end_token_id", True),
     ("output", torch.tensor([END])), ("output", torch.empty((1, 0), dtype=torch.long)),
-    ("output", torch.tensor([[1]])), ("output", 7), ("on_end", 7),
+    ("output", torch.tensor([[1]])), ("output", 7), ("output", None), ("on_end", 7),
 ])
 def test_invalid_api_values_fail_before_generation(field, value):
     job = make_job()
@@ -767,14 +767,15 @@ def test_mtp_budget_forcing_rejects_remaining_draft_and_keeps_accepted_carry():
     assert len(written) == 1 and written[0][0].tolist() == [[1, 1]]
 
 
-@pytest.mark.parametrize("natural", [False, True])
+@pytest.mark.parametrize("natural", [False, True, None])
 @pytest.mark.parametrize("packed", [False, True])
 def test_mtp_matched_closure_installs_grammar_before_next_same_window_sample(natural, packed):
     job = make_job()
     new = Filter(allowed=3, packed=packed)
-    arm(job, 10 if natural else 1, callback=lambda j: j.set_filters([new]))
+    arm(job, None if natural is None else (10 if natural else 1),
+        callback=lambda j: j.set_filters([new]))
     scores = logits_for(width=4)
-    if natural:
+    if natural is not False:
         scores[:, 1, :] = 0
         scores[:, 1, END] = 5
     state = run_mtp(job, [1, END, 3], scores=scores)
@@ -913,13 +914,13 @@ def test_async_pre_sample_guard_error_preserves_peer_and_accepts_no_token():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("when", ["pending", "forced_tail"])
+@pytest.mark.parametrize("when", ["pending", "forced_tail", "natural"])
 def test_real_async_cancel_disarms_budget_and_wakes_waiting_consumer(when):
     async def scenario():
         generator = AsyncGenerator(width=0 if when == "forced_tail" else 5)
         job = AsyncJob(generator, input_ids=torch.tensor([[7, 1]]), max_new_tokens=100)
         calls = []
-        job.set_token_budget(0 if when == "forced_tail" else 24,
+        job.set_token_budget(None if when == "natural" else (0 if when == "forced_tail" else 24),
                              torch.tensor([[END, 10, 11]]), end_token_id=END,
                              on_end=lambda _: calls.append(True))
         if when == "forced_tail":
@@ -932,5 +933,137 @@ def test_real_async_cancel_disarms_budget_and_wakes_waiting_consumer(when):
         assert [r async for r in job] == []
         assert generator.generator.drained == 1
         await generator.close()
+
+    asyncio.run(scenario())
+
+
+
+def test_natural_only_observation_never_encodes_forces_or_changes_limits():
+    job = make_job(max_new_tokens=100)
+    limits = (job.min_new_tokens, job.max_new_tokens, set(job.stop_tokens))
+    observed = []
+    ended = []
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Natural-only observation must not encode or force output")
+
+    job.generator.tokenizer.encode = forbidden
+    job.constrain_output_now = forbidden
+    job.set_token_budget(None, end_token_id=END,
+                         can_end=lambda j: (observed.append(j.new_tokens), True)[1],
+                         on_end=lambda j: ended.append(j.new_tokens))
+    assert job.token_budget["deadline"] is None and job.token_budget["output"] is None
+    rows = []
+    for _ in range(64):
+        sample(job, 1, rows)
+    assert emitted_ids(rows) == [1] * 64
+    assert observed == [] and ended == [] and job.forced_ids is None
+    sample(job, END, rows)
+    assert observed == [65] and ended == [65] and job.token_budget is None
+    assert limits == (job.min_new_tokens, job.max_new_tokens, set(job.stop_tokens))
+
+
+def test_natural_only_guard_keeps_literal_end_and_does_not_force_later():
+    job = make_job()
+    allowed = [False]
+    ended = []
+    job.set_token_budget(None, can_end=lambda _: allowed[0], end_token_id=END,
+                         on_end=lambda j: ended.append(j.new_tokens))
+    sample(job, END)
+    assert not job.token_budget["end_seen"] and ended == []
+    allowed[0] = True
+    assert [sample(job)[0][1].item() for _ in range(4)] == [1] * 4
+    assert ended == [] and job.forced_ids is None
+    sample(job, END)
+    assert ended == [6] and job.token_budget is None
+
+
+def test_natural_only_requeue_retains_observer_without_creating_deadline():
+    job = make_job()
+    ended = []
+    job.set_token_budget(None, end_token_id=END,
+                         on_end=lambda j: ended.append(j.rq_new_tokens + j.new_tokens))
+    for _ in range(5):
+        sample(job)
+    observer = job.token_budget
+    job.prepare_for_requeue()
+    assert job.token_budget is observer and observer["deadline"] is None
+    assert job.rq_new_tokens == 5 and job.new_tokens == 0
+    sample(job, END)
+    assert ended == [6] and job.token_budget is None
+
+
+def test_natural_only_banned_end_rewind_preserves_observation_without_forcing():
+    job = make_job(banned_strings=["</phase>x"])
+    ended = []
+    observed = []
+    job.set_token_budget(None, end_token_id=END,
+                         can_end=lambda j: (observed.append(j.new_tokens), True)[1],
+                         on_end=lambda j: ended.append(j.new_tokens))
+    sample(job, END)
+    assert job.token_budget["end_seen"] and ended == []
+    sample(job, 6)
+    assert job.checkpoint_rewound and job.new_tokens == 0
+    assert observed == [1, 0] and not job.token_budget["end_seen"]
+    job.checkpoint_rewound = False
+    assert [sample(job)[0][1].item() for _ in range(4)] == [1] * 4
+    assert job.token_budget["deadline"] is None and ended == []
+    sample(job, END)
+    assert ended == []
+    sample(job, 2)
+    assert ended == [6] and job.token_budget is None
+
+
+@pytest.mark.parametrize("termination", ["length", "native_stop"])
+def test_natural_only_respects_existing_termination_without_callback(termination):
+    job = make_job(max_new_tokens=2, stop_conditions=[END] if termination == "native_stop" else None)
+    ended = []
+    job.set_token_budget(None, end_token_id=END, on_end=lambda _: ended.append(True))
+    if termination == "native_stop":
+        result, rows = sample(job, END)
+    else:
+        sample(job)
+        result, rows = sample(job)
+    assert result[0] and rows[-1]["eos"] and ended == []
+    assert job.token_budget is None and job.forced_ids is None
+
+
+@pytest.mark.parametrize("failure", ["guard", "callback"])
+def test_natural_only_boundary_errors_are_contained(failure):
+    job = make_job()
+    peer = make_job()
+
+    def fail(_):
+        raise RuntimeError("natural handoff failed")
+
+    job.set_token_budget(None, end_token_id=END,
+                         can_end=fail if failure == "guard" else None,
+                         on_end=fail if failure == "callback" else None)
+    result, rows = sample(job, END)
+    assert result[0] and rows[-1]["stage"] == "error"
+    assert isinstance(rows[-1]["error"], RuntimeError)
+    assert job._token_budget_failed and job.new_tokens == 1
+    assert job.token_budget is None and sample(peer)[0][1].item() == 1
+
+
+def test_natural_only_async_capability_and_no_deadline_under_backpressure():
+    assert AsyncJob.supports_natural_token_budget is True
+
+    async def scenario():
+        generator = AsyncGenerator()
+        try:
+            job = AsyncJob(generator, input_ids=torch.tensor([[7, 1]]), max_new_tokens=35)
+            callbacks = []
+            job.set_token_budget(None, end_token_id=END,
+                                 on_end=lambda _: callbacks.append(True))
+            assert job.job.token_budget["deadline"] is None
+            for _ in range(12):
+                await asyncio.sleep(0)
+            queued = job.queue.qsize()
+            rows = [row async for row in job]
+            assert emitted_ids(rows) == [1] * 35 and rows[-1]["eos"]
+            assert queued > 24 and callbacks == [] and job.job.token_budget is None
+        finally:
+            await generator.close()
 
     asyncio.run(scenario())
