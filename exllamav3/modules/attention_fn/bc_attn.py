@@ -300,6 +300,7 @@ class BCAttn:
         from .triton_paged import (
             combine_subtiles,
             decode_row_layout,
+            decode_split_programs,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -315,11 +316,12 @@ class BCAttn:
         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
         block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
         programs = bsz * kvh * h_blocks
+        split_programs = decode_split_programs(bsz, q_len, kvh, group_size, h_blocks)
 
         # The live split count and split length are runtime kernel arguments derived from the
         # block-table bound per call (patched into the graph); the grid is sized to the cap
         target = 2 * _get_sm_count(dev)
-        splits_cap = max(1, min(target // programs, 128))
+        splits_cap = max(1, min(target // split_programs, 128))
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
