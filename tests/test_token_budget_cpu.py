@@ -90,7 +90,12 @@ class Sampler:
         self.calls.append((logits.shape[0], logit_mask is not None))
         scores = logits.float()
         if logit_mask is not None:
-            scores = scores + logit_mask
+            if logit_mask.dtype == torch.int32:
+                positions = torch.arange(VOCAB)
+                allowed = ((logit_mask[:, positions // 32].long() >> (positions % 32)) & 1).bool()
+                scores = scores.masked_fill(~allowed, -torch.inf)
+            else:
+                scores = scores + logit_mask
         return scores.argmax(-1).view(logits.shape[0], 1)
 
 
@@ -98,8 +103,9 @@ class Filter:
     trigger_token = None
     is_active = True
 
-    def __init__(self, allowed=3, stop=None):
+    def __init__(self, allowed=3, stop=None, packed=False):
         self.allowed = allowed
+        self.packed = packed
         self.stop = stop
         self.fed = []
         self.attached = None
@@ -123,7 +129,9 @@ class Filter:
         return False
 
     def get_next_logit_mask(self):
-        mask = torch.full((1, 1, VOCAB), -torch.inf)
+        if self.packed:
+            return torch.tensor([[1 << self.allowed]], dtype=torch.int32)
+        mask = torch.full((1, VOCAB), -torch.inf, dtype=torch.half)
         mask[..., self.allowed] = 0
         return mask
 
@@ -159,16 +167,21 @@ JOB_METHODS = {
     "_maybe_force_token_budget", "_advance_token_budget", "_pop_forced_token",
     "receive_logits", "receive_sample", "set_sampler", "set_filters", "set_banned_strings",
     "_init_banned_strings", "_check_banned_strings", "_release_banned_hold",
-    "hash_deferred_pages", "prepare_for_requeue",
+    "hash_deferred_pages", "prepare_for_requeue", "prepare_logit_mask",
 }
 Job = _load_class(JOB_PATH, "Job", NAMESPACE, JOB_METHODS)
 
 
 def _prepare_masks(job):
-    active = [f.get_next_logit_mask() for f in job.filters if f.is_active]
-    job.device_logit_mask = sum(active) if active else None
-    job.filter_futures.clear()
-    job.logit_masks.clear()
+    # Match the Generator's initial per-step mask queue. Between accepted MTP
+    # positions the production loop below queues these entries itself.
+    assert job.filter_futures == [] and job.logit_masks == []
+    for f in job.filters:
+        if not f.is_active:
+            continue
+        job.filter_futures.append(None)
+        job.logit_masks.append(f.get_next_logit_mask())
+    job.prepare_logit_mask()
 
 
 def _attach(job, generator, serial_number=0, rq=False):
@@ -188,7 +201,9 @@ def _attach(job, generator, serial_number=0, rq=False):
     seq = job.sequences[0]
     seq.kv_position = len(seq.sequence_ids) - 1
     seq.allocated_pages = [NS(kv_position=seq.kv_position, can_revert=False)]
-    job.prepare_logit_mask = lambda: _prepare_masks(job)
+    job.logits_device = "cpu"
+    job.get_pinned_logit_mask = lambda: torch.empty((1, VOCAB), dtype=torch.half)
+    job.get_pinned_logit_bitmask = lambda: torch.empty((1, VOCAB // 32), dtype=torch.int32)
     job.prepare_sampling_past_ids = lambda: None
     job.is_checkpoint_boundary = lambda: False
     job.deallocate_pages = lambda: setattr(job, "deallocated", True)
@@ -312,7 +327,7 @@ def test_natural_end_feeds_old_filter_then_restores_next_phase():
     sample(job, END)
     assert order == [(1, [END], None)]
     assert new_filter.attached is job and new_filter.resets == 1
-    job.prepare_logit_mask()
+    _prepare_masks(job)
     result, _ = sample(job)
     assert result[1].item() == 3 and new_filter.fed == [3]
 
@@ -328,7 +343,7 @@ def test_forced_tail_drains_before_callback_and_filters():
     assert first[1].item() == END and calls == [] and not old.is_active
     second, _ = sample(job)
     assert second[1].item() == 10 and calls == [(2, None)]
-    job.prepare_logit_mask()
+    _prepare_masks(job)
     assert sample(job)[0][1].item() == 3
     assert old.fed == [] and new.fed == [3]
 
@@ -566,9 +581,10 @@ def test_mtp_budget_forcing_rejects_remaining_draft_and_keeps_accepted_carry():
 
 
 @pytest.mark.parametrize("natural", [False, True])
-def test_mtp_matched_closure_installs_grammar_before_next_same_window_sample(natural):
+@pytest.mark.parametrize("packed", [False, True])
+def test_mtp_matched_closure_installs_grammar_before_next_same_window_sample(natural, packed):
     job = make_job()
-    new = Filter(allowed=3)
+    new = Filter(allowed=3, packed=packed)
     arm(job, 10 if natural else 1, callback=lambda j: j.set_filters([new]))
     scores = logits_for(width=4)
     if natural:
@@ -580,6 +596,8 @@ def test_mtp_matched_closure_installs_grammar_before_next_same_window_sample(nat
     assert state["accepted_lengths"] == [4]
     assert state["state"].rewinds == [0]
     assert job.sampler.calls[-1][1], "Content sample must use the newly installed mask"
+    assert job.device_logit_mask.dtype == (torch.int32 if packed else torch.half)
+    assert job.filter_futures == [] and job.logit_masks == []
 
 
 def test_no_budget_keeps_original_batch_verify_fast_path():
