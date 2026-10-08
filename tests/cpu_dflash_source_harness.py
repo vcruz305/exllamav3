@@ -206,6 +206,11 @@ class CPUJob(JobMethods):
         self.return_top_tokens = 0
         self.new_tokens = 0
         self.forced_sample = False
+        # Job.__init__ is stubbed here; keep its optional phase state disabled.
+        # The dedicated token-budget harness exercises guarded phase transitions.
+        self.token_budget = kwargs.get("rq_state", {}).get("token_budget")
+        self.token_budget_error = None
+        self._token_budget_failed = False
         self.filters_suspended = False
         self.filters = []
         self.time_first_token = 1

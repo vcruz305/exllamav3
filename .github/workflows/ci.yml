@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - 'exllamav3/**'
+      - 'tests/**'
       - 'setup.py'
       - 'pyproject.toml'
       - 'requirements.txt'
@@ -17,6 +18,7 @@ on:
       - master
     paths:
       - 'exllamav3/**'
+      - 'tests/**'
       - 'setup.py'
       - 'pyproject.toml'
       - 'requirements.txt'
