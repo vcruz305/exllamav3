@@ -182,6 +182,26 @@ class AsyncJob:
         """
         self.job.constrain_output_now(output)
 
+    def set_token_budget(
+        self, max_tokens: int, output: str | torch.Tensor, *, end_token_id: int, on_end = None,
+    ):
+        """
+        Bound an already-active phase at an accepted-token boundary; see Job.set_token_budget.
+
+        Configure synchronously after AsyncJob construction and before the first await to count
+        from the first generated token. The optional synchronous on_end receives the underlying
+        Job and runs on the producer before another sample, independent of consumer backpressure.
+        """
+        self.job.set_token_budget(
+            max_tokens, output, end_token_id = end_token_id, on_end = on_end,
+        )
+
+    def clear_token_budget(self):
+        """
+        Disarm the phase budget without changing an already scheduled forced tail.
+        """
+        self.job.clear_token_budget()
+
     def set_sampler(self, sampler):
         """
         Replace the sampler mid-generation; see Job.set_sampler. Safe to call from any coroutine on the

@@ -177,6 +177,7 @@ class Job:
         self.forced_ids_device = None
         self.forced_sample = False
         self.filters_suspended = rq_state.get("filters_suspended", False)
+        self.token_budget = rq_state.get("token_budget")
 
         # Sampling state
         self.held_text = rq_state.get("held_text", "")
@@ -534,6 +535,114 @@ class Job:
         self.forced_ids_device = None
 
 
+    def set_token_budget(
+        self,
+        max_tokens: int,
+        output: str | torch.Tensor,
+        *,
+        end_token_id: int,
+        on_end = None,
+    ):
+        """
+        Bound one already-active output phase at the producer's accepted-token boundary.
+
+        Starting at the current accepted position, allow max_tokens more tokens, then inject
+        output before sampling the next token. Prompt tokens and token healing do not count.
+        A naturally accepted end_token_id disarms the budget early. This API deliberately
+        accepts one native end token, not a text/partial-marker parser; callers must only arm
+        a phase whose start is already known and whose closing marker is that token.
+
+        output follows constrain_output_now semantics and must contain end_token_id. The
+        complete forced tail drains before on_end(self) runs, even if the end token occurs
+        earlier in that tail. The callback is synchronous and runs after stop/rewind handling,
+        before any following token is sampled; it can install the next phase's filters,
+        sampler and banned strings. EOS wins and does not call on_end. Callback exceptions
+        fail only this job. With no callback, injected output leaves filters suspended as usual.
+
+        Stops, max_new_tokens and explicit forced output retain priority. Already pending
+        forced tokens are never discarded. The deadline follows accepted positions through
+        banned-string rewinds and requeues. Call on the generator thread/event loop, preferably
+        before the job's first iteration, for a boundary independent of consumer backpressure.
+        """
+        import inspect
+        if type(max_tokens) is not int or max_tokens < 0:
+            raise ValueError("max_tokens must be a nonnegative integer")
+        if type(end_token_id) is not int or end_token_id < 0:
+            raise ValueError("end_token_id must be a nonnegative integer")
+        if on_end is not None and (not callable(on_end) or inspect.iscoroutinefunction(on_end)):
+            raise ValueError("on_end must be a synchronous callable")
+        if self.generator is None or self.is_finished:
+            raise ValueError("Token budgets require an enqueued, unfinished job")
+        if isinstance(output, torch.Tensor):
+            if output.dim() != 2 or output.shape[0] != 1 or output.numel() == 0:
+                raise ValueError("Budget output must have shape (1, S), S > 0")
+            ids = output.to("cpu", torch.long).contiguous().clone()
+        elif isinstance(output, str):
+            ids = self.generator.tokenizer.encode(
+                output, encode_special_tokens = True, add_bos = False,
+            ).to("cpu", torch.long).contiguous().clone()
+        else:
+            raise TypeError("Budget output must be text or token IDs")
+        if ids.numel() == 0 or end_token_id not in ids.view(-1).tolist():
+            raise ValueError("Budget output must contain its native end token")
+        self.token_budget = {
+            "deadline": self.rq_new_tokens + max(self.new_tokens, 0) + max_tokens,
+            "output": ids,
+            "end_token_id": end_token_id,
+            "on_end": on_end,
+            "injecting": False,
+            "end_seen": False,
+        }
+
+
+    def clear_token_budget(self):
+        """
+        Disarm a pending phase budget without changing already accepted or forced output.
+
+        A forced tail already scheduled by the budget still drains according to
+        constrain_output_now semantics; clearing does not resume filters or call on_end.
+        """
+        self.token_budget = None
+
+
+    def _maybe_force_token_budget(self):
+        budget = self.token_budget
+        if (
+            budget is not None and not budget["injecting"] and not budget["end_seen"]
+            and self.new_tokens >= 0 and self.forced_ids is None
+            and self.rq_new_tokens + self.new_tokens >= budget["deadline"]
+        ):
+            # The ordinary forced-token path handles MTP rejection/rewind and streaming.
+            # Mark first so a multi-token injection is issued exactly once.
+            budget["injecting"] = True
+            self.constrain_output_now(budget["output"])
+
+
+    def _advance_token_budget(self, token: int, eos: bool):
+        budget = self.token_budget
+        if budget is None:
+            return
+        if eos:
+            self.token_budget = None
+            return
+        # A banned-string rollback abandons this sample; the accepted-position deadline
+        # already follows the rolled-back new_tokens value. Healing is not a new token.
+        if self.checkpoint_rewound or self.new_tokens <= 0:
+            return
+        if token == budget["end_token_id"]:
+            budget["end_seen"] = True
+        if budget["end_seen"] and self.forced_ids is None:
+            self.token_budget = None
+            callback = budget["on_end"]
+            if callback is not None:
+                import inspect
+                result = callback(self)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError("Token-budget on_end must not return an awaitable")
+
+
     def set_sampler(self, sampler: Sampler | None):
         """
         Replace the job's sampler mid-generation, e.g. to sample a response block differently from the
@@ -726,6 +835,10 @@ class Job:
         # assert logits.shape[0] == len(self.sequences)
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
+
+        # Phase budgets belong to accepted producer positions, not result-consumer timing.
+        if self.token_budget is not None:
+            self._maybe_force_token_budget()
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
@@ -935,6 +1048,18 @@ class Job:
                 r.update({ "identifier": self.identifier })
 
             results_.append(r)
+            if self.token_budget is not None:
+                try:
+                    self._advance_token_budget(next_token_i, emit_eos)
+                except Exception as exc:
+                    # A failed phase transition must not sample with partially restored
+                    # constraints or kill unrelated jobs in the same generator batch.
+                    self.token_budget = None
+                    self.is_finished = True
+                    requeue_now = False
+                    emit_eos = True
+                    r.pop("requeue", None)
+                    r.update({ "stage": "error", "eos": True, "error": exc })
             return emit_eos, next_token, requeue_now
 
         # Decode and buffer output
@@ -1200,6 +1325,7 @@ class Job:
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
+            "token_budget": self.token_budget,
         }
 
         serial_number = self.serial_number
