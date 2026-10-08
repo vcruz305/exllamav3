@@ -143,7 +143,13 @@ def test_actual_frozen_configurations(sources, bsz, q_len, group, hd):
     assert on[13:15] == old[13:15], "Enabled option failed to preserve actual old block/cap"
     assert on[15] == off[15], "Enabled option changed the packed launch grid"
     for a, b in zip(on_compiled, off_compiled):
-        assert a[:6] == b[:6] and a[6].grid_y == b[6].grid_y
+        assert a[0] == b[0] and a[2:6] == b[2:6] and a[6].grid_y == b[6].grid_y
+        if a[0] == "combine":
+            assert a[1] == {n: t.removesuffix(":16") for n, t in b[1].items()}
+            old_pointers = {n: t for n, t in old_compiled[1][1].items() if t.startswith("*")}
+            assert {n: t for n, t in a[1].items() if t.startswith("*")} == old_pointers
+        else:
+            assert a[1] == b[1], "Only combine loses alignment specialization"
     po = next(n for tag, n, dtype in on_alloc if tag == "bca_po")
     rows = on_compiled[0][2]["BLOCK_ROWS"]
     hp = on_compiled[0][2]["HD_PAD"]

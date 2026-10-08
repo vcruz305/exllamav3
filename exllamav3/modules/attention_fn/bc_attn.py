@@ -301,6 +301,7 @@ class BCAttn:
             combine_subtiles,
             decode_row_layout,
             decode_split_programs,
+            _decode_legacy_splits,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
@@ -356,6 +357,12 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "V_DIM",
             "BLOCK_ROWS", "ROWS_SUB", "D_SUB")}
+        if _decode_legacy_splits:
+            # Keep the original combine AOT pointer contract. On GB10, adding
+            # divisibility changes this reduction's rounding even when every
+            # split accumulator is bit-identical. Split-kernel alignment and
+            # packed rows remain enabled.
+            sig_c = {name: ty.removesuffix(":16") for name, ty in sig_c.items()}
         rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,

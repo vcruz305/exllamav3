@@ -149,7 +149,8 @@ def run(module, label, enabled, q, kc, vc, block, seqlens):
     else:
         c_constants["V_DIM"] = hd
     aot_launch(module._paged_attn_decode_combine_kernel, c_runtime, c_constants, c_signature,
-               (programs, (rows // rs) * (hp // ds), 1), 4, 1, aligned=label != "legacy")
+               (programs, (rows // rs) * (hp // ds), 1), 4, 1,
+               aligned=label != "legacy" and not (label == "candidate" and enabled))
     assert torch.isfinite(out).all()
     return out, {"programs": programs, "cap": cap, "splits": splits, "span": span,
                  "rows": rows, "sms": sms}

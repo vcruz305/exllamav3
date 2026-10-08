@@ -1152,8 +1152,10 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
 
 # Historical flash-decoding split counts can be useful when validating an existing
 # model's numerics across the packed-row optimization. Keep the new row packing;
-# only restore the occupancy count that selects KV partitions. Changing partitions
+# restore the occupancy count that selects KV partitions. Changing partitions
 # changes where softmax probabilities are rounded to fp16 before the value dot.
+# BC also retains the original combine kernel's unannotated pointer contract:
+# its fp32 reduction can round differently after an alignment specialization.
 _decode_legacy_splits = os.environ.get("EXL3_ATTN_DECODE_LEGACY_SPLITS", "0") != "0"
 
 
