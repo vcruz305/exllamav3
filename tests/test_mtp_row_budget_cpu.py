@@ -178,3 +178,92 @@ def test_batch_budget_counts_only_prefilled_jobs():
     assert result.shape[-1] == 5
     assert len(probe.draft_model.forwards) == 5
     assert all(ids.shape[0] == 1 for ids in probe.draft_model.forwards)
+
+
+def _target_handoff(probe, old_positions, rewound=()):
+    """Execute the production target-to-MTP handoff, with one accepted target token."""
+    iterate = next(n for n in _class().body
+                   if isinstance(n, ast.FunctionDef) and n.name == "iterate_gen")
+    handoff = next(n for n in iterate.body
+                   if isinstance(n, ast.If) and ast.unparse(n.test) == "self.mtp_draft")
+    module = ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(handoff)], type_ignores=[]))
+    batch = len(probe.active_jobs)
+    target = torch.arange(batch * 2, dtype=torch.float).reshape(batch, 1, 2) + 100
+    probe.mtp_draft = True
+    namespace = {
+        "self": probe, "torch": torch,
+        "p_export_states": [target],
+        "accepted_lengths": [1] * batch,
+        "logit_mapping": list(range(batch + 1)),
+        "rewound_jobs": set(rewound),
+        "batch_ids": torch.cat([j.get_input_ids_list()[0] for j in probe.active_jobs]),
+        "block_index": torch.zeros((batch, 16), dtype=torch.int32),
+        "p_cache_seqlens": torch.tensor(old_positions, dtype=torch.int32),
+    }
+    exec(compile(module, str(SOURCE), "exec"), namespace)
+    return target
+
+
+def test_missing_carry_maintains_every_batch_members_cache():
+    probe = _probe(2)
+    initial_carry = probe.active_jobs[0].mtp_last_hidden.clone()
+    probe.active_jobs[1].mtp_last_hidden = None
+    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert probe._mtp_skipped_round
+    assert probe.draft_model.prefills == []
+    for job in probe.active_jobs:
+        job.sequences[0].kv_position += 1
+    target = _target_handoff(probe, [4, 4])
+    assert len(probe.draft_model.prefills) == 2
+    assert torch.equal(probe.draft_model.prefills[0][1], initial_carry)
+    assert torch.equal(probe.draft_model.prefills[1][1], torch.zeros_like(initial_carry))
+    for row, job in enumerate(probe.active_jobs):
+        assert probe.draft_model.written[job.token] == set(range(5))
+        assert torch.equal(job.mtp_last_hidden, target[row:row + 1])
+    assert probe.iterate_draftmodel_mtp_gen([]).shape == (2, 3)
+    assert not probe._mtp_skipped_round
+    assert all(probe.draft_model.written[j.token] == set(range(8)) for j in probe.active_jobs)
+
+
+def test_one_token_prompt_bootstrap_writes_initial_zero_carry():
+    probe = _probe(1)
+    job = probe.active_jobs[0]
+    job.sequences[0].kv_position = 0
+    job.mtp_last_hidden = None
+    probe.draft_model = Draft(probe.active_jobs)
+    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    job.sequences[0].kv_position = 1
+    _target_handoff(probe, [0])
+    assert len(probe.draft_model.prefills) == 1
+    _, hidden, positions = probe.draft_model.prefills[0]
+    assert torch.count_nonzero(hidden) == 0
+    assert positions.tolist() == [0]
+    assert probe.iterate_draftmodel_mtp_gen([]).shape == (1, 5)
+    assert probe.draft_model.written[job.token] == set(range(6))
+
+
+def test_zero_budget_handoff_does_not_write_current_position_twice():
+    probe = _probe(8)
+    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert not probe._mtp_skipped_round
+    assert len(probe.draft_model.prefills) == 1
+    for job in probe.active_jobs:
+        job.sequences[0].kv_position += 1
+    _target_handoff(probe, [4] * 8)
+    assert len(probe.draft_model.prefills) == 1
+    probe.active_jobs = probe.active_jobs[:1]
+    assert probe.iterate_draftmodel_mtp_gen([]).shape[-1] == 5
+    assert probe.draft_model.forwards[-1].shape[0] == 1
+
+
+def test_skipped_round_handoff_does_not_resurrect_rewound_carry():
+    probe = _probe(2)
+    for job in probe.active_jobs:
+        job.mtp_last_hidden = None
+    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    for job in probe.active_jobs:
+        job.sequences[0].kv_position += 1
+    _target_handoff(probe, [4, 4], rewound=[id(probe.active_jobs[0])])
+    assert probe.active_jobs[0].mtp_last_hidden is None
+    assert probe.draft_model.written[probe.active_jobs[0].token] == set(range(4))
+    assert probe.draft_model.written[probe.active_jobs[1].token] == set(range(5))

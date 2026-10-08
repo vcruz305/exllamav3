@@ -287,6 +287,7 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        self._mtp_skipped_round = False
         # DFlash writes its full native block even when verification is shortened.
         self.draft_reserve_tokens = self.num_draft_tokens
         if self.dflash_draft:
@@ -784,6 +785,7 @@ class Generator:
     def iterate_draftmodel_mtp_gen(self, results: list):
 
         self._draft_conf_round = None
+        self._mtp_skipped_round = False
 
         # Get shape of active batch
         batch_size = 0
@@ -821,8 +823,10 @@ class Generator:
             if not job.is_prefill_done(): continue
             assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
             if job.mtp_last_hidden is None:
-                # A one-token prompt has no token to prefill before the generation input.
-                # Run one normal target step first; iterate_gen() will initialize MTP state.
+                # A one-token prompt (or a rewind) has no valid carry yet. Run one
+                # normal target step, then commit the current MTP position for EVERY
+                # batch member before resuming drafts, including peers with a carry.
+                self._mtp_skipped_round = True
                 return None
             if job.time_first_token is None:
                 cuda_sync_active()
@@ -1474,8 +1478,27 @@ class Generator:
                 if id(job) in rewound_jobs:
                     continue
 
-                # Position K was drafted from the last target state already. Replace accepted
-                # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
+                # A missing carry paused drafting for the whole batch. Position K
+                # still needs its cache write, even for peers whose carry was valid.
+                # Initial zero carry matches ordinary MTP prefill at prompt position 0.
+                if self._mtp_skipped_round:
+                    carry = job.mtp_last_hidden
+                    if carry is None:
+                        carry = torch.zeros_like(target_hidden[a_idx:b_idx, :1, :])
+                    self.draft_model.prefill(
+                        batch_ids[a_idx:b_idx, :1],
+                        {
+                            "attn_mode": "flash_attn",
+                            "block_table": block_index[a_idx:b_idx],
+                            "cache": self.draft_cache,
+                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx],
+                            "target_hidden": carry,
+                        },
+                    )
+
+                # Position K was drafted from the last target state already (or
+                # maintained above). Replace accepted speculative positions K+1..K+A-1
+                # with the corresponding target-state inputs.
                 if accepted_length > 1:
                     self.draft_model.prefill(
                         batch_ids[a_idx:b_idx, 1:accepted_length],
