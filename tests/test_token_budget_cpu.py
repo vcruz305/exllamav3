@@ -164,7 +164,7 @@ _compile([next(n for n in _tree(JOB_PATH).body
          JOB_PATH, NAMESPACE)
 JOB_METHODS = {
     "__init__", "constrain_output_now", "set_token_budget", "clear_token_budget",
-    "_maybe_force_token_budget", "_advance_token_budget", "_pop_forced_token",
+    "_maybe_force_token_budget", "_advance_token_budget", "_token_budget_can_end", "_pop_forced_token",
     "receive_logits", "receive_sample", "set_sampler", "set_filters", "set_banned_strings",
     "_init_banned_strings", "_check_banned_strings", "_release_banned_hold",
     "hash_deferred_pages", "prepare_for_requeue", "prepare_logit_mask",
@@ -242,9 +242,9 @@ def emitted_ids(results):
             for i in r["token_ids"].flatten().tolist()]
 
 
-def arm(job, n, output=None, callback=None):
+def arm(job, n, output=None, callback=None, guard=None):
     job.set_token_budget(n, torch.tensor([[END]]) if output is None else output,
-                         end_token_id=END, on_end=callback)
+                         end_token_id=END, on_end=callback, can_end=guard)
 
 
 def _generator_node(name):
@@ -455,6 +455,147 @@ def test_banned_rewind_restores_accepted_deadline_and_does_not_close_phase():
     assert sample(job, 1)[0][1].item() == 1
     assert sample(job)[0][1].item() == END
     assert calls == [3]
+
+
+@pytest.mark.parametrize("callback_enabled", [False, True])
+def test_partial_banned_hold_can_rewind_natural_end_without_losing_budget(callback_enabled):
+    job = make_job(banned_strings=["</phase>x"])
+    calls = []
+    callback = (lambda j: calls.append(j.new_tokens)) if callback_enabled else None
+    arm(job, 3, callback=callback)
+    sample(job, END)
+    assert job.checkpoint["offset"] == 1
+    assert job.token_budget["end_seen"] and calls == []
+    sample(job, 6)  # Completes banned text and removes both tokens.
+    assert job.checkpoint_rewound and job.new_tokens == 0
+    assert not job.token_budget["end_seen"] and calls == []
+    job.checkpoint_rewound = False
+    got = [sample(job)[0][1].item() for _ in range(4)]
+    assert got == [1, 1, 1, END]
+    assert calls == ([4] if callback_enabled else [])
+    assert job.token_budget is None
+
+
+def test_natural_end_callback_waits_until_partial_banned_hold_is_final():
+    job = make_job(banned_strings=["</phase>x"])
+    calls = []
+    arm(job, 3, callback=lambda j: calls.append((j.new_tokens, j.checkpoint)))
+    sample(job, END)
+    assert calls == [] and job.token_budget is not None
+    sample(job, 1)  # Disproves the banned continuation, making the end final.
+    assert calls == [(2, None)] and job.token_budget is None
+
+
+def test_guard_defers_due_injection_without_discarding_budget():
+    job = make_job()
+    observed = []
+
+    def guard(j):
+        observed.append(j.new_tokens)
+        return j.new_tokens >= 3
+
+    arm(job, 0, guard=guard)
+    assert [sample(job)[0][1].item() for _ in range(4)] == [1, 1, 1, END]
+    # Due forcing checks the accepted boundary; accepted END is checked too.
+    assert observed == [0, 1, 2, 3, 4]
+    assert job.token_budget is None
+
+
+def test_approved_fixed_injection_finishes_if_guard_changes_inside_its_tail():
+    job = make_job()
+    calls = []
+    observed = []
+
+    def guard(j):
+        observed.append(j.new_tokens)
+        return j.new_tokens == 0
+
+    arm(job, 0, output="</phase>tail", guard=guard,
+        callback=lambda j: calls.append(j.new_tokens))
+    assert [sample(job)[0][1].item() for _ in range(3)] == [END, 10, 1]
+    assert calls == [2] and observed == [0, 1]
+    assert job.token_budget is None
+
+
+def test_guard_treats_native_end_inside_protected_data_as_literal():
+    job = make_job()
+    allowed = [False]
+    calls = []
+    arm(job, 10, guard=lambda _: allowed[0], callback=lambda j: calls.append(j.new_tokens))
+    sample(job, END)
+    assert job.token_budget is not None and not job.token_budget["end_seen"]
+    assert calls == []
+    allowed[0] = True
+    sample(job, END)
+    assert calls == [2] and job.token_budget is None
+
+
+def test_guard_synchronizes_after_rewind_even_before_deadline():
+    job = make_job(banned_strings=["</phase>x"])
+    observed = []
+
+    def guard(j):
+        observed.append((j.new_tokens, j.sequences[0].sequence_ids.torch().clone()))
+        return True
+
+    arm(job, 8, guard=guard)
+    sample(job, END)  # Native end check advances the guard's view.
+    sample(job, 6)    # Banned rollback removes END and x.
+    assert [n for n, _ in observed] == [1, 0]
+    assert observed[-1][1].tolist() == [[7, 1]]
+    assert job.token_budget is not None and not job.token_budget["end_seen"]
+
+
+@pytest.mark.parametrize("boundary", ["before_sample", "native_end", "rewind"])
+def test_guard_exception_is_contained_at_each_boundary(boundary):
+    job = make_job(banned_strings=["</phase>x"] if boundary == "rewind" else None)
+    before = job.sequences[0].sequence_ids.torch().clone()
+    position = job.sequences[0].kv_position
+
+    def guard(j):
+        if boundary != "rewind" or j.checkpoint_rewound:
+            raise RuntimeError("cannot verify safe phase boundary")
+        return True
+
+    arm(job, 0 if boundary == "before_sample" else 8, guard=guard)
+    if boundary == "rewind":
+        sample(job, END)
+        result, rows = sample(job, 6)
+    else:
+        result, rows = sample(job, END)
+    assert result[0] and rows[-1]["stage"] == "error"
+    assert isinstance(rows[-1]["error"], RuntimeError)
+    assert job.is_finished and job.token_budget is None
+    if boundary == "before_sample":
+        assert torch.equal(job.sequences[0].sequence_ids.torch(), before)
+        assert job.sequences[0].kv_position == position and job.new_tokens == 0
+        assert job.sampler.calls == [] and "token_ids" not in rows[-1]
+
+
+@pytest.mark.parametrize("result", [None, 1, "yes", torch.tensor(True)])
+def test_non_bool_guard_return_fails_closed(result):
+    job = make_job()
+    arm(job, 0, guard=lambda _: result)
+    ended, rows = sample(job)
+    assert ended[0] and isinstance(rows[-1]["error"], TypeError)
+    assert job.new_tokens == 0 and job.sampler.calls == []
+
+
+def test_async_guard_is_rejected_and_returned_coroutine_is_closed():
+    async def async_guard(_):
+        return True
+
+    job = make_job()
+    with pytest.raises(ValueError, match="can_end"):
+        arm(job, 0, guard=async_guard)
+
+    async def late_result():
+        return True
+
+    arm(job, 0, guard=lambda _: late_result())
+    result, rows = sample(job)
+    assert result[0] and isinstance(rows[-1]["error"], TypeError)
+    assert job.new_tokens == 0
 
 
 def test_requeue_retains_absolute_deadline_and_callback():
@@ -696,6 +837,30 @@ def test_async_callback_error_does_not_abort_an_unrelated_job():
             rows = [r async for r in peer]
             assert emitted_ids(rows) == [1] * 8
             assert generator.error is None and generator.iteration_task.done() is False
+        finally:
+            await generator.close()
+
+    asyncio.run(scenario())
+
+
+def test_async_pre_sample_guard_error_preserves_peer_and_accepts_no_token():
+    async def scenario():
+        generator = AsyncGenerator()
+        try:
+            failed = AsyncJob(generator, input_ids=torch.tensor([[7, 1]]), max_new_tokens=12)
+            peer = AsyncJob(generator, input_ids=torch.tensor([[7, 1]]), max_new_tokens=8)
+
+            def guard(_):
+                raise RuntimeError("protected-region parser failed")
+
+            failed.set_token_budget(0, torch.tensor([[END]]), end_token_id=END, can_end=guard)
+            with pytest.raises(RuntimeError, match="protected-region parser failed"):
+                [r async for r in failed]
+            assert failed.job.new_tokens == 0
+            assert failed.job.sequences[0].sequence_ids.torch().tolist() == [[7, 1]]
+            assert failed.job.sampler.calls == []
+            rows = [r async for r in peer]
+            assert emitted_ids(rows) == [1] * 8 and generator.error is None
         finally:
             await generator.close()
 

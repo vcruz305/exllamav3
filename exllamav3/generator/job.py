@@ -178,6 +178,7 @@ class Job:
         self.forced_sample = False
         self.filters_suspended = rq_state.get("filters_suspended", False)
         self.token_budget = rq_state.get("token_budget")
+        self.token_budget_error = None
 
         # Sampling state
         self.held_text = rq_state.get("held_text", "")
@@ -542,6 +543,7 @@ class Job:
         *,
         end_token_id: int,
         on_end = None,
+        can_end = None,
     ):
         """
         Bound one already-active output phase at the producer's accepted-token boundary.
@@ -556,8 +558,20 @@ class Job:
         complete forced tail drains before on_end(self) runs, even if the end token occurs
         earlier in that tail. The callback is synchronous and runs after stop/rewind handling,
         before any following token is sampled; it can install the next phase's filters,
-        sampler and banned strings. EOS wins and does not call on_end. Callback exceptions
-        fail only this job. With no callback, injected output leaves filters suspended as usual.
+        sampler and banned strings. A natural end inside a reversible banned-string hold
+        is committed only once that hold resolves, delaying handoff until the end token is
+        final. If a rewind removes it, the budget remains active. Forced budget output
+        releases such holds according to constrain_output_now. EOS wins and does not call
+        on_end. Callback exceptions fail only this job. With no callback, injected output
+        leaves filters suspended as usual.
+
+        Optional can_end(self) is a synchronous, read-only predicate returning bool. False
+        defers a due injection and treats a native end token as protected data, for example
+        inside a tool argument. It is checked only at those boundaries and after a banned
+        rewind (the latter call synchronizes any caller-owned parser state; its result is
+        ignored). The predicate must follow accepted sequence IDs across rewind/requeue.
+        Once approved, this budget's own fixed injection completes regardless of later
+        predicate values. All accepted tokens still count while closure is deferred.
 
         Stops, max_new_tokens and explicit forced output retain priority. Already pending
         forced tokens are never discarded. The deadline follows accepted positions through
@@ -569,8 +583,9 @@ class Job:
             raise ValueError("max_tokens must be a nonnegative integer")
         if type(end_token_id) is not int or end_token_id < 0:
             raise ValueError("end_token_id must be a nonnegative integer")
-        if on_end is not None and (not callable(on_end) or inspect.iscoroutinefunction(on_end)):
-            raise ValueError("on_end must be a synchronous callable")
+        for name, callback in (("on_end", on_end), ("can_end", can_end)):
+            if callback is not None and (not callable(callback) or inspect.iscoroutinefunction(callback)):
+                raise ValueError(f"{name} must be a synchronous callable")
         if self.generator is None or self.is_finished:
             raise ValueError("Token budgets require an enqueued, unfinished job")
         if isinstance(output, torch.Tensor):
@@ -590,8 +605,10 @@ class Job:
             "output": ids,
             "end_token_id": end_token_id,
             "on_end": on_end,
+            "can_end": can_end,
             "injecting": False,
             "end_seen": False,
+            "end_position": None,
         }
 
 
@@ -605,12 +622,26 @@ class Job:
         self.token_budget = None
 
 
+    def _token_budget_can_end(self, budget):
+        predicate = budget["can_end"]
+        if predicate is None:
+            return True
+        result = predicate(self)
+        if type(result) is not bool:
+            import inspect
+            if inspect.iscoroutine(result):
+                result.close()
+            raise TypeError("Token-budget can_end must return bool synchronously")
+        return result
+
+
     def _maybe_force_token_budget(self):
         budget = self.token_budget
         if (
             budget is not None and not budget["injecting"] and not budget["end_seen"]
             and self.new_tokens >= 0 and self.forced_ids is None
             and self.rq_new_tokens + self.new_tokens >= budget["deadline"]
+            and self._token_budget_can_end(budget)
         ):
             # The ordinary forced-token path handles MTP rejection/rewind and streaming.
             # Mark first so a multi-token injection is issued exactly once.
@@ -625,13 +656,34 @@ class Job:
         if eos:
             self.token_budget = None
             return
-        # A banned-string rollback abandons this sample; the accepted-position deadline
-        # already follows the rolled-back new_tokens value. Healing is not a new token.
-        if self.checkpoint_rewound or self.new_tokens <= 0:
+        position = self.rq_new_tokens + self.new_tokens
+        # A natural end may itself be in a partial banned-string hold. Do not
+        # commit an irreversible callback while a later token can rewind it.
+        if self.checkpoint_rewound:
+            # A stateful guard may have observed tokens now removed from the
+            # accepted CPU sequence. Synchronize it even if the deadline recedes.
+            self._token_budget_can_end(budget)
+            if budget["end_seen"] and position < budget["end_position"]:
+                budget["end_seen"] = False
+                budget["end_position"] = None
             return
-        if token == budget["end_token_id"]:
-            budget["end_seen"] = True
-        if budget["end_seen"] and self.forced_ids is None:
+        # Healing is not a new output token.
+        if self.new_tokens <= 0:
+            return
+        if token == budget["end_token_id"] and not budget["end_seen"]:
+            allowed = self._token_budget_can_end(budget)
+            # The predicate already approved this budget's own fixed injection.
+            # Its intended close must complete even if the injected message itself
+            # contains text that the caller's parser temporarily treats as protected.
+            if budget["injecting"] or allowed:
+                budget["end_seen"] = True
+                budget["end_position"] = position
+        reversible_end = (
+            budget["end_seen"] and self.checkpoint is not None
+            and self.checkpoint["offset"] > 0
+            and budget["end_position"] > position - self.checkpoint["offset"]
+        )
+        if budget["end_seen"] and self.forced_ids is None and not reversible_end:
             self.token_budget = None
             callback = budget["on_end"]
             if callback is not None:
@@ -838,7 +890,16 @@ class Job:
 
         # Phase budgets belong to accepted producer positions, not result-consumer timing.
         if self.token_budget is not None:
-            self._maybe_force_token_budget()
+            try:
+                self._maybe_force_token_budget()
+            except Exception as exc:
+                # Preserve the ordinary per-job receive_sample/EOS control flow
+                # without running the sampler or accepting a fabricated token.
+                self.token_budget_error = exc
+                self.token_budget = None
+                sequence = self.sequences[0].sequence_ids
+                current = sequence.torch_slice(len(sequence) - 1, len(sequence)).clone()
+                return current, None, None, None
 
         # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
         # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
@@ -890,6 +951,21 @@ class Job:
         enqueue a new one with the current sequence as its prompt, which bounds per-job cache growth and lets long
         generations pass through prompt-cache allocation again.
         """
+        if self.token_budget_error is not None:
+            error = self.token_budget_error
+            self.token_budget_error = None
+            self.is_finished = True
+            result = {
+                "job": self, "stage": "error", "eos": True,
+                "serial": self.serial_number, "error": error,
+            }
+            if self.identifier is not None:
+                result["identifier"] = self.identifier
+            results.append(result)
+            # next_token is the already accepted context tail, only to preserve
+            # Generator's terminal return shape. It is not fed, appended or emitted.
+            return True, next_token, False
+
         next_token = next_token.cpu()
         next_token_i = next_token.item()
         forced_sample = self.forced_sample

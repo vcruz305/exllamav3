@@ -183,7 +183,8 @@ class AsyncJob:
         self.job.constrain_output_now(output)
 
     def set_token_budget(
-        self, max_tokens: int, output: str | torch.Tensor, *, end_token_id: int, on_end = None,
+        self, max_tokens: int, output: str | torch.Tensor, *,
+        end_token_id: int, on_end = None, can_end = None,
     ):
         """
         Bound an already-active phase at an accepted-token boundary; see Job.set_token_budget.
@@ -193,7 +194,7 @@ class AsyncJob:
         Job and runs on the producer before another sample, independent of consumer backpressure.
         """
         self.job.set_token_budget(
-            max_tokens, output, end_token_id = end_token_id, on_end = on_end,
+            max_tokens, output, end_token_id = end_token_id, on_end = on_end, can_end = can_end,
         )
 
     def clear_token_budget(self):
