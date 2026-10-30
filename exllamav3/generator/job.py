@@ -1512,8 +1512,11 @@ class Job:
                 # The final segment: a budget aligned to the end of the cache leaves no room for the
                 # speculative window past it, and no requeue can follow it anyway, so it is cut to what
                 # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
-                # 31-token draft window could not be enqueued at all)
-                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
+                # 31-token draft window could not be enqueued at all). The window the cache has to
+                # hold is the drafter's reserved write, not the verified draft length: DFlash
+                # drafters write their full native block (draft_reserve_tokens), so the cut uses the
+                # same reservation as the room, rq_headroom and rq_margin computations above
+                y = min(y, self.generator.max_total_tokens - self.generator.draft_reserve_tokens)
                 self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
