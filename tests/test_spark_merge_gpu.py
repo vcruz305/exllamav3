@@ -241,6 +241,9 @@ def test_device_mtp_keeps_pinned_positions_stable_during_async_uploads():
 
     class AsyncDraft:
         def __init__(self):
+            # Merged contract: the generator reads capability flags off the draft
+            # model through the caps dict (the empty dict takes every default).
+            self.caps = {}
             self.positions = []
             self.last_ids = None
             self.delay = False
