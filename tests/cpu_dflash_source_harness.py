@@ -211,6 +211,8 @@ class CPUJob(JobMethods):
         seq.sequence_ids = SeqTensor.ids(prompt)
         seq.max_cached_pages = None
         seq.kv_position = prompt - 1
+        # Upstream pagetable tracks the first multimodal page; the harness only models text
+        seq.mm_first_page = None
         self.sequences = [seq]
         self.max_new_tokens = max_new_tokens
         self.max_rq_tokens = self.orig_max_rq_tokens = max_rq_tokens
@@ -325,4 +327,7 @@ def allocate(gen, job):
 
 
 def draft(gen):
-    return gen.iterate_draftmodel_dflash_gen([])
+    # Upstream moved the row ceiling to the caller: pass the untrimmed window as the
+    # production caller does when no ceiling is configured; the in-function caps
+    # clamp (max_verify_rows) still applies
+    return gen.iterate_draftmodel_dflash_gen([], gen.num_draft_tokens)

@@ -58,6 +58,7 @@ import torch.nn.functional as F
 from exllamav3.model.config import Config
 
 
+
 @pytest.fixture
 def model_config(tmp_path):
     # Reduced version of the public 6.50bpw config; two dense layers then MoVA/MoE.

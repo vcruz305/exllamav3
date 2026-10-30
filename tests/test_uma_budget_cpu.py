@@ -3,6 +3,9 @@
 EXL3_TEST_MEMORY_SOURCE selects the captured original to demonstrate the old cap.
 The CUDA stub and fake procfs are scoped to the extracted module's globals.
 """
+import pytest
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
 import ast
 import io
 import os

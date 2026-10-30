@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pytest
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "extract_k2_routing_bias_overlay.py"
 
 

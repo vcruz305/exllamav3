@@ -4,6 +4,9 @@ API servers that build the Generator without exposing draft_confidence (TabbyAPI
 engine default unless the environment sets it. This checks the resolution rule only; it does
 not construct a Generator (that needs a loaded model and a GPU).
 """
+import pytest
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
 import ast
 import pathlib
 

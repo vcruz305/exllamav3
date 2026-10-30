@@ -13,6 +13,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 
 ROOT = Path(__file__).resolve().parents[1] / "exllamav3"
 PREFIX = "k2_cpu_exllamav3"
