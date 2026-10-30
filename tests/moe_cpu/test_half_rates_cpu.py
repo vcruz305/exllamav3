@@ -13,7 +13,7 @@ from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules.block_sparse_mlp_cpu import trellis_rate
 from testlib.exl3 import rand_experts
 from testlib.moe import expert_mlp_ref
-from testlib.moe_cpu import INT8_TIERS, run_per_tier, swizzle, swizzle_layouts
+from testlib.moe_cpu import INT8_TIERS, requires_moe_cpu_int8, run_per_tier, swizzle, swizzle_layouts
 
 ALL_RATES = (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8)
 
@@ -62,6 +62,7 @@ def test_trellis_rate():
 
 
 @pytest.mark.parametrize("K", ALL_RATES)
+@requires_moe_cpu_int8
 def test_cpu_kernel_matches_gpu_reference(device, K):
     for swz in swizzle_layouts():
         gen = torch.Generator().manual_seed(int(K * 10))

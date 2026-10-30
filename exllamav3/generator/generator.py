@@ -1282,6 +1282,17 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
+        # Each pinned source must remain unchanged until its asynchronous H2D read
+        # completes. The merged loop keeps the drafted ids on the device between steps,
+        # so no per-step readback fences the staging buffer: an in-place increment of
+        # one shared cache_seqlens buffer races with those reads (every step would
+        # observe the final position). Build immutable per-step rows once instead;
+        # the single end-of-window readback fences reuse of the ladder.
+        cache_seqlens_steps = self._staging("draft_chain_seqlens", window, batch_size)
+        cache_seqlens_steps.copy_(
+            cache_seqlens[None, :] + torch.arange(window, dtype = torch.int32)[:, None]
+        )
+
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
@@ -1308,7 +1319,7 @@ class Generator:
                 "attn_mode": "flash_attn",
                 "block_table": block_index,
                 "cache": self.cache if target_kv else self.draft_cache,
-                "cache_seqlens": kv_seqlens if target_kv else cache_seqlens,
+                "cache_seqlens": kv_seqlens if target_kv else cache_seqlens_steps[idx],
                 "draft_step": idx,   # heads specialized per depth pick their head from this
                 "sparse_head": self._sparse_flag,
             }
@@ -1329,8 +1340,8 @@ class Generator:
             # Without a row from the sparse head, the next step looks the token up in the embedding table,
             # which wants the ids on its own device (a host round trip for a CPU-resident table, as before)
             batch_ids = new_ids if draft_emb is not None else to_device(new_ids, embed_device)
-            cache_seqlens += 1
-            # Drafters that re-project their state for the next step hand it back through params
+            # The shared staging buffer stays at the round's base position; the ladder
+            # rows above already carry each step's true position
             temp_hidden = params["next_target_hidden"] if "next_target_hidden" in params else batch_state
             draft_conf = params.get("draft_conf")
             if cal is not None and draft_conf is not None:

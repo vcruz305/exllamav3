@@ -52,6 +52,9 @@ def test_queue_drained_hook_enters_inference_mode():
     class Stub:
         recurrent_cache = None
         disk_page_cache = None
+        # Merged layout: idle housekeeping first saves the sparse drafting head's
+        # placement profile; this generator has none
+        sparse_head = None
         pagetable = SimpleNamespace(defrag = lambda: seen.append(torch.is_inference_mode_enabled()))
         model = SimpleNamespace(config = SimpleNamespace(infer_params = SimpleNamespace(moe_cpu_swap_pending = False)))
 

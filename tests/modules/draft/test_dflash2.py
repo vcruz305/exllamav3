@@ -38,6 +38,9 @@ def test_architecture_is_registered():
 def test_prepare_inputs_sets_anchor_and_uses_dflash_attention_setup():
     import exllamav3.architecture.dflash2 as arch
     model = object.__new__(DFlash2Model)
+    # Merged upstream layout: only a model with a recurrent state class prepares
+    # recurrence; this (non-recurrent) contract leaves that branch off
+    model.recurrent_state_cls = None
     input_ids = torch.tensor([[42]])
     prepared = object()
 
@@ -74,16 +77,50 @@ def test_input_embedding_scale_is_applied():
 
 
 @pytest.mark.nogpu
-def test_tp_target_is_rejected_during_attach():
+def test_attach_to_validates_target_and_accepts_tensor_parallel():
+    # The merged upstream DFlash2 supports tensor-parallel targets (sample_from_state
+    # dispatches the head top-k across ranks), so attach_to no longer rejects them;
+    # it validates the target's shape and head configuration instead, before attaching.
     model = object.__new__(DFlash2Model)
-    target = SimpleNamespace(loaded_tp = True)
+    model.config = SimpleNamespace(
+        vocab_size = 128, hidden_size = 64, mask_token_id = 1, target_layer_ids = [1, 3],
+    )
+    model.input_layer = SimpleNamespace()
 
-    try:
-        model.attach_to(target)
-    except NotImplementedError as exc:
-        assert "tensor-parallel targets" in str(exc)
-    else:
-        raise AssertionError("DFlash2 attached to a tensor-parallel target")
+    class _Target:
+        # Real target models are class instances, and the merged attach_to keeps
+        # them behind weak references (drafthold lifetime); SimpleNamespace cannot
+        # be weakly referenced.
+        def __init__(self, vocab_size, hidden_size, num_hidden_layers, logit_layer_idx, loaded_tp = False):
+            self.loaded_tp = loaded_tp
+            self.config = SimpleNamespace(
+                vocab_size = vocab_size, hidden_size = hidden_size,
+                num_hidden_layers = num_hidden_layers)
+            self.logit_layer_idx = logit_layer_idx
+
+    good = _Target(128, 64, 4, 0, loaded_tp = True)
+    model.attach_to(good)
+    assert model.attached_model() is good
+    assert model.input_layer.attached_model() is good
+
+    bad_targets = {
+        "vocabulary mismatch": _Target(256, 64, 4, 0),
+        "hidden size mismatch": _Target(128, 32, 4, 0),
+        "no compatible LM head": _Target(128, 64, 4, None),
+        "tap layer outside the target": _Target(128, 64, 2, 0),
+    }
+    for bad in bad_targets.values():
+        with pytest.raises(ValueError):
+            model.attach_to(bad)
+
+    # The mask token gate needs an otherwise-matching target to be reached
+    mask_model = object.__new__(DFlash2Model)
+    mask_model.config = SimpleNamespace(
+        vocab_size = 128, hidden_size = 64, mask_token_id = 200, target_layer_ids = [1, 3],
+    )
+    mask_model.input_layer = SimpleNamespace()
+    with pytest.raises(ValueError, match = "mask_token_id"):
+        mask_model.attach_to(good)
 
 
 @pytest.mark.nogpu
@@ -361,6 +398,10 @@ def test_dflash2_block_keeps_fp32_residual_and_fp16_branches():
 @pytest.mark.nogpu
 def test_candidate_logit_scale_and_softcap_are_applied():
     class LMHead:
+        # Merged layout: the sparse drafting head is probed before the raw-logits path;
+        # this target has none
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 
@@ -400,6 +441,10 @@ def test_candidate_logit_scale_and_softcap_are_applied():
 @pytest.mark.nogpu
 def test_sample_exports_selector_confidence_for_dynamic_drafting():
     class LMHead:
+        # Merged layout: the sparse drafting head is probed before the raw-logits path;
+        # this target has none
+        sparse_head = None
+
         def prepare_for_device(self, state, params):
             return state
 

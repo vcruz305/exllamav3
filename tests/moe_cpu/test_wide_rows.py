@@ -22,7 +22,7 @@ from exllamav3.util.hadamard import get_hadamard_dt
 from testlib.env import get_test_device
 from testlib.exl3 import rand_experts
 from testlib.isolated import run_isolated
-from testlib.moe_cpu import INT8_TIERS, cpu_runtime, run_per_tier, supported_tiers, swizzle, swizzle_layouts   # noqa: F401 (fixture)
+from testlib.moe_cpu import INT8_TIERS, cpu_runtime, requires_moe_cpu_int8, run_per_tier, supported_tiers, swizzle, swizzle_layouts   # noqa: F401 (fixture)
 
 pytestmark = pytest.mark.usefixtures("cpu_runtime")
 
@@ -164,6 +164,7 @@ def test_peaked_intermediate(K, per_call, plain):
 
 
 @pytest.mark.parametrize("K", RATES)
+@requires_moe_cpu_int8
 def test_ordinary_rows_unchanged(K, plain):
     """Rows that int8 holds well are not touched: bit for bit what plain rows give"""
     for swz in swizzle_layouts():
@@ -216,6 +217,7 @@ def test_tiers_agree():
 
 @pytest.mark.parametrize("activation, act_limit", [(0, 0.0), (3, 7.0)])
 @pytest.mark.parametrize("per_call", (1, len(SEL)))
+@requires_moe_cpu_int8
 def test_deep_saturation_is_finite(activation, act_limit, per_call):
     """Pre-activations past -88.7, where exp() of their negative is infinite in fp32, give zero"""
     K = 4

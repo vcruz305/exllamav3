@@ -1,55 +1,74 @@
 """Small K2-Horizon model contracts from the public 6.50bpw config/index and modeling source."""
+import importlib.machinery
+import importlib.util
 import json
 import math
 import sys
 import types
 
-# Importing exllamav3.ext normally compiles CUDA; these tests exercise CPU contracts only.
-# The real extension's entrypoints are not called by model construction or torch helpers.
-sys.modules.setdefault("exllamav3.ext", types.ModuleType("exllamav3.ext"))
-sys.modules["exllamav3.ext"].exllamav3_ext = types.SimpleNamespace(
-    silu_mul=lambda *args: None,
-    gelu_mul=lambda *args: None,
-    silu_oai_mul=lambda *args: None,
-    relu2_mul=lambda *args: None,
-    relu_mul=lambda *args: None,
-    BC_LinearFP16=lambda *args: None,
-)
 
-paged = types.ModuleType("exllamav3.modules.attention_fn.triton_paged")
-paged._qc_staging = 0
-for name in (
-    "fn_triton_paged_attn", "fn_triton_paged_attn_longq", "fn_triton_paged_attn_decode",
-    "fn_triton_paged_attn_prefill", "fn_triton_varlen_attn",
-    "fn_triton_paged_attn_decode_qc", "fn_triton_paged_attn_prefill_qc", "fn_triton_attn_nocache",
-):
-    setattr(paged, name, lambda *args: None)
-sys.modules[paged.__name__] = paged
+def _prebuilt_extension_available() -> bool:
+    """Whether the compiled exllamav3_ext module is importable without a build.
 
-# Other attention/recurrent Triton kernels are not exercised by these CPU tests.
-def _triton_stub(name):
-    module = types.ModuleType(name)
-    def missing(attr):
-        if attr.startswith("__"):
-            raise AttributeError(attr)
-        return lambda *args, **kwargs: None
-    module.__getattr__ = missing
-    sys.modules[name] = module
+    Importing exllamav3.ext JIT-compiles the extension when no prebuilt module is
+    installed; these tests exercise CPU contracts only, so on such hosts the
+    extension module and the Triton kernel modules are replaced by inert stubs.
+    When a prebuilt extension IS installed the stubs must NOT be installed: they
+    would replace exllamav3.ext.exllamav3_ext for every module imported later in
+    the same process (pytest imports all test modules up front), silently
+    diverting the real kernel tests onto the stub and failing them with
+    AttributeErrors on the real symbol set.
+    """
+    try:
+        spec = importlib.util.find_spec("exllamav3_ext")
+    except (ImportError, ValueError):
+        return False
+    return bool(
+        spec and spec.origin and
+        any(spec.origin.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+    )
 
-paged.__getattr__ = lambda attr: _triton_stub_attr(attr)
 
-def _triton_stub_attr(attr):
-    if attr.startswith("__"):
-        raise AttributeError(attr)
-    return lambda *args, **kwargs: None
+if not _prebuilt_extension_available():
+    # Importing exllamav3.ext normally compiles CUDA; these tests exercise CPU contracts only.
+    # The real extension's entrypoints are not called by model construction or torch helpers.
+    sys.modules.setdefault("exllamav3.ext", types.ModuleType("exllamav3.ext"))
+    sys.modules["exllamav3.ext"].exllamav3_ext = types.SimpleNamespace(
+        silu_mul=lambda *args: None,
+        gelu_mul=lambda *args: None,
+        silu_oai_mul=lambda *args: None,
+        relu2_mul=lambda *args: None,
+        relu_mul=lambda *args: None,
+        BC_LinearFP16=lambda *args: None,
+    )
 
-for name in (
-    "exllamav3.modules.attention_fn.mla_triton",
-    "exllamav3.modules.attention_fn.dsa_triton",
-    "exllamav3.modules.attention_fn.qsa_triton",
-    "exllamav3.modules.gated_delta_net_fn",
-):
-    _triton_stub(name)
+    paged = types.ModuleType("exllamav3.modules.attention_fn.triton_paged")
+    paged._qc_staging = 0
+    for name in (
+        "fn_triton_paged_attn", "fn_triton_paged_attn_longq", "fn_triton_paged_attn_decode",
+        "fn_triton_paged_attn_prefill", "fn_triton_varlen_attn",
+        "fn_triton_paged_attn_decode_qc", "fn_triton_paged_attn_prefill_qc", "fn_triton_attn_nocache",
+    ):
+        setattr(paged, name, lambda *args: None)
+    sys.modules[paged.__name__] = paged
+
+    # Other attention/recurrent Triton kernels are not exercised by these CPU tests.
+    def _triton_stub(name):
+        module = types.ModuleType(name)
+        def missing(attr):
+            if attr.startswith("__"):
+                raise AttributeError(attr)
+            return lambda *args, **kwargs: None
+        module.__getattr__ = missing
+        sys.modules[name] = module
+
+    for name in (
+        "exllamav3.modules.attention_fn.mla_triton",
+        "exllamav3.modules.attention_fn.dsa_triton",
+        "exllamav3.modules.attention_fn.qsa_triton",
+        "exllamav3.modules.gated_delta_net_fn",
+    ):
+        _triton_stub(name)
 
 import pytest
 import torch

@@ -48,6 +48,23 @@ def supported_tiers() -> list[str]:
     return list(TIERS[: TIERS.index(active_tier()) + 1])
 
 
+def moe_cpu_int8_available() -> bool:
+    """True when the extension itself reports the int8 CPU MoE kernels runnable here. The
+    aarch64 build stubs the whole pool -- exl3_moe_cpu_core_order reports no physical cores
+    and every ISA probe returns false -- and the int8 tiers need AVX2 or better, so this
+    asks the extension's own capability reports, not the platform name."""
+    from exllamav3.ext import exllamav3_ext as ext
+    return (ext.exl3_moe_cpu_core_order()[1] > 0
+            and (ext.exl3_moe_cpu_has_avx2() or ext.exl3_moe_cpu_has_avx512_bw()
+                 or ext.exl3_moe_cpu_has_avx512_vnni() or ext.exl3_moe_cpu_has_avx512_vbmi()))
+
+
+requires_moe_cpu_int8 = pytest.mark.skipif(
+    not moe_cpu_int8_available(),
+    reason = "the extension reports no int8 CPU MoE kernels (x86 AVX2/AVX-512; the aarch64 build stubs the pool)",
+)
+
+
 def _tier_and_result(func_path, func_name, args, kwargs):
     spec = importlib.util.spec_from_file_location("_exl3_tier_module", func_path)
     module = importlib.util.module_from_spec(spec)
