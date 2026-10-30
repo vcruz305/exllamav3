@@ -91,7 +91,16 @@ def harness(monkeypatch):
     def spec(K, gated = False):
         dims = {name: (16, 16, K) if name != "g" or gated else None for name in ("g", "u", "d")}
         size = int(32 * K)
-        return dict(hi = 16, ho = 16, num_experts = 1, activation = 2, proj_dims = dims,
+        E = 1
+        # The merged loader (register_layer) resolves every layer to per-expert
+        # dims and byte lists -- uniform dims become [dims] * E -- and the restore
+        # pass only runs for projections listed there; a spec without them matches
+        # no real loaded layer.
+        per_expert_dims = {name: None if dims[name] is None else [dims[name]] * E
+                           for name in ("g", "u", "d")}
+        return dict(hi = 16, ho = 16, num_experts = E, activation = 2, proj_dims = dims,
+                    per_expert_dims = per_expert_dims,
+                    expert_bytes_list = [size * (3 if gated else 2)] * E,
                     proj_bytes = (size if gated else 0, size, size),
                     expert_bytes = size * (3 if gated else 2))
 

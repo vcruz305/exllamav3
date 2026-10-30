@@ -87,28 +87,27 @@ def test_attach_to_validates_target_and_accepts_tensor_parallel():
     )
     model.input_layer = SimpleNamespace()
 
-    good = SimpleNamespace(
-        loaded_tp = True,
-        config = SimpleNamespace(vocab_size = 128, hidden_size = 64, num_hidden_layers = 4),
-        logit_layer_idx = 0,
-    )
+    class _Target:
+        # Real target models are class instances, and the merged attach_to keeps
+        # them behind weak references (drafthold lifetime); SimpleNamespace cannot
+        # be weakly referenced.
+        def __init__(self, vocab_size, hidden_size, num_hidden_layers, logit_layer_idx, loaded_tp = False):
+            self.loaded_tp = loaded_tp
+            self.config = SimpleNamespace(
+                vocab_size = vocab_size, hidden_size = hidden_size,
+                num_hidden_layers = num_hidden_layers)
+            self.logit_layer_idx = logit_layer_idx
+
+    good = _Target(128, 64, 4, 0, loaded_tp = True)
     model.attach_to(good)
     assert model.attached_model() is good
     assert model.input_layer.attached_model() is good
 
     bad_targets = {
-        "vocabulary mismatch": SimpleNamespace(
-            config = SimpleNamespace(vocab_size = 256, hidden_size = 64, num_hidden_layers = 4),
-            logit_layer_idx = 0),
-        "hidden size mismatch": SimpleNamespace(
-            config = SimpleNamespace(vocab_size = 128, hidden_size = 32, num_hidden_layers = 4),
-            logit_layer_idx = 0),
-        "no compatible LM head": SimpleNamespace(
-            config = SimpleNamespace(vocab_size = 128, hidden_size = 64, num_hidden_layers = 4),
-            logit_layer_idx = None),
-        "tap layer outside the target": SimpleNamespace(
-            config = SimpleNamespace(vocab_size = 128, hidden_size = 64, num_hidden_layers = 2),
-            logit_layer_idx = 0),
+        "vocabulary mismatch": _Target(256, 64, 4, 0),
+        "hidden size mismatch": _Target(128, 32, 4, 0),
+        "no compatible LM head": _Target(128, 64, 4, None),
+        "tap layer outside the target": _Target(128, 64, 2, 0),
     }
     for bad in bad_targets.values():
         with pytest.raises(ValueError):

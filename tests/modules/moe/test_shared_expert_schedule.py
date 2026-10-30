@@ -92,6 +92,10 @@ def test_fused_shared_expert_is_not_run_twice():
     layer = SimpleNamespace(
         alt_residual_channel = False, hidden_size = 4, expert_size = 4,
         bc = SimpleNamespace(run_bszN = fused), bc_sh_exp = True,
+        # Merged layout: _forward_rows probes the mixed-K coop decode kernels
+        # (layer.coopmk) before the shared-expert merge; a real layer always
+        # carries the attribute (None outside the sm_121 coop tier)
+        coopmk = None, coopmk_out = None,
         experts_cfg = SimpleNamespace(out_bszn = output), f_threshold = 128,
         is_quantized = True, config = SimpleNamespace(infer_params = SimpleNamespace(no_reconstruct = False)),
         support_quant_paths = True, router_pre_norm = None, routed_pre_norm = None,
