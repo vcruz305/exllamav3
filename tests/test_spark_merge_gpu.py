@@ -260,13 +260,15 @@ def test_device_mtp_keeps_pinned_positions_stable_during_async_uploads():
     probe.draft_model = AsyncDraft()
     # Warm allocations first: pinning memory for the first time can itself
     # synchronize CUDA and hide the race this test is intended to expose.
-    probe.iterate_draftmodel_mtp_gen([])
+    # (Merged API: the caller passes the draft window; the method clamps it to
+    # the row budget internally, exactly as the production caller does.)
+    probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     torch.cuda.synchronize()
     probe.draft_model.positions.clear()
     probe.draft_model.delay = True
     stream = torch.cuda.Stream(device=DEVICE)
     with torch.cuda.stream(stream):
-        result = probe.iterate_draftmodel_mtp_gen([])
+        result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     stream.synchronize()
     assert result.shape[-1] == 3
     assert [p.cpu().tolist() for p in probe.draft_model.positions] == [[4, 4], [5, 5], [6, 6]]

@@ -15,6 +15,13 @@ from exllamav3.modules.block_sparse_mlp import BlockSparseMLP, MAX_BSZN
 pytestmark = pytest.mark.nogpu
 
 
+def forward(layer, x, params):
+    """The merged layout keeps the whole scheduling body in BlockSparseMLP._forward_rows;
+    forward() only adds the (environment-gated, off by default) row-invariant verify
+    dispatch around it, so the scheduling contract is tested at _forward_rows."""
+    return BlockSparseMLP._forward_rows(layer, x, params)
+
+
 @pytest.mark.parametrize("rows, pending", [(1, True), (1, False), (MAX_BSZN + 1, True)])
 @pytest.mark.parametrize("tp", [False, True])
 @pytest.mark.parametrize("offload", [False, True])
@@ -57,7 +64,7 @@ def test_shared_schedule(rows, pending, tp, offload):
         shared_experts_post_norm = module("shared_norm", lambda a: a.square()),
         routed_post_norm = module("routed_norm", lambda a: a.square()),
     )
-    actual = BlockSparseMLP.forward(layer, x, {"backend": None})
+    actual = forward(layer, x, {"backend": None})
     torch.testing.assert_close(actual, 4 + (x * 3).square())
     assert events.count("shared") == 1
     assert (events.index("shared") < events.index("collect")) == (pending and rows <= MAX_BSZN)
@@ -96,6 +103,6 @@ def test_fused_shared_expert_is_not_run_twice():
         shared_experts = SimpleNamespace(forward = unexpected), shared_experts_post_norm = None,
         routed_post_norm = None, shared_gate = None,
     )
-    result = BlockSparseMLP.forward(layer, torch.ones(1, 1, 4), {})
+    result = forward(layer, torch.ones(1, 1, 4), {})
     torch.testing.assert_close(result, torch.full((1, 1, 4), 9.))
     assert events == ["fused", "collect"]
