@@ -20,6 +20,9 @@ from exllamav3.model.moe_cpu_affinity import (apply_process_affinity, default_wo
 pytestmark = pytest.mark.nogpu
 
 
+@pytest.mark.skipif(ext.exl3_moe_cpu_core_order()[1] == 0,
+                  reason = "the extension reports no physical core topology for the CPU MoE worker pool "
+                           "(the aarch64 build stubs the pool)")
 def test_core_order_binding_shape():
     # The binding reports the pool's topology whether or not the workers pin to it (the host
     # placement and the worker-count default use it either way)

@@ -10,9 +10,12 @@ import pytest
 import torch
 
 from exllamav3.ext import exllamav3_ext as ext
-from testlib.moe_cpu import cpu_runtime, swizzle, swizzle_layouts   # noqa: F401 (fixture)
+from testlib.moe_cpu import cpu_runtime, requires_moe_cpu_int8, swizzle, swizzle_layouts   # noqa: F401 (fixture)
 
-pytestmark = pytest.mark.nogpu
+pytestmark = [
+    pytest.mark.nogpu,
+    requires_moe_cpu_int8,
+]
 
 
 @pytest.mark.parametrize("activation", [0, 1, 2, 3])

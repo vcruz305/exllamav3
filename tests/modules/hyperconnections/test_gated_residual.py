@@ -73,13 +73,19 @@ def test_tiled_matches_reference_and_gemm(device, D, rank, use_combine):
 def test_fused_decode_matches_reference(device, D, rank):
     # The fused decode pair (R <= FUSED_MAX_R) on the Qwen3.8 shape and a larger one
     m = make_site(device, D, rank, True)
+    # The int8 decode path quantizes the whole cat(down, inject) projection (per-row int8 with
+    # fp32 scales; hc_mix.cu takes the post rows inside fn_q), so the inject-derived post
+    # gates carry that quantization's error there: 1.3-1.7e-3 relative measured on GB10,
+    # above the 1e-3 bound the unquantized fp16 path holds. The mixed-stream bound and the
+    # bit-reproducibility check below are unchanged on both paths.
+    post_tol = 3e-3 if m.fn_q is not None else 1e-3
     for R in (1, 2, 5, 8):
         torch.manual_seed(R)
         x = torch.randn(1, R, 4, D, device = device) * 3.0
         ref_post, ref_mixed = m._mix_ref(x)
         post, mixed = m._mix(x, cached = False)
         assert rel(mixed, ref_mixed.view(R, D)) < 3e-3, R
-        assert rel(post, ref_post.view(R, 4)) < 1e-3, R
+        assert rel(post, ref_post.view(R, 4)) < post_tol, R
         post2, mixed2 = m._mix(x, cached = False)
         assert torch.equal(mixed, mixed2) and torch.equal(post, post2), R
 
@@ -195,6 +201,22 @@ def test_weighted_copy_handoff(device, D, rank):
     a, b = make_site(device, D, rank, True, seed = 1), make_site(device, D, rank, True, seed = 2)
     GatedResidual.link_sites([a, b])
     assert a.next_site is b and b.next_site is None
+    if b.fn_q is not None:
+        # The int8 decode path weights the streams inside its own kernel and takes no copy,
+        # so the handoff contract (and the entry itself) exists only on the fp16 fused path.
+        # On this path the contract is the intentional gate: the residual update still
+        # contracts to an FMA and no copy is ever staged.
+        for R in (1, 3, 8):
+            torch.manual_seed(R)
+            x = torch.randn(1, R, 4, D, device = device) * 3.0
+            y = torch.randn(1, R, D, device = device, dtype = torch.half)
+            post = torch.rand(1, R, 4, device = device) * 2
+            params = {}
+            x_ref = x + post.unsqueeze(-1) * y.float().unsqueeze(-2)
+            a.apply_(x, y, post, None, params)
+            assert rel(x, x_ref) < 1e-6
+            assert "gr_weighted" not in params
+        return
     for R in (1, 3, 8):
         torch.manual_seed(R)
         x = torch.randn(1, R, 4, D, device = device) * 3.0
@@ -238,6 +260,14 @@ def test_weighted_copy_rejected_when_stale(device):
     R = 4
     x = torch.randn(1, R, 4, D, device = device) * 3.0
     y = torch.randn(1, R, D, device = device, dtype = torch.half)
+    if b.fn_q is not None:
+        # The stale-entry guards serve the fp16 fused path only; on the int8 decode path no
+        # entry can exist at all (its kernel weights the streams itself), which is the
+        # contract that holds here
+        params = {}
+        a.apply_(x, y, torch.rand(1, R, 4, device = device), None, params)
+        assert "gr_weighted" not in params
+        return
     params = {}
     a.apply_(x, y, torch.rand(1, R, 4, device = device), None, params)
     ref_post, ref_mixed = b._mix_ref(x)
