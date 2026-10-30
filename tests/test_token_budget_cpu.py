@@ -20,6 +20,9 @@ import numpy as np
 import pytest
 import torch
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 ROOT = Path(__file__).resolve().parents[1]
 JOB_PATH = ROOT / "exllamav3/generator/job.py"
 GEN_PATH = ROOT / "exllamav3/generator/generator.py"
@@ -269,7 +272,10 @@ def run_mtp(job, proposals, scores=None, batch_verify=True):
     branch = next(n for n in node.body if isinstance(n, ast.If)
                   and ast.unparse(n.test) == "draft_tokens is None and batch_logits.shape[1] == 1")
     namespace = {
-        "self": probe, "torch": torch, "PAGE_SIZE": 256, "_BATCH_VERIFY": batch_verify,
+        "self": probe, "torch": torch, "PAGE_SIZE": 256,
+        # Upstream's batched readback replaced the fork's _BATCH_VERIFY gate:
+        # batch_verify=True selects the batched (one pinned stage, one sync) path
+        "_NO_BATCH_READBACK": not batch_verify,
         "draft_tokens": torch.tensor([proposals], dtype=torch.long),
         "batch_logits": scores, "logit_mapping": [0, 1], "batch_states": [state],
         "accepted_lengths": [], "completed_jobs": [], "requeuing_jobs": [],
@@ -792,7 +798,10 @@ def test_no_budget_keeps_original_batch_verify_fast_path():
     job = make_job()
     state = run_mtp(job, [1] * 5)
     assert emitted_ids(state["results"]) == [1] * 6
-    assert job.sampler.calls == [(6, False)]
+    # Upstream's batched readback launches every position's sampler up front and reads the
+    # window back through one pinned stage: each position is sampled exactly once, no
+    # per-position host sync, and the acceptance walk is unchanged
+    assert job.sampler.calls == [(1, False)] * 6
     assert job.token_budget is None
 
 

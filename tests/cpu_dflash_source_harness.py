@@ -211,6 +211,8 @@ class CPUJob(JobMethods):
         seq.sequence_ids = SeqTensor.ids(prompt)
         seq.max_cached_pages = None
         seq.kv_position = prompt - 1
+        # Upstream pagetable tracks the first multimodal page; the harness only models text
+        seq.mm_first_page = None
         self.sequences = [seq]
         self.max_new_tokens = max_new_tokens
         self.max_rq_tokens = self.orig_max_rq_tokens = max_rq_tokens
@@ -225,6 +227,9 @@ class CPUJob(JobMethods):
         self.token_budget = kwargs.get("rq_state", {}).get("token_budget")
         self.token_budget_error = None
         self._token_budget_failed = False
+        # Upstream loop detection stays disabled in this harness; prepare_for_requeue
+        # serializes the detector, so the attribute must exist (None, as with sam)
+        self.loop_detector = kwargs.get("rq_state", {}).get("loop_detector")
         self.filters_suspended = False
         self.filters = []
         self.time_first_token = 1
@@ -325,4 +330,7 @@ def allocate(gen, job):
 
 
 def draft(gen):
-    return gen.iterate_draftmodel_dflash_gen([])
+    # Upstream moved the row ceiling to the caller: pass the untrimmed window as the
+    # production caller does when no ceiling is configured; the in-function caps
+    # clamp (max_verify_rows) still applies
+    return gen.iterate_draftmodel_dflash_gen([], gen.num_draft_tokens)

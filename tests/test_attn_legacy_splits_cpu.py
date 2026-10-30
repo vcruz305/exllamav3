@@ -18,6 +18,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 ROOT = Path(__file__).resolve().parents[1]
 PAGED = ROOT / "exllamav3/modules/attention_fn/triton_paged.py"
 BC = ROOT / "exllamav3/modules/attention_fn/bc_attn.py"

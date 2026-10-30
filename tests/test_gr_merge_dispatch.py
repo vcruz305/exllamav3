@@ -1,4 +1,7 @@
 """CPU-only dispatch regression for the fork's decode int8 and upstream's tiled path."""
+import pytest
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
 import importlib.util
 import sys
 import types
@@ -71,10 +74,13 @@ def test_int8_quantization_preserves_tiled_source_lifecycle():
     m.proj_m = 5
     m.proj_h = torch.randn((64, 32), dtype=torch.half)
     m.norm_w = torch.linspace(0.1, 2.0, 32).reshape(4, 8)
+    # load() derives w_h as the fp16-rounded norm coefficients; _quantize_int8 folds
+    # those (not the fp32 norm_w) so the decode bytes match the historical preparation
+    m.w_h = m.norm_w.flatten().half().contiguous()
     m.upx_h = torch.randn((4, 2, 1, 4), dtype=torch.half)
     original_proj = m.proj_h.clone()
     original_up = m.upx_h.clone()
-    folded = (m.proj_h[:5].float() * m.norm_w.flatten()).half().float()
+    folded = (m.proj_h[:5].float() * m.w_h.float()).half().float()
     scales = folded.abs().amax(dim=1).clamp_min(1e-8) / 127.0
     expected = torch.round(folded / scales[:, None]).clamp_(-128, 127).to(torch.int8)
     m.tiled = True

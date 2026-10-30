@@ -3,6 +3,9 @@ CPU-only unit tests for the pure logic of convert.py --retry_outliers (exllamav3
 Run:  python -I tests/test_retry_outliers.py
 (The module is loaded by file path so the CUDA extension is not imported.)
 """
+import pytest
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
 import importlib.util
 import json
 import os

@@ -15,6 +15,9 @@ import subprocess
 
 import pytest
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 ROOT = Path(__file__).resolve().parents[1]
 CUDA = ROOT / "exllamav3/exllamav3_ext/quant"
 FIXTURE_HASHES = {

@@ -13,6 +13,9 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
+
 SOURCE = Path(__file__).resolve().parents[1] / "exllamav3/generator/generator.py"
 
 
@@ -59,8 +62,9 @@ def _methods():
     cls = ast.ClassDef(name="MTPProbe", bases=[], keywords=[], body=methods, decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     namespace = {
-        "torch": torch, "PAGE_SIZE": 256, "_MTP_DEVICE_DRAFT": False,
+        "torch": torch, "PAGE_SIZE": 256,
         "cuda_sync_active": lambda: None, "time": NS(time=lambda: 1.0),
+        "to_device": lambda t, dev: t,
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["MTPProbe"]
@@ -91,6 +95,7 @@ class Draft:
         self.forwards = []
         self.samples = 0
         self.last_ids = None
+        self.caps = {}
 
     def _write(self, ids, params):
         for row in range(ids.shape[0]):
@@ -122,10 +127,12 @@ def _probe(batch, budget=8, full=5):
     probe.active_jobs = [Job(i + 10) for i in range(batch)]
     probe.draft_model = Draft(probe.active_jobs)
     probe.draft_cache = object()
+    probe._sparse_flag = None
     probe.draft_calibrator = None
     probe.draft_input_ids_pinned = torch.zeros((max(batch, 1), 1), dtype=torch.long)
     probe.draft_ids_pinned = torch.zeros((max(batch, 1), max(full, 1)), dtype=torch.long)
-    probe.model = NS(logit_layer_idx=0, modules=[NS(prepare_for_device=lambda state, params: state)])
+    probe.model = NS(logit_layer_idx=0,
+                     modules=[NS(device=None, prepare_for_device=lambda state, params: state)])
     probe._staging = lambda name, *shape: torch.zeros(shape, dtype=torch.int32)
     return probe
 
@@ -135,13 +142,13 @@ def _probe(batch, budget=8, full=5):
     (4, 0, 5, 5), (2, 1000, 5, 5), (2, 8, 0, 0), (4, 3, 5, 0),
 ])
 def test_window_from_real_method(batch, budget, full, want):
-    assert _probe(batch, budget, full)._mtp_window(batch) == want
+    assert _probe(batch, budget, full)._mtp_window(batch, full) == want
 
 
 @pytest.mark.parametrize("batch,want", [(1, 5), (2, 3), (4, 1)])
 def test_real_mtp_loop_limits_proposals(batch, want):
     probe = _probe(batch)
-    result = probe.iterate_draftmodel_mtp_gen([])
+    result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     assert result.shape == (batch, want)
     assert len(probe.draft_model.forwards) == want
     assert probe.draft_model.samples == want
@@ -150,7 +157,7 @@ def test_real_mtp_loop_limits_proposals(batch, want):
 
 def test_zero_proposals_commit_cache_before_smaller_batch_resumes():
     probe = _probe(8)
-    result = probe.iterate_draftmodel_mtp_gen([])
+    result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     assert result is None
     assert probe.draft_model.samples == 0
     assert probe.draft_model.forwards == []
@@ -165,7 +172,7 @@ def test_zero_proposals_commit_cache_before_smaller_batch_resumes():
         job.sequences[0].kv_position += 1
         job.mtp_last_hidden += 1
     probe.active_jobs = probe.active_jobs[:1]
-    result = probe.iterate_draftmodel_mtp_gen([])
+    result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     assert result.shape[-1] == 5
     assert probe.draft_model.written[10] == set(range(10))
 
@@ -174,7 +181,7 @@ def test_batch_budget_counts_only_prefilled_jobs():
     probe = _probe(4)
     for job in probe.active_jobs[1:]:
         job.ready = False
-    result = probe.iterate_draftmodel_mtp_gen([])
+    result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     assert result.shape[-1] == 5
     assert len(probe.draft_model.forwards) == 5
     assert all(ids.shape[0] == 1 for ids in probe.draft_model.forwards)
@@ -208,7 +215,7 @@ def test_missing_carry_maintains_every_batch_members_cache():
     probe = _probe(2)
     initial_carry = probe.active_jobs[0].mtp_last_hidden.clone()
     probe.active_jobs[1].mtp_last_hidden = None
-    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens) is None
     assert probe._mtp_skipped_round
     assert probe.draft_model.prefills == []
     for job in probe.active_jobs:
@@ -220,7 +227,7 @@ def test_missing_carry_maintains_every_batch_members_cache():
     for row, job in enumerate(probe.active_jobs):
         assert probe.draft_model.written[job.token] == set(range(5))
         assert torch.equal(job.mtp_last_hidden, target[row:row + 1])
-    assert probe.iterate_draftmodel_mtp_gen([]).shape == (2, 3)
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens).shape == (2, 3)
     assert not probe._mtp_skipped_round
     assert all(probe.draft_model.written[j.token] == set(range(8)) for j in probe.active_jobs)
 
@@ -231,20 +238,20 @@ def test_one_token_prompt_bootstrap_writes_initial_zero_carry():
     job.sequences[0].kv_position = 0
     job.mtp_last_hidden = None
     probe.draft_model = Draft(probe.active_jobs)
-    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens) is None
     job.sequences[0].kv_position = 1
     _target_handoff(probe, [0])
     assert len(probe.draft_model.prefills) == 1
     _, hidden, positions = probe.draft_model.prefills[0]
     assert torch.count_nonzero(hidden) == 0
     assert positions.tolist() == [0]
-    assert probe.iterate_draftmodel_mtp_gen([]).shape == (1, 5)
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens).shape == (1, 5)
     assert probe.draft_model.written[job.token] == set(range(6))
 
 
 def test_zero_budget_handoff_does_not_write_current_position_twice():
     probe = _probe(8)
-    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens) is None
     assert not probe._mtp_skipped_round
     assert len(probe.draft_model.prefills) == 1
     for job in probe.active_jobs:
@@ -252,7 +259,7 @@ def test_zero_budget_handoff_does_not_write_current_position_twice():
     _target_handoff(probe, [4] * 8)
     assert len(probe.draft_model.prefills) == 1
     probe.active_jobs = probe.active_jobs[:1]
-    assert probe.iterate_draftmodel_mtp_gen([]).shape[-1] == 5
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens).shape[-1] == 5
     assert probe.draft_model.forwards[-1].shape[0] == 1
 
 
@@ -260,7 +267,7 @@ def test_skipped_round_handoff_does_not_resurrect_rewound_carry():
     probe = _probe(2)
     for job in probe.active_jobs:
         job.mtp_last_hidden = None
-    assert probe.iterate_draftmodel_mtp_gen([]) is None
+    assert probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens) is None
     for job in probe.active_jobs:
         job.sequences[0].kv_position += 1
     _target_handoff(probe, [4, 4], rewound=[id(probe.active_jobs[0])])
@@ -277,33 +284,39 @@ class PretendCudaTensor(torch.Tensor):
 
 
 class DeferredPositionDraft:
-    """Record host sources as async DMA would, reading them after submission."""
+    """Record each step's position value at submission time, as the loop sees it."""
     def __init__(self):
         self.sources = []
+        self.sampled = []
         self.last_ids = None
+        self.caps = {}
 
     def forward(self, ids, params):
-        self.sources.append(params["cache_seqlens"])
+        self.sources.append(params["cache_seqlens"].tolist())
         self.last_ids = ids
         return params["target_hidden"] + 0.125
 
     def sample_from_state(self, state, params):
+        self.sampled.append(self.last_ids)
         return self.last_ids
 
-
 @pytest.mark.parametrize("batch,window", [(1, 5), (2, 3), (4, 1)])
-def test_device_draft_positions_remain_immutable_until_final_readback(batch, window):
+def test_device_draft_positions_advance_one_per_step_and_read_back_once(batch, window):
     probe = _probe(batch)
-    probe.iterate_draftmodel_mtp_gen.__func__.__globals__["_MTP_DEVICE_DRAFT"] = True
     for job in probe.active_jobs:
         job.mtp_last_hidden = job.mtp_last_hidden.as_subclass(PretendCudaTensor)
     probe.draft_model = DeferredPositionDraft()
-    result = probe.iterate_draftmodel_mtp_gen([])
+    before = probe.draft_ids_pinned.clone()
+    result = probe.iterate_draftmodel_mtp_gen([], probe.num_draft_tokens)
     assert result.shape[-1] == window
     assert len(probe.draft_model.sources) == window
-    # Read the original host sources only after the whole chain was submitted.
-    # A single in-place-incremented source would now contain the final position
-    # for every step, corrupting asynchronous H2D reads queued behind GPU work.
+    # Each step must see its own position: exactly one advance per drafted token
     for step, source in enumerate(probe.draft_model.sources):
-        assert source.tolist() == [4 + step] * batch
-    assert len({s.data_ptr() for s in probe.draft_model.sources}) == window
+        assert source == [4 + step] * batch
+    # The whole window comes back in one final readback: the pinned buffer is
+    # untouched until then and receives the concatenation of every step's ids
+    assert len(probe.draft_model.sampled) == window
+    assert not torch.equal(before, probe.draft_ids_pinned)
+    for row in range(batch):
+        for step in range(window):
+            assert probe.draft_ids_pinned[row, step] == probe.draft_model.sampled[step][row, 0]

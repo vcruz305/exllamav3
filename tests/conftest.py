@@ -276,6 +276,29 @@ def model_dirs(request, model_registry) -> dict[str, str]:
     return {mid: model_registry.get(mid).path for mid in m.args}
 
 
+@pytest.fixture(scope = "session", autouse = True)
+def _isolated_expert_profiles(tmp_path_factory):
+    # CPU expert split saves per-model expert frequency profiles under the user cache directory and seeds
+    # later loads from them. Tests must neither depend on the user's profiles (a settled profile changes which
+    # experts the promote placement has to move, and whether it moves any) nor leave their own behind. (Not via
+    # XDG_CACHE_HOME: torch's extension build root follows it too, and would rebuild the extension per session)
+    try:
+        import exllamav3.modules.block_sparse_mlp_cpu as bsm_cpu
+    except Exception:
+        # Extension not built (e.g. GPU-less validation host): the profile isolation only matters
+        # for tests that exercise the CPU expert split, and those need the extension anyway
+        yield
+        return
+    bsm_cpu.EXPERT_STATS_DIR = str(tmp_path_factory.mktemp("expert_stats"))
+    try:
+        from exllamav3.modules import sparse_head
+    except Exception:
+        yield
+        return
+    sparse_head.TOKEN_STATS_DIR = str(tmp_path_factory.mktemp("token_stats"))
+    yield
+
+
 @pytest.fixture(autouse = True)
 def _current_cuda_device(request):
     # Triton and some ext launches follow the *current* device rather than the tensors' device. Make the test

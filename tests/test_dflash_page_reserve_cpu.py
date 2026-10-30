@@ -1,4 +1,7 @@
 """CPU source-level reservation regressions (not GPU correctness tests)."""
+import pytest
+# Upstream's conftest skips every test without this marker on GPU-less machines
+pytestmark = pytest.mark.nogpu
 import unittest
 from cpu_dflash_source_harness import generator, queue, draft, allocate
 
