@@ -227,6 +227,9 @@ class CPUJob(JobMethods):
         self.token_budget = kwargs.get("rq_state", {}).get("token_budget")
         self.token_budget_error = None
         self._token_budget_failed = False
+        # Upstream loop detection stays disabled in this harness; prepare_for_requeue
+        # serializes the detector, so the attribute must exist (None, as with sam)
+        self.loop_detector = kwargs.get("rq_state", {}).get("loop_detector")
         self.filters_suspended = False
         self.filters = []
         self.time_first_token = 1
