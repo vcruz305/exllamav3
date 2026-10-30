@@ -1,7 +1,13 @@
 from __future__ import annotations
 import torch
 from ...model.config import Config
-from .exl3_lib.quantize import frac_k, preapply_had_l_, preapply_had_r_, had_k, had_n
+# preapply_had_l/_r are the allocating, row-chunked variants; LinearEXL3.reconstruct_columns
+# (sparse-head column extraction) needs them because its input is a view over a shared stack
+# buffer that must not be mutated in place. get_weight_tensor reconstructs into a private buffer
+# and takes the in-place _ variants
+from .exl3_lib.quantize import (
+    frac_k, preapply_had_l, preapply_had_r, preapply_had_l_, preapply_had_r_, had_k, had_n,
+)
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
