@@ -2090,12 +2090,16 @@ class MoeCpuHost:
         else:
             per_expert_bytes = {}
             for e in streamed:
+                # Same trellis-byte rule as the loader's tb(): the 16K-byte tile count
+                # is integral for every supported K (fractional-K bitrates included),
+                # and the byte totals must stay integers for the slot packing and the
+                # DMA slices below
                 if gated and per_expert_dims.get("g"):
-                    gb = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                    gb = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * int(16 * per_expert_dims["g"][e][2]) * 2
                 else:
                     gb = 0
-                ub = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
-                db = (per_expert_dims["d"][e][0] // 16) * (per_expert_dims["d"][e][1] // 16) * 16 * per_expert_dims["d"][e][2] * 2
+                ub = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * int(16 * per_expert_dims["u"][e][2]) * 2
+                db = (per_expert_dims["d"][e][0] // 16) * (per_expert_dims["d"][e][1] // 16) * int(16 * per_expert_dims["d"][e][2]) * 2
                 per_expert_bytes[e] = gb + ub + db
 
         max_expert_bytes = max(per_expert_bytes.values()) if per_expert_bytes else spec["expert_bytes"]
@@ -2282,11 +2286,11 @@ class MoeCpuHost:
                         # Compute per-expert offsets
                         bb = base + expert_offsets[e]
                         if per_expert_dims and per_expert_dims.get("g"):
-                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * int(16 * per_expert_dims["g"][e][2]) * 2
                         else:
                             gb_e = 0
                         if per_expert_dims and per_expert_dims.get("u"):
-                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * int(16 * per_expert_dims["u"][e][2]) * 2
                         else:
                             ub_e = 0
 
@@ -2376,11 +2380,11 @@ class MoeCpuHost:
                     ub_list_grp = []
                     for e in grp:
                         if per_expert_dims and per_expert_dims.get("g"):
-                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                            gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * int(16 * per_expert_dims["g"][e][2]) * 2
                         else:
                             gb_e = 0
                         if per_expert_dims and per_expert_dims.get("u"):
-                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                            ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * int(16 * per_expert_dims["u"][e][2]) * 2
                         else:
                             ub_e = 0
                         gb_list_grp.append(gb_e)
@@ -2409,9 +2413,9 @@ class MoeCpuHost:
                 gb_e = 0
                 ub_e = 0
                 if per_expert_dims and per_expert_dims.get("g"):
-                    gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * 16 * per_expert_dims["g"][e][2] * 2
+                    gb_e = (per_expert_dims["g"][e][0] // 16) * (per_expert_dims["g"][e][1] // 16) * int(16 * per_expert_dims["g"][e][2]) * 2
                 if per_expert_dims and per_expert_dims.get("u"):
-                    ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * 16 * per_expert_dims["u"][e][2] * 2
+                    ub_e = (per_expert_dims["u"][e][0] // 16) * (per_expert_dims["u"][e][1] // 16) * int(16 * per_expert_dims["u"][e][2]) * 2
 
                 def tview(off_b, dims):
                     k, n, K = dims
