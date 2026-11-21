@@ -232,6 +232,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
         act_limit: float = 0.0,
+        act_limit2: float = 0.0,
         interm_dtype: torch.dtype = None,
         interm_div: float = 1.0,
         router_type: str = "std",
@@ -284,6 +285,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.expert_size = latent_size or hidden_size
         self.router_type = router_type
         self.act_limit = act_limit
+        self.act_limit2 = act_limit2
         self.alt_residual_channel = alt_residual_channel
 
         self.routing_first = routing_first
@@ -486,6 +488,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 case "swiglu_oai":
                     self.activation_fn_call = ext.silu_oai_mul
                     self.activation_fn_idx = 3
+                case "silu_softcap":
+                    # Inkling-2 softcapped SwiGLU: the gate and up caps ride act_limit and act_limit2
+                    # through every kernel family; the standalone op serves the torch fallback
+                    assert act_limit > 0 and act_limit2 > 0, \
+                        "silu_softcap needs positive caps in act_limit (gate) and act_limit2 (up)"
+                    _cg, _cu = float(act_limit), float(act_limit2)
+                    self.activation_fn_call = lambda g, u, a, _lim: ext.silu_softcap_mul(g, u, a, _cg, _cu)
+                    self.activation_fn_idx = 4
                 case "relu2":
                     self.activation_fn_call = ext.relu2_mul
                     self.activation_fn_idx = 2
@@ -603,7 +613,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
-        # per-expert path, which handles all of them (gpt-oss)
+        # per-expert path, which handles all of them (gpt-oss). silu_softcap is declined here: the
+        # BC_BlockSparseMLP family (rdna / graph / dq libtorch paths) carries the activation as
+        # booleans (act_silu / act_gelu / ...) with no softcap arm, so it would apply no activation.
+        # Mixed-K layers reach the softcap through exl3_moe_mixedk (self.mixedk_unified), not here
         self.support_quant_paths = (
             self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
@@ -670,7 +683,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.mixedk_unified = False
             if (len(_all_mcg) == 1 and len(_all_mul1) == 1 and
                 list(_all_mcg)[0] != list(_all_mul1)[0] and
-                (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
+                (self.activation_fn in ("silu", "gelu", "silu_softcap") if self.gated else self.activation_fn == "relu2") and
                 all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
                 all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
                 hasattr(ext, "exl3_moe_mixedk")):
@@ -939,7 +952,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return
         # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
         # requires the last), whole expert range on this device
-        if not self.gated or self.activation_fn not in ("silu", "gelu"):
+        if not self.gated or self.activation_fn not in ("silu", "gelu", "silu_softcap"):
             return
         if self.mixedk_mcg or not self.mixedk_mul1:
             return
@@ -973,8 +986,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             None, None, None,
             k_tab(self.gates), k_tab(self.ups), k_tab(self.downs),
             bool(self.mixedk_mcg), bool(self.mixedk_mul1),
-            0 if self.activation_fn == "silu" else 1,
+            {"silu": 0, "gelu": 1, "silu_softcap": 4}[self.activation_fn],
             float(self.act_limit),
+            float(self.act_limit2),
             True,
             buf((slots, Hi), torch.half, "coopmk_had_g"),
             buf((slots, Hi), torch.half, "coopmk_had_u"),
@@ -1609,6 +1623,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.mcg,
                         self.multi_down.mul1,
                         self.act_limit,
+                        self.act_limit2,
                         num_active,
                         scratch, tables[0] if tables is not None else None,
                         count_lo, count_hi, m_tile
@@ -1718,6 +1733,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 self.mixedk_mcg,
                                 self.mixedk_mul1,
                                 self.act_limit,
+                                self.act_limit2,
                                 num_active,
                                 scratch, tables[0] if tables is not None else None,
                                 count_lo, count_hi, m_tile,
@@ -1811,6 +1827,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             md.mcg,
                             md.mul1,
                             self.act_limit,
+                            self.act_limit2,
                             -1,
                             None, None,
                             1, TEMP_ROWS_FUSED, 16,

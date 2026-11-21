@@ -1,10 +1,12 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..modules.attn import prepare_for_attn
 from ..modules.short_conv import ShortConvState
+from ..modules.block_sparse_mlp import BlockSparseMLP
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..modules.arch_specific.inkling2 import (
     Inkling2Embedding,
@@ -19,6 +21,50 @@ Inkling2Loop (thinkingmachines/Inkling-2-Mini), text decoder.
 
 The checkpoint's vision tower and multi-token-prediction sidecar are not instantiated.
 """
+
+
+def _build_moe(c: Config, key: str):
+    """
+    Routed experts of one layer. Default: the fork's BlockSparseMLP with the softcapped SwiGLU as activation
+    "silu_softcap" and the DeepSeek-V3-style sigmoid router (selection bias). Mixed-K layers take the unified
+    fused mixed-K kernel (EXL3_MOE_COOP_MIXEDK=1 adds the CoopMK decode kernels); uniform-K layers take the
+    dense per-expert path, since the BC fused family has no softcap arm. INKLING2_PY_MOE=1 keeps the
+    per-expert Python Inkling2MoE for A/B comparison.
+    """
+    if os.environ.get("INKLING2_PY_MOE", "0") == "1":
+        return Inkling2MoE(
+            config = c,
+            key = f"{key}.mlp",
+            hidden_size = c.hidden_size,
+            intermediate_size = c.intermediate_size,
+            num_experts = c.num_experts,
+            num_experts_per_tok = c.num_experts_per_tok,
+            route_scale = c.route_scale,
+            gate_softcap = c.gate_softcap,
+            up_softcap = c.up_softcap,
+        )
+    return BlockSparseMLP(
+        config = c,
+        key = f"{key}.mlp",
+        hidden_size = c.hidden_size,
+        intermediate_size = c.intermediate_size,
+        num_experts = c.num_experts,
+        num_experts_per_tok = c.num_experts_per_tok,
+        key_gate = "experts.{expert_idx}.gate_proj",
+        key_up = "experts.{expert_idx}.up_proj",
+        key_down = "experts.{expert_idx}.down_proj",
+        key_routing_gate = "gate",
+        key_e_score_bias = "gate.bias",
+        qmap = "block.mlp",
+        out_dtype = torch.float,
+        activation_fn = "silu_softcap",
+        act_limit = c.gate_softcap,
+        act_limit2 = c.up_softcap,
+        router_type = "ds3",
+        routed_scaling_factor = c.route_scale,
+        n_group = 1,
+        topk_group = 1,
+    )
 
 
 class Inkling2LoopConfig(Config):
@@ -155,17 +201,7 @@ class Inkling2LoopModel(Model):
                         log_scaling = log_scaling,
                         eps = c.rms_norm_eps,
                     ),
-                    mlp = Inkling2MoE(
-                        config = c,
-                        key = f"{key}.mlp",
-                        hidden_size = c.hidden_size,
-                        intermediate_size = c.intermediate_size,
-                        num_experts = c.num_experts,
-                        num_experts_per_tok = c.num_experts_per_tok,
-                        route_scale = c.route_scale,
-                        gate_softcap = c.gate_softcap,
-                        up_softcap = c.up_softcap,
-                    ),
+                    mlp = _build_moe(c, key),
                 )
             ]
             self.modules[-1].layer_idx = idx

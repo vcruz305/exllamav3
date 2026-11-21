@@ -746,6 +746,11 @@ class Inkling2Block(Module):
     def _norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
         return _rms(x.float(), self.eps) * self.norms[name]
 
+    def _mlp_input(self, x: torch.Tensor) -> torch.Tensor:
+        # The Python MoE takes the fp32 normalized stream (its router runs in fp32); BlockSparseMLP's
+        # expert kernels and router take the half-precision rows
+        return x if isinstance(self.mlp, Inkling2MoE) else x.to(ACT_DTYPE).contiguous()
+
     def _sconv(self, x: torch.Tensor, name: str, history: torch.Tensor | None) -> torch.Tensor:
         # (conv(x) + x) / sqrt(k + 1), causal depthwise conv; history: (bsz, k - 1, dim) preceding inputs
         bsz, seq, C = x.shape
@@ -813,7 +818,7 @@ class Inkling2Block(Module):
         m = attn_res(st.block_states, residual, self.queries["mlp"])[..., 0, :]
         if messages is not None:
             m = self.gates["mlp"](m, messages[..., 3, :])
-        m = self.mlp.forward(self._norm(m, "mlp"), params)
+        m = self.mlp.forward(self._mlp_input(self._norm(m, "mlp")), params)
         m = self._sconv(m, "mlp", ring.exchange(2 * self.kv_channels + self.hidden_size, m))
         return residual + m
 
