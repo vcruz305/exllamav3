@@ -84,12 +84,21 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 _COOP_MIXEDK_ENV = os.environ.get("EXL3_MOE_COOP_MIXEDK")
 COOP_MIXEDK = _COOP_MIXEDK_ENV == "1"
 COOPMK_PLAN = int(os.environ.get("EXL3_COOPMK_PLAN", "3"))
+# silu_softcap (Inkling-2) layers take the fused decode kernels by default on every GPU: CoopMK for the
+# unified mixed-K layers, the non-MK coop kernels (BC_BlockSparseMLP.run_bszN) for the uniform-K ones.
+# Without them those layers run the per-expert Python path at decode. EXL3_MOE_SOFTCAP_COOP=0 turns both
+# off (the uniform-K layers then take the per-expert path again); EXL3_MOE_COOP_MIXEDK=0 turns off
+# CoopMK alone, and =1 forces it on any activation / GPU
+SOFTCAP_COOP = os.environ.get("EXL3_MOE_SOFTCAP_COOP", "1") != "0"
 
 
-def _coop_mixedk_enabled(device) -> bool:
-    """EXL3_MOE_COOP_MIXEDK if set, else on for sm_121 devices"""
+def _coop_mixedk_enabled(device, activation_fn = None) -> bool:
+    """EXL3_MOE_COOP_MIXEDK if set; else on for silu_softcap layers (unless EXL3_MOE_SOFTCAP_COOP=0),
+    otherwise on for sm_121 devices"""
     if _COOP_MIXEDK_ENV is not None:
         return _COOP_MIXEDK_ENV == "1"
+    if activation_fn == "silu_softcap":
+        return SOFTCAP_COOP
     try:
         return torch.device(device).type == "cuda" and torch.cuda.get_device_capability(device) == (12, 1)
     except Exception:
@@ -614,9 +623,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss). silu_softcap is declined here: the
-        # BC_BlockSparseMLP family (rdna / graph / dq libtorch paths) carries the activation as
-        # booleans (act_silu / act_gelu / ...) with no softcap arm, so it would apply no activation.
-        # Mixed-K layers reach the softcap through exl3_moe_mixedk (self.mixedk_unified), not here
+        # BC_BlockSparseMLP graph/dq paths carry the activation as booleans (act_silu / act_gelu / ...)
+        # with no softcap arm, so it would apply no activation. It reaches only the fused decode kernels
+        # (support_bc_bszn -> run_bszN, coop act index 4). Mixed-K layers reach the softcap through
+        # exl3_moe_mixedk (self.mixedk_unified) and CoopMK, not here
         self.support_quant_paths = (
             self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
@@ -633,7 +643,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return all(has) or not any(has)
         self.support_bc_bszn = (
             self.is_quantized and self.uniform_expert_q and
-            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") or
+             (self.activation_fn == "silu_softcap" and SOFTCAP_COOP) if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
         )
@@ -918,6 +929,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 down_bias_ptrs,
                 act_relu2 = self.activation_fn == "relu2",
                 sh_coop = self.shared_coop_ok(),
+                act_softcap = self.activation_fn == "silu_softcap",
+                act_limit2 = float(self.act_limit2 or 0.0),
             )
 
             # Larger buffers for fused path, if supported. Wide row tiles (32 / 64 rows, separate
@@ -948,7 +961,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.coopmk_out = None
         if not getattr(self, "mixedk_unified", False):
             return
-        if not _coop_mixedk_enabled(self.device):
+        if not _coop_mixedk_enabled(self.device, self.activation_fn):
             return
         # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
         # requires the last), whole expert range on this device
