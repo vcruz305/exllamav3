@@ -51,6 +51,26 @@ def _default_allocator_settings():
 _default_allocator_settings()
 
 
+def _raise_nofile_limit(target = 65536):
+    """
+    Raise the soft open-file limit to min(target, hard limit); never lowers it.
+
+    Under WSL the CUDA driver keeps one event fd per kernel variant the extension has used. A model with
+    many variants reaches the usual soft limit of 1024, and the next driver call then fails as
+    "CUDA driver error: unknown error".
+    """
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except Exception:
+        pass
+
+_raise_nofile_limit()
+
+
 def _default_triton_backend():
     """
     On a ROCm torch, point Triton at its AMD backend. With an NVIDIA driver also installed, both
