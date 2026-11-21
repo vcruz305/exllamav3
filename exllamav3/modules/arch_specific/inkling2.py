@@ -38,7 +38,25 @@ KV_DTYPE = torch.half
 
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
-    return x * torch.rsqrt(x.square().mean(-1, keepdim = True) + eps)
+    # One fused kernel on CUDA; same math as x * rsqrt(mean(x^2) + eps), which is 5 aten ops when written out
+    return F.rms_norm(x, (x.shape[-1],), None, eps)
+
+
+def _fold_sliding(w: torch.Tensor) -> torch.Tensor:
+    """
+    Depthwise causal conv weight (C, 1, k) with the residual term (conv(x) + x) / sqrt(k + 1) folded in: (C, k),
+    taps in time-ascending order (column k - 1 multiplies the current token). Applied as (window * folded).sum(-1).
+    """
+    k = w.shape[-1]
+    s = math.sqrt(k + 1)
+    f = w[:, 0, :] / s
+    f[:, k - 1] += 1.0 / s
+    return f.contiguous()
+
+
+def _with_history(ctx: torch.Tensor | None, x: torch.Tensor, taps: int) -> torch.Tensor:
+    # [history | x] for a call without recurrent state: zeros at sequence start
+    return F.pad(x, (0, 0, taps, 0)) if ctx is None else ctx
 
 
 def _l2_clip(x: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -135,22 +153,24 @@ class Inkling2Ring:
         self.taps = taps
 
     def exchange(self, c0: int, x: torch.Tensor) -> torch.Tensor | None:
-        """Return the history preceding x (bsz, seq, C) for channels [c0, c0 + C) and store x's tail as the new one"""
+        """
+        Store x (bsz, seq, C) as the new history of channels [c0, c0 + C) and return [history | x] (bsz, taps + seq, C)
+        for the same channels, or None without recurrent state
+        """
         if self.state is None:
             return None
         C = x.shape[-1]
-        hist = []
+        out = []
         for i, slot in enumerate(self.slots):
             st = self.state[slot, c0 : c0 + C]                          # (C, taps + max_history)
-            h = st[:, :self.taps].T.clone()                             # (taps, C)
-            full = torch.cat([h, x[i].to(st.dtype)], dim = 0)
+            full = torch.cat([st[:, :self.taps].T, x[i].to(st.dtype)], dim = 0)     # (taps + seq, C), a copy
             if self.record:
                 n = min(st.shape[-1], full.shape[0])
                 st[:, -n:].copy_(full[-n:].T)
             else:
                 st[:, :self.taps].copy_(full[-self.taps:].T)
-            hist.append(h)
-        return torch.stack(hist, dim = 0).to(x.dtype)
+            out.append(full)
+        return torch.stack(out, dim = 0) if len(out) > 1 else out[0].unsqueeze(0)
 
 
 class Inkling2State:
@@ -327,6 +347,8 @@ class Inkling2Attention(Module):
         self.rel_proj = None
         self.k_conv = None
         self.v_conv = None
+        self.k_fold = None
+        self.v_fold = None
         self.caps.update({"kv_cache": True})
         self.cache_layers = []
 
@@ -345,6 +367,23 @@ class Inkling2Attention(Module):
             return {"static": f"{self.key}.{name}.static_w", "proj": f"{self.key}.{name}.weight_proj"}
         return {"weight": f"{self.key}.{name}.weight"}
 
+    def _fold_conv(self, conv: dict) -> dict:
+        """
+        Taps of one K/V short conv with the residual term and 1/sqrt(scale) folded in (time-ascending taps, see
+        _fold_sliding). Full layers keep a static part (H, C/H, k) and a per-token projection (H * k, dim) of the
+        per-head taps, with the projection rows reordered to the same tap order.
+        """
+        k = self.ksize
+        if not self.is_full:
+            return {"w": _fold_sliding(conv["weight"])}
+        H = self.num_kv_heads
+        C = H * self.head_dim
+        s = math.sqrt(2 * k + 1)
+        static = conv["static"].T.reshape(H, C // H, k).flip(-1) / s          # (H, C/H, k), tap j = lag k - 1 - j
+        static[..., k - 1] += 1.0 / s
+        proj = conv["proj"].reshape(H, k, -1).flip(1).reshape(H * k, -1) / s
+        return {"static": static.contiguous(), "proj": proj.contiguous()}
+
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
@@ -355,13 +394,15 @@ class Inkling2Attention(Module):
         self.rel_proj = _side(c, f"{self.key}.rel_logits_proj.proj", device)
         self.k_conv = {n: _side(c, k, device) for n, k in self._conv_keys("k_sconv").items()}
         self.v_conv = {n: _side(c, k, device) for n, k in self._conv_keys("v_sconv").items()}
+        self.k_fold = self._fold_conv(self.k_conv)
+        self.v_fold = self._fold_conv(self.v_conv)
         for cl in self.cache_layers:
             cl.alloc(device)
 
     @override
     def unload(self):
         self.sink_proj = self.q_scale = self.rel_scale = self.rel_proj = None
-        self.k_conv = self.v_conv = None
+        self.k_conv = self.v_conv = self.k_fold = self.v_fold = None
         for cl in self.cache_layers:
             cl.free()
         super().unload()
@@ -387,41 +428,51 @@ class Inkling2Attention(Module):
         alpha, n_floor = self.log_scaling
         return 1.0 + alpha * torch.log(((positions + 1).float() / n_floor).clamp(min = 1.0))
 
-    def _kv_conv(self, x: torch.Tensor, dyn_in: torch.Tensor, conv: dict, history: torch.Tensor | None):
-        """
-        Short causal convolution over the K or V projection. x: (bsz, seq, C) fp32, history: (bsz, ksize - 1, C)
-        of the preceding inputs (zeros at sequence start). Sliding layers: static depthwise taps; full layers:
-        static per-channel taps plus per-token, per-head taps projected from the projection's own input.
-        """
-        bsz, seq, C = x.shape
-        k = self.ksize
-        if history is None:
-            history = x.new_zeros((bsz, k - 1, C))
-        ctx = torch.cat([history, x], dim = 1)                                  # (bsz, seq + k - 1, C)
-        if not self.is_full:
-            w = conv["weight"]                                                  # (C, 1, k), tap k - 1 = current
-            y = F.conv1d(ctx.transpose(1, 2), w, None, padding = 0, groups = C).transpose(1, 2)
-            return (y + x) / math.sqrt(k + 1)
-        H = self.num_kv_heads
-        dyn = F.linear(dyn_in.float(), conv["proj"]).view(bsz, seq, H, 1, k)    # per token, per head, per lag
-        w = conv["static"].T.reshape(H, C // H, k) + dyn                        # (bsz, seq, H, C/H, k), lag 0 = current
-        win = ctx.unfold(1, k, 1).flip(-1)                                      # (bsz, seq, C, k), [..., lag]
-        win = win.reshape(bsz, seq, H, C // H, k)
-        y = (win * w).sum(-1).reshape(bsz, seq, C)
-        return (y + x) / math.sqrt(2 * k + 1)
+    def _tau_host(self, pos: int) -> float:
+        # Same as _log_scale for one absolute position, in host math (exactly 1.0 below n_floor)
+        alpha, n_floor = self.log_scaling
+        return 1.0 + alpha * math.log(max((pos + 1) / n_floor, 1.0))
 
-    def project(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, positions: torch.Tensor,
+    def _tau(self, pos_host: list | None, positions: torch.Tensor | None, dev) -> torch.Tensor | None:
+        """
+        Log-scaling factor per row, (bsz, seq) or None when it is 1 everywhere. Single-token calls pass the host
+        positions and skip the device work unless the factor differs from 1.
+        """
+        if self.log_scaling is None:
+            return None
+        if pos_host is not None:
+            taus = [self._tau_host(p) for p in pos_host]
+            if all(t == 1.0 for t in taus):
+                return None
+            return torch.tensor(taus, dtype = torch.float, device = dev).view(-1, 1)
+        return self._log_scale(positions)
+
+    def _kv_conv(self, ctx: torch.Tensor, dyn_in: torch.Tensor, fold: dict):
+        """
+        Short causal convolution over the K or V projection, scaled as (conv(x) + x) / sqrt(...). ctx: (bsz, taps + seq, C)
+        fp32 = [history | current]. dyn_in: the projection's input, for the per-token taps of full layers.
+        """
+        k = self.ksize
+        win = ctx.unfold(1, k, 1)                                               # (bsz, seq, C, k), time-ascending
+        if not self.is_full:
+            return (win * fold["w"]).sum(-1)
+        bsz, seq = win.shape[0], win.shape[1]
+        H, C = self.num_kv_heads, win.shape[2]
+        dyn = F.linear(dyn_in.float(), fold["proj"]).view(bsz, seq, H, 1, k)    # per token, per head, per tap
+        w = fold["static"] + dyn                                                # (bsz, seq, H, C/H, k)
+        return (win.reshape(bsz, seq, H, C // H, k) * w).sum(-1).reshape(bsz, seq, C)
+
+    def project(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, tau: torch.Tensor | None,
                 params: dict, ring: Inkling2Ring):
         """
         Returns q (bsz, seq, Hq, D), k / v (bsz, seq, Hkv, D), relative logits (bsz, seq, Hq, rel_extent),
-        sink logits (bsz, seq, Hq) and output gate (bsz, seq, Hq * D)
+        sink logits (bsz, seq, Hq) and output gate (bsz, seq, Hq * D). tau: log-scaling factor (bsz, seq) or None
         """
         bsz, seq, _ = q_in.shape
         qh = q_in.to(ACT_DTYPE).contiguous()
         same = k_in is q_in and v_in is q_in
         kh = qh if same else k_in.to(ACT_DTYPE).contiguous()
         vh = qh if same else v_in.to(ACT_DTYPE).contiguous()
-        tau = self._log_scale(positions)
 
         q = self.q_proj.forward(qh, params).float().view(bsz, seq, self.num_q_heads, self.head_dim)
         q = _l2_clip(q * self.q_scale, self.qk_clip)
@@ -431,10 +482,11 @@ class Inkling2Attention(Module):
         k_raw = self.k_proj.forward(kh, params).float()
         v_raw = self.v_proj.forward(vh, params).float()
         C = k_raw.shape[-1]
-        k_hist = ring.exchange(0, k_raw)
-        v_hist = ring.exchange(C, v_raw)
-        k = self._kv_conv(k_raw, k_in, self.k_conv, k_hist).view(bsz, seq, self.num_kv_heads, self.head_dim)
-        v = self._kv_conv(v_raw, v_in, self.v_conv, v_hist).view(bsz, seq, self.num_kv_heads, self.head_dim)
+        taps = self.ksize - 1
+        k_ctx = _with_history(ring.exchange(0, k_raw), k_raw, taps)
+        v_ctx = _with_history(ring.exchange(C, v_raw), v_raw, taps)
+        k = self._kv_conv(k_ctx, k_in, self.k_fold).view(bsz, seq, self.num_kv_heads, self.head_dim)
+        v = self._kv_conv(v_ctx, v_in, self.v_fold).view(bsz, seq, self.num_kv_heads, self.head_dim)
         # K and V take the cache's precision whether or not a cache is attached, so cached and uncached
         # passes attend over the same values
         k = _l2_clip(k, self.qk_clip).to(KV_DTYPE)
@@ -476,11 +528,15 @@ class Inkling2Attention(Module):
             qc = q[:, a:b].reshape(bsz, n, Hk, G, D).permute(0, 2, 3, 1, 4).reshape(bsz, Hk, G * n, D)
             logits = torch.matmul(qc, kc.permute(0, 2, 3, 1)).view(bsz, Hq, n, hi - lo)
             logits *= self.sm_scale
-            if n == 1 and (W is None or hi - lo <= W) and hi - lo <= E:
-                # One query that sees every gathered key, all within the relative extent: the bias row is
-                # read back to front and nothing is masked
+            if n == 1:
+                # One query: keys [lo, hi) are all at or before it and, on sliding layers, inside its window, so
+                # nothing is masked. The bias row is read back to front from the newest key; keys farther than
+                # rel_extent get no bias
+                L = hi - lo
                 d0 = q0 + a - (k0 + hi - 1)                                      # distance to the newest key
-                logits += rel[:, a:b, :, d0 : d0 + hi - lo].flip(-1).transpose(1, 2)
+                Lb = min(L, E - d0)
+                if Lb > 0:
+                    logits[..., L - Lb:] += rel[:, a:b, :, d0 : d0 + Lb].flip(-1).transpose(1, 2)
             else:
                 qp = torch.arange(q0 + a, q0 + b, device = q.device)
                 kp = torch.arange(k0 + lo, k0 + hi, device = q.device)
@@ -677,8 +733,10 @@ class Inkling2Block(Module):
         )
         self.norms = None
         self.convs = None
+        self.convs_f = None
         self.queries = None
         self.msg_query = None
+        self.qkv_norm = self.gate_down = self.gate_up = None
 
         # Conv history channels: [K projection | V projection | attention output | MLP output]
         self.kv_channels = attn.num_kv_heads * attn.head_dim
@@ -698,9 +756,18 @@ class Inkling2Block(Module):
         c = self.config
         self.norms = {n: _side(c, k, device) for n, k in self.norm_keys.items()}
         self.convs = {n: _side(c, k, device) for n, k in self.conv_keys.items()}
+        self.convs_f = {n: _fold_sliding(w) for n, w in self.convs.items()}
         self.queries = {n: _side(c, k, device).view(-1, self.hidden_size) for n, k in self.query_keys.items()}
         for g in self.gates.values():
             g.load(device)
+        self.qkv_norm = torch.stack(
+            [self.norms[n] for n in (("q", "k", "v") if self.is_full else ("q", "q", "q"))]
+        ).contiguous()
+        if self.in_loop:
+            # The four message gates stacked for the batched gate computation (see _gates)
+            gl = list(self.gates.values())
+            self.gate_down = torch.stack([g.down.t() for g in gl]).contiguous()                     # (4, 2 dim, rank)
+            self.gate_up = torch.stack([torch.cat([g.forget.t(), g.gain.t()], dim = 1) for g in gl]).contiguous()
         if self.in_loop:
             # Stored as two (2 * num_loop_layers, dim) tensors: [query, mlp] and [key, value] per loop layer
             i = self.layer_idx - self.loop_start
@@ -712,7 +779,8 @@ class Inkling2Block(Module):
 
     @override
     def unload(self):
-        self.norms = self.convs = self.queries = self.msg_query = None
+        self.norms = self.convs = self.convs_f = self.queries = self.msg_query = None
+        self.qkv_norm = self.gate_down = self.gate_up = None
         for g in self.gates.values():
             g.unload()
         for rl in self.recurrent_layers:
@@ -744,21 +812,50 @@ class Inkling2Block(Module):
         return t
 
     def _norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
-        return _rms(x.float(), self.eps) * self.norms[name]
+        return F.rms_norm(x.float(), (self.hidden_size,), self.norms[name], self.eps)
+
+    def _gates(self, X: torch.Tensor, M: torch.Tensor, first: int) -> torch.Tensor:
+        """
+        Message gates first .. first + G on the rows X, M: (bsz, seq, G, dim) fp32, states and messages. Per row and gate
+        this is Inkling2MessageGate: (1 - tanh(forget)) * X + tanh(gain) * M, the low-rank gates over [rms(X), rms(M)].
+        All G gates run as two batched matmuls over the stacked weights (see load).
+        """
+        bsz, seq, G, H = X.shape
+        N = bsz * seq
+        xs = X.reshape(N, G, H).transpose(0, 1)                                 # (G, N, dim)
+        ms = M.reshape(N, G, H).transpose(0, 1)
+        z = F.rms_norm(torch.stack([xs, ms], dim = 2), (H,), None, self.eps).reshape(G, N, 2 * H)
+        g = torch.bmm(z, self.gate_down[first : first + G])                     # (G, N, rank)
+        t = torch.tanh(torch.bmm(g, self.gate_up[first : first + G]))           # (G, N, 2 * dim): forget | gain
+        out = (1 - t[..., :H]) * xs + t[..., H:] * ms
+        return out.transpose(0, 1).reshape(bsz, seq, G, H)
+
+    def _attn_inputs(self, hs: torch.Tensor, messages: torch.Tensor | None):
+        """
+        Inputs (q, k, v) of the attention sublayer from its attention residual hs (bsz, seq, nq, dim). Full layers take
+        the three inputs from three queries (one for layer 0), sliding layers take one. Message gates, when present, mix
+        the messages into each input; every input is then normalized with its own norm (the q norm on sliding layers).
+        """
+        bsz, seq, nq, H = hs.shape
+        if messages is None and not self.is_full:
+            y = self._norm(hs[..., 0, :], "q")
+            return y, y, y
+        if nq != 3:
+            hs = hs.expand(bsz, seq, 3, H)
+        if messages is not None:
+            hs = self._gates(hs, messages[..., :3, :], 0)
+        y = F.rms_norm(hs.float(), (H,), None, self.eps) * self.qkv_norm
+        return y[..., 0, :], y[..., 1, :], y[..., 2, :]
 
     def _mlp_input(self, x: torch.Tensor) -> torch.Tensor:
         # The Python MoE takes the fp32 normalized stream (its router runs in fp32); BlockSparseMLP's
         # expert kernels and router take the half-precision rows
         return x if isinstance(self.mlp, Inkling2MoE) else x.to(ACT_DTYPE).contiguous()
 
-    def _sconv(self, x: torch.Tensor, name: str, history: torch.Tensor | None) -> torch.Tensor:
-        # (conv(x) + x) / sqrt(k + 1), causal depthwise conv; history: (bsz, k - 1, dim) preceding inputs
-        bsz, seq, C = x.shape
-        if history is None:
-            history = x.new_zeros((bsz, self.ksize - 1, C))
-        ctx = torch.cat([history, x], dim = 1).transpose(1, 2)
-        y = F.conv1d(ctx, self.convs[name], None, padding = 0, groups = C).transpose(1, 2)
-        return (y + x) / math.sqrt(self.ksize + 1)
+    def _sconv(self, x: torch.Tensor, name: str, ctx: torch.Tensor) -> torch.Tensor:
+        # (conv(x) + x) / sqrt(k + 1), causal depthwise conv (scale and residual folded into convs_f);
+        # ctx: (bsz, k - 1 + seq, dim) = [preceding inputs | x]
+        return (ctx.unfold(1, self.ksize, 1) * self.convs_f[name]).sum(-1)
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -783,31 +880,18 @@ class Inkling2Block(Module):
             if instance > 0:
                 prev_block, prev_out = st.prev_pass
                 messages = attn_res([prev_block.to(dev)], prev_out.to(dev), self.msg_query)
-        st.block_states = [s.to(dev) for s in st.block_states]
+        st.block_states = [s if s.device == dev else s.to(dev) for s in st.block_states]
 
         block_residual = x
         if self.layer_idx == 0:
-            h = (x,)
+            hs = x.unsqueeze(-2)
         else:
-            h = attn_res(st.block_states, x, self.queries["attn"]).unbind(-2)
-
-        if self.is_full:
-            q_in, k_in, v_in = h if len(h) == 3 else (h[0], h[0], h[0])
-            if messages is not None:
-                q_in = self.gates["attn"](q_in, messages[..., 0, :])
-                k_in = self.gates["k"](k_in, messages[..., 1, :])
-                v_in = self.gates["v"](v_in, messages[..., 2, :])
-            q_in, k_in, v_in = self._norm(q_in, "q"), self._norm(k_in, "k"), self._norm(v_in, "v")
-        elif messages is not None:
-            q_in = self._norm(self.gates["attn"](h[0], messages[..., 0, :]), "q")
-            k_in = self._norm(self.gates["k"](h[0], messages[..., 1, :]), "q")
-            v_in = self._norm(self.gates["v"](h[0], messages[..., 2, :]), "q")
-        else:
-            q_in = k_in = v_in = self._norm(h[0], "q")
+            hs = attn_res(st.block_states, x, self.queries["attn"])
+        q_in, k_in, v_in = self._attn_inputs(hs, messages)
 
         ring = self._ring(params, instance)
         a = self.attention(q_in, k_in, v_in, params, instance, ring)
-        a = self._sconv(a, "attn", ring.exchange(2 * self.kv_channels, a))
+        a = self._sconv(a, "attn", _with_history(ring.exchange(2 * self.kv_channels, a), a, self.ksize - 1))
 
         if self.is_block_boundary:
             st.block_states = st.block_states + [block_residual]
@@ -817,9 +901,10 @@ class Inkling2Block(Module):
 
         m = attn_res(st.block_states, residual, self.queries["mlp"])[..., 0, :]
         if messages is not None:
-            m = self.gates["mlp"](m, messages[..., 3, :])
+            m = self._gates(m.unsqueeze(-2), messages[..., 3:4, :], 3)[..., 0, :]
         m = self.mlp.forward(self._mlp_input(self._norm(m, "mlp")), params)
-        m = self._sconv(m, "mlp", ring.exchange(2 * self.kv_channels + self.hidden_size, m))
+        m = self._sconv(m, "mlp", _with_history(
+            ring.exchange(2 * self.kv_channels + self.hidden_size, m), m, self.ksize - 1))
         return residual + m
 
     def attention(self, q_in, k_in, v_in, params: dict, instance: int, ring: Inkling2Ring) -> torch.Tensor:
@@ -830,8 +915,12 @@ class Inkling2Block(Module):
 
         if cache is None:
             pos0 = params.get("position", 0) or 0
-            pos = torch.arange(pos0, pos0 + seq, device = dev)
-            q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, pos.unsqueeze(0).expand(bsz, -1), params, ring)
+            if seq == 1:
+                tau = attn._tau([int(pos0)] * bsz, None, dev)
+            else:
+                pos = torch.arange(pos0, pos0 + seq, device = dev)
+                tau = attn._tau(None, pos.unsqueeze(0).expand(bsz, -1), dev)
+            q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, tau, params, ring)
             o = attn.attend(q, rel, sink, k, v, pos0, pos0)
             return attn.finish(o, gate, params)
 
@@ -839,9 +928,14 @@ class Inkling2Block(Module):
         # sequence attends over its own pages (all of them, or the ones its window reaches)
         block_table = params["block_table"]
         past = [int(p) for p in params["cache_seqlens"].tolist()]
+        if seq == 1 and not block_table.is_cuda:
+            rows = block_table.tolist()
+            if all(row[j] == row[0] + j for row in rows for j in range(len(row))):
+                return self._decode_contiguous(q_in, k_in, v_in, params, past, rows, instance, ring)
+
         ar = torch.arange(seq, device = dev)
         positions = torch.tensor(past, device = dev).unsqueeze(1) + ar.unsqueeze(0)
-        q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, positions, params, ring)
+        q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, attn._tau(None, positions, dev), params, ring)
 
         kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], block_table, instance = instance)
         bt = block_table.to(kc.device).long()
@@ -860,6 +954,37 @@ class Inkling2Block(Module):
             v_all = vc[pages].view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
             outs.append(attn.attend(q[i:i+1], rel[i:i+1], sink[i:i+1], k_all, v_all, past[i], lo))
         cache.update_layer(self.layer_idx, params["cache_seqlens"], block_table, kc, vc, seq, instance)
+        o = torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
+        return attn.finish(o, gate, params)
+
+    def _decode_contiguous(self, q_in, k_in, v_in, params: dict, past: list, rows: list, instance: int,
+                           ring: Inkling2Ring) -> torch.Tensor:
+        """
+        Single-token paged step where every sequence's pages are consecutive: the cache is one flat run of rows, so
+        the new row is a plain write and the attended keys are views (no gather). Host integers only.
+        """
+        attn = self.attn
+        bsz = q_in.shape[0]
+        dev = q_in.device
+        cache = params["cache"]
+        block_table = params["block_table"]
+        P = PAGE_SIZE
+        q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, attn._tau(past, None, dev), params, ring)
+        kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], block_table, instance = instance)
+        kf = kc.view(-1, attn.num_kv_heads, attn.head_dim)
+        vf = vc.view(-1, attn.num_kv_heads, attn.head_dim)
+        outs = []
+        for i in range(bsz):
+            p = past[i]
+            base = rows[i][0] * P
+            flat = base + p
+            kf[flat] = k[i, 0]
+            vf[flat] = v[i, 0]
+            lo = 0 if attn.sliding_window is None else max(0, p - (attn.sliding_window - 1))
+            k_all = kf[base + lo : flat + 1].unsqueeze(0)
+            v_all = vf[base + lo : flat + 1].unsqueeze(0)
+            outs.append(attn.attend(q[i:i+1], rel[i:i+1], sink[i:i+1], k_all, v_all, p, lo))
+        cache.update_layer(self.layer_idx, params["cache_seqlens"], block_table, kc, vc, 1, instance)
         o = torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
         return attn.finish(o, gate, params)
 
