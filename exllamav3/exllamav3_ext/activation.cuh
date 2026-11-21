@@ -20,6 +20,15 @@ void silu_mul
     const float act_limit
 );
 
+void silu_softcap_mul
+(
+    const at::Tensor& g,
+    const at::Tensor& u,
+    at::Tensor& z,
+    const float cg,
+    const float cu
+);
+
 void silu_oai_mul_gr
 (
     const at::Tensor& x,

@@ -42,6 +42,7 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
+    const float act_limit2,
     const int num_active,
     const c10::optional<at::Tensor>& output_scratch,
     const c10::optional<at::Tensor>& fused_base,
@@ -99,6 +100,7 @@ void exl3_moe_mixedk
     const bool down_mul1,
 
     const float act_limit,
+    const float act_limit2,
     const int num_active,
     const c10::optional<at::Tensor>& output_scratch,
     const c10::optional<at::Tensor>& fused_base,

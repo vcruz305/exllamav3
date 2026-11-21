@@ -109,12 +109,20 @@ __device__ __forceinline__ float act_oai_swiglu(float g, float u, float limit)
     return (u + 1.0f) * glu;
 }
 
+// Softcapped SwiGLU (Inkling-2): tanh(g / cg) * cg * sigmoid(g) * tanh(u / cu) * cu. The caps are
+// the activation itself, so no act_limit clamp applies
+__device__ __forceinline__ float act_softcap(float g, float u, float cg, float cu)
+{
+    return tanhf(g / cg) * cg * (1.0f / (1.0f + __expf(-g))) * (tanhf(u / cu) * cu);
+}
+
 // Gated activation with the act_limit semantics of act_mul_kernel_*: gate lane activated, up lane
 // clamped symmetrically and the activated gate from above when a limit is set. Gateless experts
 // pass g = u, giving relu(u) * u = relu2(u) exactly
-__device__ __forceinline__ float act_gate(int act, bool gated, float g, float u, float limit)
+__device__ __forceinline__ float act_gate(int act, bool gated, float g, float u, float limit, float limit2)
 {
     if (act == MOE_COOP_ACT_SILU_OAI) return act_oai_swiglu(g, u, limit);
+    if (act == MOE_COOP_ACT_SILU_SOFTCAP) return act_softcap(g, u, limit, limit2);
     float x;
     if (!gated) x = fmaxf(0.0f, u);
     else if (act == MOE_COOP_ACT_SILU) x = act_silu(g);
@@ -791,10 +799,10 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
             }
 
-            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit);
-            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit);
-            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit);
-            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit);
+            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit, p.act_limit2);
+            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit, p.act_limit2);
+            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit, p.act_limit2);
+            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit, p.act_limit2);
 
             scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
             had128(a0, a1, a2, a3, lane);

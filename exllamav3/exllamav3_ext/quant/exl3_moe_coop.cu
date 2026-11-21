@@ -278,6 +278,7 @@ MoeCoopParams exl3_moe_coop_prepare
     p.n_local = (int) u_trellis.size(0);
     p.act = act;
     p.act_limit = act_limit;
+    p.act_limit2 = 0.0f;
     p.gated = gated;
 
     p.had_g = (half*) had_g.data_ptr();

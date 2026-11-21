@@ -10,6 +10,10 @@
 // lane is clamped symmetrically and shifted by +1 inside the activation), so the generic
 // clamp + gate multiply below must be skipped for this index
 #define ACT_SILU_OAI 3
+// Softcapped SwiGLU (Inkling-2): tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u, caps in
+// act_limit (gate) and act_limit2 (up). Like ACT_SILU_OAI it consumes both lanes, and the generic
+// clamp + gate multiply below are skipped for it
+#define ACT_SILU_SOFTCAP 4
 
 // Hadamard transform 128-element vector across one warp, with optional pre and post scales
 
@@ -295,6 +299,7 @@ void had_hf_r_128_guad_inner
     const half* __restrict__ pre_scale_d,
     const float r_scale,
     const float act_limit,
+    const float act_limit2,
     const int act_function
 )
 {
@@ -360,6 +365,15 @@ void had_hf_r_128_guad_inner
         return (u + 1.0f) * glu;
     };
 
+    // Softcapped SwiGLU in fp32 (ACT_SILU_SOFTCAP): gate factor tanh(g / cg) * cg * sigmoid(g),
+    // up factor tanh(u / cu) * cu, product. No act_limit clamp: the caps are the activation
+    auto _softcap = [&](float g, float u)
+    {
+        float gate = tanhf(g / act_limit) * act_limit * (1.0f / (1.0f + __expf(-g)));
+        float up = tanhf(u / act_limit2) * act_limit2;
+        return gate * up;
+    };
+
     // Load. In non-gated mode the g buffer holds no data (its GEMM is skipped); the gate lane
     // is synthesized from u in the activation switch below
     half4 vg = {};
@@ -420,11 +434,26 @@ void had_hf_r_128_guad_inner
             break;
         }
 
+        case ACT_SILU_SOFTCAP:
+        {
+            float2 gx = __half22float2(vg.x);
+            float2 gy = __half22float2(vg.y);
+            float2 ux = __half22float2(vu.x);
+            float2 uy = __half22float2(vu.y);
+            gx.x = _softcap(gx.x, ux.x);
+            gx.y = _softcap(gx.y, ux.y);
+            gy.x = _softcap(gy.x, uy.x);
+            gy.y = _softcap(gy.y, uy.y);
+            vg.x = __float22half2_rn(gx);
+            vg.y = __float22half2_rn(gy);
+            break;
+        }
+
         default:
             break;
     }
 
-    if (act_function != ACT_SILU_OAI)
+    if (act_function != ACT_SILU_OAI && act_function != ACT_SILU_SOFTCAP)
     {
         // Optional activation limits
         if (act_limit != 0.0f)

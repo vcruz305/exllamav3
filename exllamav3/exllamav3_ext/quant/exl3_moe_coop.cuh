@@ -13,6 +13,7 @@
 #define MOE_COOP_ACT_GELU 1
 #define MOE_COOP_ACT_RELU2 2
 #define MOE_COOP_ACT_SILU_OAI 3
+#define MOE_COOP_ACT_SILU_SOFTCAP 4   // caps: act_limit (gate), act_limit2 (up); coopmk only
 
 #define MOE_COOP_THREADS 512
 #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
@@ -44,6 +45,7 @@ struct MoeCoopParams
     const int64_t* d_bias;
     int act;                    // MOE_COOP_ACT_*
     float act_limit;
+    float act_limit2;           // softcap up cap (MOE_COOP_ACT_SILU_SOFTCAP)
     bool gated;                 // false: no gate projection, activation is relu(u) * u
 
     // Scratch (leading dim >= bsz * topk)

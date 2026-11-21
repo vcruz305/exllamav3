@@ -69,6 +69,7 @@ public:
         bool mcg, bool mul1,
         int act,
         float act_limit,
+        float act_limit2,
         bool gated,
         at::Tensor had_g, at::Tensor had_u,
         at::Tensor gu_g, at::Tensor gu_u,

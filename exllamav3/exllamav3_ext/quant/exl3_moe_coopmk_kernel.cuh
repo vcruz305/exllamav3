@@ -242,10 +242,10 @@ void coopmk_a_kernel(const MoeCoopParams p, const int* __restrict__ k_tab)
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
             }
 
-            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit);
-            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit);
-            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit);
-            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit);
+            float a0 = act_gate(p.act, p.gated, g0, u0, p.act_limit, p.act_limit2);
+            float a1 = act_gate(p.act, p.gated, g1, u1, p.act_limit, p.act_limit2);
+            float a2 = act_gate(p.act, p.gated, g2, u2, p.act_limit, p.act_limit2);
+            float a3 = act_gate(p.act, p.gated, g3, u3, p.act_limit, p.act_limit2);
 
             scale_h4(((const half*) p.d_suh[local]) + col, a0, a1, a2, a3);
             had128(a0, a1, a2, a3, lane);

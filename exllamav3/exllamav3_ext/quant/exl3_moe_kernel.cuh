@@ -308,6 +308,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exp_down_suh + 128 * token_off,
                     0.088388347648f,
                     act_limit,
+                    act_limit2,
                     act_function
                 );
             }
@@ -580,6 +581,7 @@ void exl3_moe_mixedk_kernel(EXL3_MOE_MIXEDK_KERNEL_ARGS)
                     exp_down_suh + 128 * token_off,
                     0.088388347648f,
                     act_limit,
+                    act_limit2,
                     act_function
                 );
             }

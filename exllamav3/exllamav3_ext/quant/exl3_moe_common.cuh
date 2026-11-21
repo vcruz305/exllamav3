@@ -7,6 +7,7 @@
 #define MOE_ACT_SILU 0
 #define MOE_ACT_GELU 1
 #define MOE_ACT_RELU2_NOGATE 2  // non-gated relu2 (NemotronH): gate GEMM and staging skipped
+#define MOE_ACT_SILU_SOFTCAP 4  // softcapped SwiGLU (Inkling-2): caps act_limit (gate), act_limit2 (up)
 
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
@@ -44,6 +45,7 @@
     const int max_tokens_per_expert,            \
     const int concurrency,                      \
     const float act_limit,                      \
+    const float act_limit2,                     \
     const int act_function,                     \
     const int K_gate,                           \
     const int K_up,                             \
@@ -86,6 +88,7 @@
     const int max_tokens_per_expert,            \
     const int concurrency,                      \
     const float act_limit,                      \
+    const float act_limit2,                     \
     const int act_function,                     \
     const int* __restrict__ K_gate_arr,         \
     const int* __restrict__ K_up_arr,           \

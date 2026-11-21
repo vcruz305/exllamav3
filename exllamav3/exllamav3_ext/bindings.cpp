@@ -237,6 +237,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rope", &rope, "rope");
     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
     m.def("silu_mul", &silu_mul, "silu_mul");
+    m.def("silu_softcap_mul", &silu_softcap_mul, "silu_softcap_mul");
     m.def("silu_oai_mul", &silu_oai_mul, "silu_oai_mul");
     m.def("gelu_mul", &gelu_mul, "gelu_mul");
     m.def("relu2_mul", &relu2_mul, "relu2_mul");
@@ -330,7 +331,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("up_ptrs_trellis"), py::arg("up_ptrs_suh"), py::arg("up_ptrs_svh"), py::arg("down_ptrs_trellis"),
           py::arg("down_ptrs_suh"), py::arg("down_ptrs_svh"), py::arg("gate_mcg"), py::arg("gate_mul1"),
           py::arg("up_mcg"), py::arg("up_mul1"), py::arg("down_mcg"), py::arg("down_mul1"),
-          py::arg("act_limit"), py::arg("num_active"), py::arg("output_scratch"), py::arg("fused_base"),
+          py::arg("act_limit"), py::arg("act_limit2"), py::arg("num_active"), py::arg("output_scratch"), py::arg("fused_base"),
           py::arg("count_lo"), py::arg("count_hi"), py::arg("m_tile"), py::arg("k_max") = 8,
           py::arg("expert_order") = py::none());
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
@@ -344,7 +345,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                 at::Tensor, at::Tensor, at::Tensor,
                 c10::optional<at::Tensor>, c10::optional<at::Tensor>, c10::optional<at::Tensor>,
                 at::Tensor, at::Tensor, at::Tensor,
-                bool, bool, int, float, bool,
+                bool, bool, int, float, float, bool,
                 at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                 at::Tensor, at::Tensor,
                 c10::optional<at::Tensor>,
@@ -355,7 +356,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
              py::arg("d_trellis"), py::arg("d_suh"), py::arg("d_svh"),
              py::arg("g_bias"), py::arg("u_bias"), py::arg("d_bias"),
              py::arg("k_gate"), py::arg("k_up"), py::arg("k_down"),
-             py::arg("mcg"), py::arg("mul1"), py::arg("act"), py::arg("act_limit"), py::arg("gated"),
+             py::arg("mcg"), py::arg("mul1"), py::arg("act"), py::arg("act_limit"), py::arg("act_limit2"), py::arg("gated"),
              py::arg("had_g"), py::arg("had_u"), py::arg("gu_g"), py::arg("gu_u"), py::arg("act_out"), py::arg("d_out"),
              py::arg("ctr"), py::arg("out"),
              py::arg("sh_gate_w"),

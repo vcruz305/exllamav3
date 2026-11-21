@@ -115,6 +115,7 @@ CoopMK::CoopMK
     bool mcg, bool mul1,
     int act,
     float act_limit,
+    float act_limit2,
     bool gated,
     at::Tensor had_g, at::Tensor had_u,
     at::Tensor gu_g, at::Tensor gu_u,
@@ -130,7 +131,7 @@ CoopMK::CoopMK
     TORCH_CHECK(ctr.is_contiguous(), "coopmk: ctr must be contiguous");
     for (const at::Tensor* t : { &g_trellis, &g_suh, &g_svh, &u_trellis, &u_suh, &u_svh, &d_trellis, &d_suh, &d_svh })
         TORCH_CHECK(t->scalar_type() == at::kLong && t->is_contiguous() && t->dim() == 1, "coopmk: pointer tables must be contiguous 1-D int64");
-    TORCH_CHECK(act >= 0 && act <= 3, "coopmk: unknown activation");
+    TORCH_CHECK(act >= 0 && act <= 4, "coopmk: unknown activation");   // 4 = MOE_COOP_ACT_SILU_SOFTCAP
     const int64_t n = u_trellis.size(0);
     TORCH_CHECK(g_trellis.size(0) == n && d_trellis.size(0) == n, "coopmk: pointer table lengths differ");
     TORCH_CHECK(k_gate.numel() == n && k_up.numel() == n && k_down.numel() == n, "coopmk: K table lengths differ");
@@ -190,6 +191,7 @@ CoopMK::CoopMK
     p.n_local = (int) n;
     p.act = act;
     p.act_limit = act_limit;
+    p.act_limit2 = act_limit2;
     p.gated = gated;
 
     p.had_g = (half*) had_g.data_ptr();

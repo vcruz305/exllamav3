@@ -121,6 +121,64 @@ void silu_mul
     silu_mul_gr(x, y, z, act_limit, nullptr);
 }
 
+// Softcapped SwiGLU (Inkling-2): tanh(g / cg) * cg * sigmoid(g) * tanh(u / cu) * cu -> z. fp32 math
+// from float or half g / u, z half; elementwise, so z may alias u (each element is read before written)
+
+__device__ __forceinline__ float sc_to_f(float x) { return x; }
+__device__ __forceinline__ float sc_to_f(half x) { return __half2float(x); }
+
+template <typename T>
+__global__ void softcap_mul_kernel(const T* g, const T* u, half* z, const float cg, const float cu, const size_t numel)
+{
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < numel; i += (size_t) gridDim.x * blockDim.x)
+    {
+        float gf = sc_to_f(g[i]);
+        float uf = sc_to_f(u[i]);
+        float a = tanhf(gf / cg) * cg * (1.0f / (1.0f + __expf(-gf))) * (tanhf(uf / cu) * cu);
+        z[i] = __float2half_rn(a);
+    }
+}
+
+void silu_softcap_mul
+(
+    const at::Tensor& g,
+    const at::Tensor& u,
+    at::Tensor& z,
+    const float cg,
+    const float cu
+)
+{
+    act_mul_check(g, u, z);
+    TORCH_CHECK(cg > 0.0f && cu > 0.0f, "silu_softcap_mul: caps must be positive");
+    TORCH_CHECK_DTYPE(z, kHalf);
+
+    const at::cuda::OptionalCUDAGuard device_guard(g.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    size_t numel = g.numel();
+    if (!numel) return;
+    size_t blocks = CEIL_DIVIDE(numel, NUM_THREADS);
+    if (blocks > 4096) blocks = 4096;   // grid-stride loop over the rest
+    if (g.dtype() == at::kFloat)
+    {
+        TORCH_CHECK_DTYPE(u, kFloat);
+        softcap_mul_kernel<float><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const float*) g.data_ptr(), (const float*) u.data_ptr(), (half*) z.data_ptr(), cg, cu, numel
+        );
+    }
+    else
+    {
+        TORCH_CHECK_DTYPE(g, kHalf);
+        TORCH_CHECK_DTYPE(u, kHalf);
+        softcap_mul_kernel<half><<<blocks, NUM_THREADS, 0, stream>>>
+        (
+            (const half*) g.data_ptr(), (const half*) u.data_ptr(), (half*) z.data_ptr(), cg, cu, numel
+        );
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
 // gpt-oss clamped swiglu: (clamp(y, -limit, limit) + 1) * g * sigmoid(1.702 * g),
 // g = min(x, limit) -> z, in-place if z == x or z == y
 
