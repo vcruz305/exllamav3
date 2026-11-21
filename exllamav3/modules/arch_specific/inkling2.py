@@ -31,6 +31,11 @@ Reference semantics: transformers `Inkling2LoopTextModel` (models/inkling2_loop/
 
 STATE_KEY = "inkling2"
 
+# Precision of the activations handed to the quantized linears (the EXL3 kernels take fp16 rows) and of
+# the K/V rows (the cache's). Validation against an fp32 reference raises both to take the rounding out
+ACT_DTYPE = torch.half
+KV_DTYPE = torch.half
+
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(-1, keepdim = True) + eps)
@@ -412,10 +417,10 @@ class Inkling2Attention(Module):
         sink logits (bsz, seq, Hq) and output gate (bsz, seq, Hq * D)
         """
         bsz, seq, _ = q_in.shape
-        qh = q_in.half().contiguous()
+        qh = q_in.to(ACT_DTYPE).contiguous()
         same = k_in is q_in and v_in is q_in
-        kh = qh if same else k_in.half().contiguous()
-        vh = qh if same else v_in.half().contiguous()
+        kh = qh if same else k_in.to(ACT_DTYPE).contiguous()
+        vh = qh if same else v_in.to(ACT_DTYPE).contiguous()
         tau = self._log_scale(positions)
 
         q = self.q_proj.forward(qh, params).float().view(bsz, seq, self.num_q_heads, self.head_dim)
@@ -432,8 +437,8 @@ class Inkling2Attention(Module):
         v = self._kv_conv(v_raw, v_in, self.v_conv, v_hist).view(bsz, seq, self.num_kv_heads, self.head_dim)
         # K and V take the cache's precision whether or not a cache is attached, so cached and uncached
         # passes attend over the same values
-        k = _l2_clip(k, self.qk_clip).half()
-        v = _rms(v, self.eps).half()
+        k = _l2_clip(k, self.qk_clip).to(KV_DTYPE)
+        v = _rms(v, self.eps).to(KV_DTYPE)
 
         r = self.r_proj.forward(qh, params).float().view(bsz, seq, self.num_q_heads, self.d_rel)
         r = _l2_clip(r * self.rel_scale, self.rel_clip)
@@ -498,7 +503,7 @@ class Inkling2Attention(Module):
         return torch.cat(out, dim = 1) if len(out) > 1 else out[0]
 
     def finish(self, o: torch.Tensor, gate: torch.Tensor, params: dict) -> torch.Tensor:
-        o = (o * gate).half().contiguous()
+        o = (o * gate).to(ACT_DTYPE).contiguous()
         return self.o_proj.forward(o, params, out_dtype = torch.float)
 
     @override
@@ -589,7 +594,7 @@ class Inkling2MoE(Module):
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         idx, w = self.route(x)
-        xh = x.half()
+        xh = x.to(ACT_DTYPE)
         y = torch.zeros_like(x, dtype = torch.float)
         cg, cu = self.gate_softcap, self.up_softcap
         if x.shape[0] <= 4:
@@ -598,7 +603,7 @@ class Inkling2MoE(Module):
                 xe = xh[r:r + 1].unsqueeze(0)
                 g = torch.cat([self.gates[e].forward(xe, params) for e in experts], dim = 1)     # (1, k, I)
                 u = torch.cat([self.ups[e].forward(xe, params) for e in experts], dim = 1)
-                a = (torch.tanh(g / cg) * cg * torch.sigmoid(g) * torch.tanh(u / cu) * cu).half()
+                a = (torch.tanh(g / cg) * cg * torch.sigmoid(g) * torch.tanh(u / cu) * cu).to(ACT_DTYPE)
                 d = torch.cat([
                     self.downs[e].forward(a[:, i : i + 1].contiguous(), params, out_dtype = torch.float)
                     for i, e in enumerate(experts)
@@ -612,7 +617,7 @@ class Inkling2MoE(Module):
             g = self.gates[e].forward(xe, params).float()
             u = self.ups[e].forward(xe, params).float()
             a = torch.tanh(g / cg) * cg * torch.sigmoid(g) * torch.tanh(u / cu) * cu
-            d = self.downs[e].forward(a.half().contiguous(), params, out_dtype = torch.float)[0]
+            d = self.downs[e].forward(a.to(ACT_DTYPE).contiguous(), params, out_dtype = torch.float)[0]
             y.index_add_(0, rows, d * w[rows, slot].unsqueeze(-1))
         return y.view(shape)
 
@@ -916,7 +921,7 @@ class Inkling2Final(Module):
         # The forward loop may have cropped x to the last tokens; the block states follow
         blocks = [s[:, -n:].to(self.device) for s in st.block_states]
         x = attn_res(blocks, x.float(), self.query)[..., 0, :]
-        x = (_rms(x, self.eps) * self.norm_weight).half().contiguous()
+        x = (_rms(x, self.eps) * self.norm_weight).to(ACT_DTYPE).contiguous()
         logits = self.head.forward(x, params, out_dtype)
         # Rows past the tokenizer's vocabulary are padding in the checkpoint
         return logits[..., :self.vocab_size]
