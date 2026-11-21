@@ -4,6 +4,8 @@ import torch
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..modules.attn import prepare_for_attn
+from ..modules.short_conv import ShortConvState
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..modules.arch_specific.inkling2 import (
     Inkling2Embedding,
     Inkling2Attention,
@@ -187,6 +189,14 @@ class Inkling2LoopModel(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
+        self.caps.update({
+            "supports_tp": False,
+            "recurrent_states": True,
+            "default_recurrent_checkpoint_interval": 2048,
+        })
+        # Short-convolution histories ride the generic conv-ring state (see Inkling2ConvLayerState)
+        self.recurrent_state_cls = ShortConvState
+
         # The loop: layers [loop_start, loop_end) run num_passes times
         if not c.layer_map and not c.layer_map_str:
             core = list(range(c.loop_start, c.loop_end))
@@ -198,6 +208,7 @@ class Inkling2LoopModel(Model):
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         params["input_ids"] = input_ids
         input_ids = prepare_for_attn(input_ids, params)
+        prepare_for_recurrence(input_ids, params, self)
         return input_ids
 
     @override

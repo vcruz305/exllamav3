@@ -4,6 +4,8 @@ import math
 import torch
 import torch.nn.functional as F
 from ...model.config import Config
+from ...constants import PAGE_SIZE
+from ...cache.recurrent import host_copy
 from ..module import Module
 from ..linear import Linear
 
@@ -58,6 +60,92 @@ def attn_res(block_states: list[torch.Tensor], partial: torch.Tensor, query: tor
     w = torch.matmul(stacked, query.float().T) * (dim ** -0.5)      # (bsz, seq, S, nq)
     w = torch.softmax(w, dim = -2)
     return torch.matmul(w.transpose(-1, -2), stacked)               # (bsz, seq, nq, dim)
+
+
+class Inkling2ConvLayerState:
+    """
+    Per-sequence short-convolution history of one layer instance: the last (kernel - 1) inputs of the four
+    causal convolutions (K projection, V projection, attention output, MLP output), concatenated along the
+    channel axis. Layout and rewind semantics follow ShortConvLayerState: [..., :taps] is the live history,
+    a pass that records history (speculative decoding) writes its inputs to the tail instead and rewind()
+    settles the live history at the accepted length.
+    """
+
+    def __init__(self, module: Inkling2Block, max_batch_size: int, max_history: int, cache_id: int):
+        self.module = module
+        self.taps = module.ksize - 1
+        self.conv_state = torch.empty(
+            (max_batch_size, module.ring_channels, self.taps + max_history), dtype = torch.float, device = "meta",
+        )
+        self.device = None
+        self.max_history = max_history
+        self.max_batch_size = max_batch_size
+        self.cache_id = cache_id
+
+    def get_checkpoint_size(self):
+        return self.module.ring_channels * self.taps * 4
+
+    def storage_size(self):
+        return self.conv_state.numel() * self.conv_state.element_size()
+
+    def alloc(self, device):
+        self.conv_state = torch.zeros_like(self.conv_state, device = device)
+        self.device = device
+
+    def free(self):
+        self.conv_state = torch.empty_like(self.conv_state, device = "meta")
+        self.device = None
+
+    def clear(self, idx: int):
+        if self.device is not None:
+            self.conv_state[idx].zero_()
+
+    def get_state_tensors(self):
+        return (self.conv_state,)
+
+    def rewind(self, slot: int, last_history: int, num_tokens: int):
+        assert num_tokens >= 0 and (last_history == 0 or num_tokens <= last_history), \
+            f"inkling2 conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        if last_history > 0:
+            p = self.conv_state.shape[-1] - num_tokens
+            self.conv_state[slot, :, :self.taps].copy_(self.conv_state[slot, :, p - self.taps : p].clone())
+
+    def stash(self, slot, position: int = 0):
+        return host_copy(self.conv_state[slot, :, :self.taps])
+
+    def unstash(self, slot, stashed, position: int = 0):
+        self.conv_state[slot, :, :self.taps].copy_(stashed)
+
+    def tp_export(self, plan):
+        raise NotImplementedError("Inkling2Loop: tensor-parallel is not supported")
+
+
+class Inkling2Ring:
+    """One forward call's view of a layer instance's conv history for the batch (None-safe: no cache, no history)"""
+
+    def __init__(self, state: torch.Tensor | None, slots: list | None, record: bool, taps: int):
+        self.state = state
+        self.slots = slots
+        self.record = record
+        self.taps = taps
+
+    def exchange(self, c0: int, x: torch.Tensor) -> torch.Tensor | None:
+        """Return the history preceding x (bsz, seq, C) for channels [c0, c0 + C) and store x's tail as the new one"""
+        if self.state is None:
+            return None
+        C = x.shape[-1]
+        hist = []
+        for i, slot in enumerate(self.slots):
+            st = self.state[slot, c0 : c0 + C]                          # (C, taps + max_history)
+            h = st[:, :self.taps].T.clone()                             # (taps, C)
+            full = torch.cat([h, x[i].to(st.dtype)], dim = 0)
+            if self.record:
+                n = min(st.shape[-1], full.shape[0])
+                st[:, -n:].copy_(full[-n:].T)
+            else:
+                st[:, :self.taps].copy_(full[-self.taps:].T)
+            hist.append(h)
+        return torch.stack(hist, dim = 0).to(x.dtype)
 
 
 class Inkling2State:
@@ -213,7 +301,7 @@ class Inkling2Attention(Module):
         self.q_chunk = 512
 
         def lin(name, n_out, qm):
-            m = Linear(config, f"{key}.{name}", hidden_size, n_out, qmap = qm, out_dtype = torch.half)
+            m = Linear(config, f"{key}.{name}", hidden_size, n_out, qmap = qm, out_dtype = torch.float)
             self.register_submodule(m)
             return m
 
@@ -234,7 +322,8 @@ class Inkling2Attention(Module):
         self.rel_proj = None
         self.k_conv = None
         self.v_conv = None
-        self.caps.update({"kv_cache": False})
+        self.caps.update({"kv_cache": True})
+        self.cache_layers = []
 
     @override
     def optimizer_targets(self):
@@ -261,11 +350,15 @@ class Inkling2Attention(Module):
         self.rel_proj = _side(c, f"{self.key}.rel_logits_proj.proj", device)
         self.k_conv = {n: _side(c, k, device) for n, k in self._conv_keys("k_sconv").items()}
         self.v_conv = {n: _side(c, k, device) for n, k in self._conv_keys("v_sconv").items()}
+        for cl in self.cache_layers:
+            cl.alloc(device)
 
     @override
     def unload(self):
         self.sink_proj = self.q_scale = self.rel_scale = self.rel_proj = None
         self.k_conv = self.v_conv = None
+        for cl in self.cache_layers:
+            cl.free()
         super().unload()
 
     @override
@@ -313,10 +406,10 @@ class Inkling2Attention(Module):
         return (y + x) / math.sqrt(2 * k + 1)
 
     def project(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, positions: torch.Tensor,
-                params: dict, k_hist = None, v_hist = None):
+                params: dict, ring: Inkling2Ring):
         """
         Returns q (bsz, seq, Hq, D), k / v (bsz, seq, Hkv, D), relative logits (bsz, seq, Hq, rel_extent),
-        sink logits (bsz, seq, Hq), output gate (bsz, seq, Hq * D), and the raw K/V projections (conv inputs)
+        sink logits (bsz, seq, Hq) and output gate (bsz, seq, Hq * D)
         """
         bsz, seq, _ = q_in.shape
         qh = q_in.half().contiguous()
@@ -332,10 +425,15 @@ class Inkling2Attention(Module):
 
         k_raw = self.k_proj.forward(kh, params).float()
         v_raw = self.v_proj.forward(vh, params).float()
+        C = k_raw.shape[-1]
+        k_hist = ring.exchange(0, k_raw)
+        v_hist = ring.exchange(C, v_raw)
         k = self._kv_conv(k_raw, k_in, self.k_conv, k_hist).view(bsz, seq, self.num_kv_heads, self.head_dim)
         v = self._kv_conv(v_raw, v_in, self.v_conv, v_hist).view(bsz, seq, self.num_kv_heads, self.head_dim)
-        k = _l2_clip(k, self.qk_clip)
-        v = _rms(v, self.eps)
+        # K and V take the cache's precision whether or not a cache is attached, so cached and uncached
+        # passes attend over the same values
+        k = _l2_clip(k, self.qk_clip).half()
+        v = _rms(v, self.eps).half()
 
         r = self.r_proj.forward(qh, params).float().view(bsz, seq, self.num_q_heads, self.d_rel)
         r = _l2_clip(r * self.rel_scale, self.rel_clip)
@@ -345,45 +443,58 @@ class Inkling2Attention(Module):
 
         sink = F.linear(q_in.float(), self.sink_proj)                           # (bsz, seq, Hq)
         gate = torch.sigmoid(self.g_proj.forward(qh, params).float())
-        return q, k, v, rel, sink, gate, k_raw, v_raw
+        return q, k, v, rel, sink, gate
 
-    def attend(self, q, rel, sink, k_all, v_all, q_pos: torch.Tensor, k_pos: torch.Tensor) -> torch.Tensor:
+    def attend(self, q, rel, sink, k_all, v_all, q0: int, k0: int) -> torch.Tensor:
         """
-        q: (bsz, Tq, Hq, D), rel: (bsz, Tq, Hq, E), sink: (bsz, Tq, Hq), k_all / v_all: (bsz, Tk, Hkv, D),
-        q_pos: (Tq,) and k_pos: (Tk,) absolute positions (ascending). Returns (bsz, Tq, Hq * D) fp32.
+        q: (bsz, Tq, Hq, D), rel: (bsz, Tq, Hq, E), sink: (bsz, Tq, Hq), k_all / v_all: (bsz, Tk, Hkv, D).
+        Queries sit at absolute positions q0.., keys at k0.. (contiguous). Returns (bsz, Tq, Hq * D) fp32.
         """
         bsz, Tq, Hq, D = q.shape
         Hk, G = self.num_kv_heads, self.gqa
         E = self.rel_extent
+        Tk = k_all.shape[1]
+        W = self.sliding_window
+        # Bound the (heads, queries, keys) logit block of one step to ~64M elements
+        Tk_max = Tk if W is None else min(Tk, W + self.q_chunk)
+        step = max(16, min(self.q_chunk, (1 << 26) // max(1, Hq * Tk_max * bsz)))
         out = []
-        for a in range(0, Tq, self.q_chunk):
-            b = min(a + self.q_chunk, Tq)
-            qp = q_pos[a:b]
+        for a in range(0, Tq, step):
+            b = min(a + step, Tq)
+            n = b - a
             # Keys this chunk can see: up to its last query, and for sliding layers from its first window on
-            hi = int(torch.searchsorted(k_pos, qp[-1], right = True))
-            lo = 0
-            if self.sliding_window is not None:
-                lo = int(torch.searchsorted(k_pos, qp[0] - (self.sliding_window - 1), right = False))
-            kp = k_pos[lo:hi]
+            hi = min(Tk, q0 + b - k0)
+            lo = 0 if W is None else max(0, q0 + a - (W - 1) - k0)
             kc = k_all[:, lo:hi].float()
             vc = v_all[:, lo:hi].float()
-            n = b - a
-            qc = q[:, a:b].reshape(bsz, n, Hk, G, D)
-            logits = torch.einsum("bqhgd,bkhd->bhgqk", qc, kc).reshape(bsz, Hq, n, hi - lo) * self.sm_scale
-            dist = qp[:, None] - kp[None, :]                                     # (n, Tk)
-            in_rel = (dist >= 0) & (dist < E)
-            idx = dist.clamp(0, E - 1).expand(bsz, Hq, n, hi - lo)
-            bias = rel[:, a:b].transpose(1, 2).gather(-1, idx)
-            logits = logits + bias.masked_fill(~in_rel, 0.0)
-            masked = dist < 0
-            if self.sliding_window is not None:
-                masked = masked | (dist >= self.sliding_window)
-            logits = logits.masked_fill(masked, float("-inf"))
+            # Query head h reads KV head h // G
+            qc = q[:, a:b].reshape(bsz, n, Hk, G, D).permute(0, 2, 3, 1, 4).reshape(bsz, Hk, G * n, D)
+            logits = torch.matmul(qc, kc.permute(0, 2, 3, 1)).view(bsz, Hq, n, hi - lo)
+            logits *= self.sm_scale
+            if n == 1 and (W is None or hi - lo <= W) and hi - lo <= E:
+                # One query that sees every gathered key, all within the relative extent: the bias row is
+                # read back to front and nothing is masked
+                d0 = q0 + a - (k0 + hi - 1)                                      # distance to the newest key
+                logits += rel[:, a:b, :, d0 : d0 + hi - lo].flip(-1).transpose(1, 2)
+            else:
+                qp = torch.arange(q0 + a, q0 + b, device = q.device)
+                kp = torch.arange(k0 + lo, k0 + hi, device = q.device)
+                dist = qp[:, None] - kp[None, :]                                 # (n, Tk)
+                in_rel = (dist >= 0) & (dist < E)
+                idx = dist.clamp(0, E - 1).expand(bsz, Hq, n, hi - lo)
+                bias = rel[:, a:b].transpose(1, 2).gather(-1, idx)
+                logits += bias.masked_fill_(~in_rel, 0.0)
+                del bias
+                masked = dist < 0
+                if W is not None:
+                    masked = masked | (dist >= W)
+                logits.masked_fill_(masked, float("-inf"))
             # The sink is one extra logit per query with a zero value: it only absorbs probability mass
             logits = torch.cat([logits, sink[:, a:b].transpose(1, 2).unsqueeze(-1)], dim = -1)
-            p = torch.softmax(logits, dim = -1)[..., :-1].reshape(bsz, Hk, G, n, hi - lo)
-            o = torch.einsum("bhgqk,bkhd->bqhgd", p, vc)
-            out.append(o.reshape(bsz, n, Hq * D))
+            p = torch.softmax(logits, dim = -1)[..., :-1].reshape(bsz, Hk, G * n, hi - lo)
+            del logits
+            o = torch.matmul(p, vc.transpose(1, 2)).view(bsz, Hk, G, n, D)
+            out.append(o.permute(0, 3, 1, 2, 4).reshape(bsz, n, Hq * D))
         return torch.cat(out, dim = 1) if len(out) > 1 else out[0]
 
     def finish(self, o: torch.Tensor, gate: torch.Tensor, params: dict) -> torch.Tensor:
@@ -427,9 +538,9 @@ class Inkling2MoE(Module):
         self.gates, self.ups, self.downs = [], [], []
         for i in range(num_experts):
             g = Linear(config, f"{key}.experts.{i}.gate_proj", hidden_size, intermediate_size,
-                       qmap = qmap and qmap + ".input", out_dtype = torch.half, qgroup = key + ".gate")
+                       qmap = qmap and qmap + ".input", out_dtype = torch.float, qgroup = key + ".gate")
             u = Linear(config, f"{key}.experts.{i}.up_proj", hidden_size, intermediate_size,
-                       qmap = qmap and qmap + ".input", out_dtype = torch.half, qgroup = key + ".up")
+                       qmap = qmap and qmap + ".input", out_dtype = torch.float, qgroup = key + ".up")
             d = Linear(config, f"{key}.experts.{i}.down_proj", intermediate_size, hidden_size,
                        qmap = qmap and qmap + f".e{i}.down", out_dtype = torch.float, qgroup = key + ".down")
             self.gates.append(g); self.ups.append(u); self.downs.append(d)
@@ -481,6 +592,19 @@ class Inkling2MoE(Module):
         xh = x.half()
         y = torch.zeros_like(x, dtype = torch.float)
         cg, cu = self.gate_softcap, self.up_softcap
+        if x.shape[0] <= 4:
+            # Decode: one host sync for the routing, then each (row, expert) pair on its own
+            for r, experts in enumerate(idx.tolist()):
+                xe = xh[r:r + 1].unsqueeze(0)
+                g = torch.cat([self.gates[e].forward(xe, params) for e in experts], dim = 1)     # (1, k, I)
+                u = torch.cat([self.ups[e].forward(xe, params) for e in experts], dim = 1)
+                a = (torch.tanh(g / cg) * cg * torch.sigmoid(g) * torch.tanh(u / cu) * cu).half()
+                d = torch.cat([
+                    self.downs[e].forward(a[:, i : i + 1].contiguous(), params, out_dtype = torch.float)
+                    for i, e in enumerate(experts)
+                ], dim = 1)
+                y[r] = torch.matmul(w[r], d[0])
+            return y.view(shape)
         # One host sync for the set of routed experts, ascending order
         for e in torch.unique(idx).tolist():
             rows, slot = torch.where(idx == e)
@@ -551,6 +675,14 @@ class Inkling2Block(Module):
         self.queries = None
         self.msg_query = None
 
+        # Conv history channels: [K projection | V projection | attention output | MLP output]
+        self.kv_channels = attn.num_kv_heads * attn.head_dim
+        self.ring_channels = 2 * self.kv_channels + 2 * hidden_size
+        self.caps.update({"recurrent_cache": True})
+        self.layer_state_cls = Inkling2ConvLayerState
+        self.recurrent_layers = []
+        self.tp_recurrent_lookup = {}
+
     @override
     def optimizer_targets(self):
         return [self.attn.optimizer_targets(), self.mlp.optimizer_targets()]
@@ -570,13 +702,25 @@ class Inkling2Block(Module):
             qm = _side(c, self.msg_keys[0], device).view(-1, 2, self.hidden_size)[i]
             kv = _side(c, self.msg_keys[1], device).view(-1, 2, self.hidden_size)[i]
             self.msg_query = torch.stack([qm[0], kv[0], kv[1], qm[1]], dim = 0).contiguous()
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
 
     @override
     def unload(self):
         self.norms = self.convs = self.queries = self.msg_query = None
         for g in self.gates.values():
             g.unload()
+        for rl in self.recurrent_layers:
+            rl.free()
         super().unload()
+
+    def _ring(self, params: dict, instance: int) -> Inkling2Ring:
+        rsg = params.get("recurrent_states")
+        if not rsg:
+            return Inkling2Ring(None, None, False, self.ksize - 1)
+        (state,) = rsg[0].cache.get_recurrent_layer((self.layer_idx, instance)).get_state_tensors()
+        slots = [r.slot for r in rsg]
+        return Inkling2Ring(state, slots, bool(params.get("recurrent_history")), self.ksize - 1)
 
     @override
     def get_tensors(self):
@@ -651,8 +795,9 @@ class Inkling2Block(Module):
         else:
             q_in = k_in = v_in = self._norm(h[0], "q")
 
-        a = self.attention(q_in, k_in, v_in, params, instance)
-        a = self._sconv(a, "attn", None)
+        ring = self._ring(params, instance)
+        a = self.attention(q_in, k_in, v_in, params, instance, ring)
+        a = self._sconv(a, "attn", ring.exchange(2 * self.kv_channels, a))
 
         if self.is_block_boundary:
             st.block_states = st.block_states + [block_residual]
@@ -664,20 +809,48 @@ class Inkling2Block(Module):
         if messages is not None:
             m = self.gates["mlp"](m, messages[..., 3, :])
         m = self.mlp.forward(self._norm(m, "mlp"), params)
-        m = self._sconv(m, "mlp", None)
+        m = self._sconv(m, "mlp", ring.exchange(2 * self.kv_channels + self.hidden_size, m))
         return residual + m
 
-    def attention(self, q_in, k_in, v_in, params: dict, instance: int) -> torch.Tensor:
+    def attention(self, q_in, k_in, v_in, params: dict, instance: int, ring: Inkling2Ring) -> torch.Tensor:
         attn = self.attn
         bsz, seq, _ = q_in.shape
-        mode = params.get("attn_mode", "flash_attn_nc")
-        if mode != "flash_attn_nc":
-            raise NotImplementedError("Inkling2Loop: cached attention is not implemented yet")
-        pos0 = params.get("position", 0) or 0
-        pos = torch.arange(pos0, pos0 + seq, device = q_in.device)
-        positions = pos.unsqueeze(0).expand(bsz, -1)
-        q, k, v, rel, sink, gate, _, _ = attn.project(q_in, k_in, v_in, positions, params)
-        o = attn.attend(q, rel, sink, k, v, pos, pos)
+        dev = q_in.device
+        cache = params.get("cache")
+
+        if cache is None:
+            pos0 = params.get("position", 0) or 0
+            pos = torch.arange(pos0, pos0 + seq, device = dev)
+            q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, pos.unsqueeze(0).expand(bsz, -1), params, ring)
+            o = attn.attend(q, rel, sink, k, v, pos0, pos0)
+            return attn.finish(o, gate, params)
+
+        # Paged cache: the new K/V rows go to positions cache_seqlens.. of each sequence's pages, then every
+        # sequence attends over its own pages (all of them, or the ones its window reaches)
+        block_table = params["block_table"]
+        past = [int(p) for p in params["cache_seqlens"].tolist()]
+        ar = torch.arange(seq, device = dev)
+        positions = torch.tensor(past, device = dev).unsqueeze(1) + ar.unsqueeze(0)
+        q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, positions, params, ring)
+
+        kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], block_table, instance = instance)
+        bt = block_table.to(kc.device).long()
+        outs = []
+        for i in range(bsz):
+            pos = positions[i].to(kc.device)
+            page, off = bt[i][pos // PAGE_SIZE], pos % PAGE_SIZE
+            kc[page, off] = k[i].to(kc.device)
+            vc[page, off] = v[i].to(kc.device)
+            end = past[i] + seq
+            lo = 0 if attn.sliding_window is None else max(0, past[i] - (attn.sliding_window - 1))
+            p0, p1 = lo // PAGE_SIZE, (end - 1) // PAGE_SIZE + 1
+            a, b = lo - p0 * PAGE_SIZE, end - p0 * PAGE_SIZE
+            pages = bt[i, p0:p1]
+            k_all = kc[pages].view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
+            v_all = vc[pages].view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
+            outs.append(attn.attend(q[i:i+1], rel[i:i+1], sink[i:i+1], k_all, v_all, past[i], lo))
+        cache.update_layer(self.layer_idx, params["cache_seqlens"], block_table, kc, vc, seq, instance)
+        o = torch.cat(outs, dim = 0) if bsz > 1 else outs[0]
         return attn.finish(o, gate, params)
 
 
