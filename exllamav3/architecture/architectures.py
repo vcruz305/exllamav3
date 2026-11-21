@@ -34,6 +34,7 @@ from .iquestcoder import IQuestCoderModel
 from .kimi_linear import KimiLinearModel
 from .k2_horizon import K2HorizonModel
 from .bailing_hybrid import BailingHybridModel
+from .inkling2_loop import Inkling2LoopModel
 from .laguna import LagunaModel
 from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
@@ -114,6 +115,7 @@ ARCHITECTURES = {
         HyV3Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        Inkling2LoopModel,
         LagunaModel,
         Lfm2Model,
         Lfm2MoeModel,
