@@ -61,10 +61,12 @@ struct BC_BlockSparseMLP
     bool act_gelu;
     bool act_silu_oai;
     bool act_relu2;     // non-gated relu2 (NemotronH): no gate projections, act on up alone
+    bool act_softcap;   // silu_softcap (Inkling-2): fused decode path only; caps in act_limit / act_limit2
     bool gated;         // derived: false when the gates vector is empty
     std::shared_ptr<BC_GatedMLP> shared_experts;
     std::shared_ptr<BC_LinearFP16> shared_gate;
     float act_limit;
+    float act_limit2;   // up cap of silu_softcap (act_limit is the gate cap)
     std::vector<std::shared_ptr<BC_LinearEXL3>> gates;
     std::vector<std::shared_ptr<BC_LinearEXL3>> ups;
     std::vector<std::shared_ptr<BC_LinearEXL3>> downs;
@@ -168,7 +170,9 @@ struct BC_BlockSparseMLP
         c10::optional<at::Tensor> _up_bias_ptrs,
         c10::optional<at::Tensor> _down_bias_ptrs,
         bool _act_relu2 = false,
-        bool _sh_coop = false
+        bool _sh_coop = false,
+        float _act_limit2 = 0.0f,
+        bool _act_softcap = false
     );
 
     void run_bszN

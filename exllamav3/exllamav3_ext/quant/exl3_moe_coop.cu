@@ -207,7 +207,8 @@ MoeCoopParams exl3_moe_coop_prepare
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_gate_w,
-    float& K_gu, float& K_d, int& cb
+    float& K_gu, float& K_d, int& cb,
+    float act_limit2
 )
 {
     TORCH_CHECK_DTYPE(ctr, kInt);
@@ -217,7 +218,11 @@ MoeCoopParams exl3_moe_coop_prepare
     TORCH_CHECK(!(mcg && mul1), "exl3_moe_coop: specified both mcg and mul1");
     TORCH_CHECK(Kg >= 1 && Kg <= 8 && Ku >= 1 && Ku <= 8 && Kd >= 1 && Kd <= 8, "exl3_moe_coop: K out of range");
     TORCH_CHECK(!gated || Kg == Ku, "exl3_moe_coop: gate and up must share a bit width");
-    TORCH_CHECK(act >= 0 && act <= 3, "exl3_moe_coop: unknown activation");
+    TORCH_CHECK(act >= 0 && act <= MOE_COOP_ACT_SILU_SOFTCAP, "exl3_moe_coop: unknown activation");
+    // silu_softcap is a gated activation whose two caps travel as act_limit (gate) and act_limit2 (up);
+    // a missing cap would divide by zero, so decline rather than run it
+    TORCH_CHECK(act != MOE_COOP_ACT_SILU_SOFTCAP || (gated && act_limit > 0.0f && act_limit2 > 0.0f),
+                "exl3_moe_coop: silu_softcap needs gated experts and positive caps");
 
     MoeCoopParams p = {};
     p.Hi = Hi;
@@ -278,7 +283,7 @@ MoeCoopParams exl3_moe_coop_prepare
     p.n_local = (int) u_trellis.size(0);
     p.act = act;
     p.act_limit = act_limit;
-    p.act_limit2 = 0.0f;
+    p.act_limit2 = act_limit2;
     p.gated = gated;
 
     p.had_g = (half*) had_g.data_ptr();

@@ -110,7 +110,8 @@ MoeCoopParams exl3_moe_coop_prepare
     at::Tensor& ctr,
     at::Tensor& out,
     const c10::optional<at::Tensor>& sh_gate_w,
-    float& K_gu, float& K_d, int& cb
+    float& K_gu, float& K_d, int& cb,
+    float act_limit2 = 0.0f          // MOE_COOP_ACT_SILU_SOFTCAP only: the up cap (act_limit is the gate cap)
 );
 
 // Per-call part: input rows, routing, optional shared-expert output (bsz rows, width H), launch

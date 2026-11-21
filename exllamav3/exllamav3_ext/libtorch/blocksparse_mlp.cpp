@@ -219,7 +219,9 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
     bool _act_relu2,
-    bool _sh_coop
+    bool _sh_coop,
+    float _act_limit2,
+    bool _act_softcap
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -259,9 +261,11 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         act_gelu            (_act_gelu),
         act_silu_oai        (_act_silu_oai),
         act_relu2           (_act_relu2),
+        act_softcap         (_act_softcap),
         shared_experts      (_shared_experts),
         shared_gate         (_shared_gate),
         act_limit           (_act_limit),
+        act_limit2          (_act_limit2),
         gates               (_gates),
         ups                 (_ups),
         downs               (_downs),
@@ -300,7 +304,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
 
     // Static part of the fused decode kernels' parameters, validated once
     {
-        int act = act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
+        int act = act_softcap ? MOE_COOP_ACT_SILU_SOFTCAP :
+                  act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
                   act_gelu ? MOE_COOP_ACT_GELU :
                   act_relu2 ? MOE_COOP_ACT_RELU2 :
                   MOE_COOP_ACT_SILU;
@@ -317,7 +322,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
             up_mcg, up_mul1,
             act, act_limit, gated,
             yh, had_u, interm_g, interm_u, interm_a, out_d, coop_ctr, out_bszn,
-            sh_w, coop_K_gu, coop_K_d, coop_cb
+            sh_w, coop_K_gu, coop_K_d, coop_cb, act_limit2
         );
         coop_p.min_expert = min_expert;
         coop_p.max_expert = max_expert;
@@ -441,6 +446,7 @@ void BC_BlockSparseMLP::run_single_expert_gr
     Graph* graph
 )
 {
+    TORCH_CHECK(!act_softcap, "BC_BlockSparseMLP: silu_softcap runs only on the fused decode path (run_bszN)");
     int bsz = y.size(0);
 
     at::Tensor ai = interm_a2.slice(0, 0, bsz);
@@ -518,6 +524,7 @@ void BC_BlockSparseMLP::run_single_expert
     const int expert_idx
 )
 {
+    TORCH_CHECK(!act_softcap, "BC_BlockSparseMLP: silu_softcap runs only on the fused decode path (run_bszN)");
     int bsz = y.size(0);
     TORCH_CHECK(bsz <= TEMP_ROWS_GRAPH);
     int graphidx = bsz - 1;
@@ -574,6 +581,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
     at::Tensor& out
 )
 {
+    TORCH_CHECK(!act_softcap, "BC_BlockSparseMLP: silu_softcap runs only on the fused decode path (run_bszN)");
     int bsz = y.size(0);
 
     at::Tensor yh1 = yh.slice(0, 0, bsz);
