@@ -86,6 +86,8 @@ def _exl3_bc(lin, name: str):
 _TOKEN = os.environ.get("INKLING2_TOKEN", "1") != "0"
 # exl3_mlin for the q, r, g, k, v projections of the token step (rounding-level change vs the per-linear BC path)
 _MLIN_TOK = os.environ.get("INKLING2_TOK_MLIN", "1") != "0"
+# CUDA-graph replay of the token step (per record flag); INKLING2_GRAPH=0 runs the same step eagerly
+_GRAPH = os.environ.get("INKLING2_GRAPH", "1") != "0"
 # Call arguments that select the general path (capture, overrides, reconstruct, all-expert or sensitivity passes)
 _TOKEN_BLOCKERS = ("capture", "capture_qmaps", "capture_sens", "ovr", "reconstruct", "activate_all_experts",
                    "autosplit_measure", "tp_warmup")
@@ -292,6 +294,8 @@ class Inkling2LoopModel(Model):
         self._tok_key = None
         self._tok_disabled = False
         self.tok_steps = 0          # decode tokens served by ext.InkToken (fast-path hit count)
+        self.graph_captures = 0     # CUDA graphs captured for the token step
+        self._gkey, self._graphs, self._gwarm = None, {}, {}
         c = config
 
         self.modules += [
@@ -416,7 +420,29 @@ class Inkling2LoopModel(Model):
             slot = params["recurrent_states"][0].slot
             record = bool(params.get("recurrent_history"))
             self.tok_steps += 1
-            return self._tok.step(int(x.reshape(-1)[0]), pos, base_page, slot, record)
+            tok_id = int(x.reshape(-1)[0])
+            if not _GRAPH:
+                return self._tok.step(tok_id, pos, base_page, slot, record)
+            # CUDA graph: per-token values go through the device buffers (update), the captured step reads them.
+            gk = (id(self._tok), slot)
+            if self._gkey != gk:
+                self._gkey, self._graphs, self._gwarm = gk, {}, {}
+            self._tok.update(tok_id, pos, base_page, slot)
+            if record in self._graphs:
+                g, out = self._graphs[record]
+                g.replay()
+                return out.clone()
+            n = self._gwarm.get(record, 0)
+            if n < 2:                       # eager steps first: cuBLAS handles and allocator state before capture
+                self._gwarm[record] = n + 1
+                return self._tok.step_dev(record).clone()
+            g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes this token once
+            with torch.cuda.graph(g):
+                out = self._tok.step_dev(record)
+            g.replay()
+            self._graphs[record] = (g, out)
+            self.graph_captures += 1
+            return out.clone()
         return super().forward_ls(x, params)
 
     @override
