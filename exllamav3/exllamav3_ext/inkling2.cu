@@ -139,6 +139,120 @@ __global__ void __launch_bounds__(256) ink_attn_res_kernel(
     }
 }
 
+// Two launches, spread over H / 512 blocks of 128 threads (one thread per 4 channels). Every source's float4 is loaded
+// up front (one memory round trip per phase, not one per source). Same math as ink_attn_res_kernel (sums in another
+// order). Needs H % 4 == 0 and 16-byte aligned sources; other shapes take the generic kernel.
+#define INK_ARBS 128                       // threads per block of the attention-residual kernels
+#define INK_ACC (INK_MAXS * INK_MAXQ + INK_MAXS)   // 80: dot products at [j * 4 + q], sums of squares at [64 + j]
+
+// partial[b][i] = sum over the block's channels of the NACC products (block b covers channels b * 512 .. + 512)
+__global__ void __launch_bounds__(INK_ARBS) ink_attn_res_part_kernel(
+    InkSrcs srcs, int S, int NQ, int H4, const float* __restrict__ qT, float* __restrict__ partial)
+{
+    __shared__ float wsum[INK_ARBS / 32][INK_ACC];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int d4 = blockIdx.x * INK_ARBS + tid;
+    const bool ok = d4 < H4;
+    const int dd = ok ? d4 : 0;
+    const float valid = ok ? 1.f : 0.f;
+
+    float4 xv[INK_MAXS];
+    #pragma unroll
+    for (int j = 0; j < INK_MAXS; ++j)
+        xv[j] = j < S ? reinterpret_cast<const float4*>(srcs.p[j])[dd] : make_float4(0.f, 0.f, 0.f, 0.f);
+    float qv[INK_MAXQ][4];
+    #pragma unroll
+    for (int q = 0; q < INK_MAXQ; ++q)
+        #pragma unroll
+        for (int c = 0; c < 4; ++c) qv[q][c] = (q < NQ) ? qT[(4 * dd + c) * NQ + q] * valid : 0.f;
+
+    float acc[INK_ACC];
+    #pragma unroll
+    for (int i = 0; i < INK_ACC; ++i) acc[i] = 0.f;
+    #pragma unroll
+    for (int j = 0; j < INK_MAXS; ++j) {
+        if (j < S) {
+            const float4 x = xv[j];
+            const float4 xm = make_float4(x.x * valid, x.y * valid, x.z * valid, x.w * valid);
+            acc[INK_MAXS * INK_MAXQ + j] = xm.x * xm.x + xm.y * xm.y + xm.z * xm.z + xm.w * xm.w;
+            #pragma unroll
+            for (int q = 0; q < INK_MAXQ; ++q)
+                if (q < NQ) acc[j * INK_MAXQ + q] = xm.x * qv[q][0] + xm.y * qv[q][1] + xm.z * qv[q][2] + xm.w * qv[q][3];
+        }
+    }
+    // step-major butterfly: the reductions are independent, so each round issues them back to back
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        #pragma unroll
+        for (int i = 0; i < INK_ACC; ++i) acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], o);
+    if (lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < INK_ACC; ++i) wsum[warp][i] = acc[i];
+    }
+    __syncthreads();
+    if (tid < INK_ACC) {
+        float s = 0.f;
+        #pragma unroll
+        for (int w = 0; w < INK_ARBS / 32; ++w) s += wsum[w][tid];
+        partial[blockIdx.x * INK_ACC + tid] = s;
+    }
+}
+
+// Finish: every block reduces the partials, computes the softmax weights (warp q = query q, lane j = source j) and
+// writes its 128 channel groups: out[q][d] = sum_j w_jq rs_j x_j[d].
+__global__ void __launch_bounds__(INK_ARBS) ink_attn_res_fin_kernel(
+    InkSrcs srcs, int S, int NQ, int H, int H4, int nblk, const float* __restrict__ partial, float eps,
+    float* __restrict__ out)
+{
+    __shared__ float red[INK_ACC];
+    __shared__ float rs[INK_MAXS];
+    __shared__ float coef[INK_MAXQ][INK_MAXS];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int d4 = blockIdx.x * INK_ARBS + tid;
+    float4 xv[INK_MAXS];
+    #pragma unroll
+    for (int j = 0; j < INK_MAXS; ++j)
+        xv[j] = (j < S && d4 < H4) ? reinterpret_cast<const float4*>(srcs.p[j])[d4] : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (tid < INK_ACC) {
+        float s = 0.f;
+        for (int b = 0; b < nblk; ++b) s += partial[b * INK_ACC + tid];
+        red[tid] = s;
+    }
+    __syncthreads();
+    if (tid < S) rs[tid] = rsqrtf(red[INK_MAXS * INK_MAXQ + tid] / (float)H + eps);
+    __syncthreads();
+    if (warp < NQ) {
+        // softmax over the sources of query `warp`: logits rs_j * dot_jq
+        const bool in = lane < S;
+        const float s = in ? rs[lane] * red[lane * INK_MAXQ + warp] : -INFINITY;
+        float m = s;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float e = in ? expf(s - m) : 0.f;
+        float den = e;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) den += __shfl_xor_sync(0xffffffffu, den, o);
+        if (in) coef[warp][lane] = e / den * rs[lane];
+    }
+    __syncthreads();
+    if (d4 < H4) {
+        #pragma unroll
+        for (int q = 0; q < INK_MAXQ; ++q) {
+            if (q < NQ) {
+                float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+                #pragma unroll
+                for (int j = 0; j < INK_MAXS; ++j) {
+                    if (j < S) {
+                        const float cf = coef[q][j];
+                        o.x += cf * xv[j].x; o.y += cf * xv[j].y; o.z += cf * xv[j].z; o.w += cf * xv[j].w;
+                    }
+                }
+                reinterpret_cast<float4*>(out + q * H)[d4] = o;
+            }
+        }
+    }
+}
+
 at::Tensor ink_attn_res(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
 {
     const int S = (int)srcs.size();
@@ -147,15 +261,28 @@ at::Tensor ink_attn_res(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
     const int H = (int)qT.size(0), NQ = (int)qT.size(1);
     const at::cuda::OptionalCUDAGuard guard(qT.device());
     InkSrcs a;
+    bool aligned = true;
     for (int j = 0; j < S; ++j) {
         TORCH_CHECK(srcs[j].scalar_type() == at::kFloat && srcs[j].is_contiguous() && srcs[j].numel() == H,
                     "ink_attn_res: sources must be contiguous fp32 vectors of H");
         a.p[j] = srcs[j].data_ptr<float>();
+        aligned = aligned && (((uintptr_t)a.p[j]) % 16 == 0);
     }
     TORCH_CHECK(qT.scalar_type() == at::kFloat && qT.is_contiguous(), "ink_attn_res: qT must be contiguous fp32");
     auto out = at::empty({NQ, H}, qT.options());
-    ink_attn_res_kernel<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        a, S, NQ, H, qT.data_ptr<float>(), (float)eps, out.data_ptr<float>());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (H % 4 == 0 && aligned) {
+        const int H4 = H / 4;
+        const int nblk = (H4 + INK_ARBS - 1) / INK_ARBS;
+        auto partial = at::empty({nblk, INK_ACC}, qT.options());
+        ink_attn_res_part_kernel<<<nblk, INK_ARBS, 0, stream>>>(
+            a, S, NQ, H4, qT.data_ptr<float>(), partial.data_ptr<float>());
+        ink_attn_res_fin_kernel<<<nblk, INK_ARBS, 0, stream>>>(
+            a, S, NQ, H, H4, nblk, partial.data_ptr<float>(), (float)eps, out.data_ptr<float>());
+    } else {
+        ink_attn_res_kernel<<<1, 256, 0, stream>>>(
+            a, S, NQ, H, qT.data_ptr<float>(), (float)eps, out.data_ptr<float>());
+    }
     return out;
 }
 
@@ -164,52 +291,131 @@ at::Tensor ink_attn_res(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
 //   z = [rms(x), rms(m)] (2H), g = z @ down_g (R), t = tanh(g @ up_g) (2H), out = (1 - t[:H]) * x + t[H:] * m
 // gd: (4, 2H, R) row-major, gu: (4, R, 2H) row-major.
 // ---------------------------------------------------------------------------------------------------------------------
-__global__ void __launch_bounds__(1024) ink_gates_kernel(
+// Two launches, both spread over the GPU (the old one-block-per-gate kernel was latency-bound: serial strided loads):
+//   ink_gate_down_kernel: grid (2H / 128 row chunks, G). Normalizes z = [rms(x), rms(m)] (block reductions over H), then
+//                         each block contracts its 128 rows of gd into a partial g (R values) -> part[G][NSPL][R].
+//   ink_gate_out_kernel:  grid (H / 64, G). Sums the partials into g (R values), computes t = tanh(g @ gu) for the 64
+//                         forget and the 64 gain columns of its h range, and writes out[h] = (1 - t_f) x + t_g m.
+#define INK_GRC 128        // rows of the 2H gate-down matrix per partial block
+#define INK_GHW 64         // output h columns per block of the second gate kernel
+
+__global__ void __launch_bounds__(256) ink_gate_down_kernel(
     const float* __restrict__ X, long long xs, const float* __restrict__ M, long long ms,
-    const float* __restrict__ gd, const float* __restrict__ gu, int first, int H, int R, float eps,
-    float* __restrict__ out)
+    const float* __restrict__ gd, int first, int H, int R, int NSPL, float eps, float* __restrict__ part)
 {
-    extern __shared__ float z[];                    // 2H: normalized [x | m], then t = tanh(...)
-    __shared__ float red[32];
-    __shared__ float gp[1024];
-    __shared__ float gv[INK_MAXG];
-    const int g = blockIdx.x, gi = first + g, tid = threadIdx.x;
+    __shared__ float red[2][32];
+    __shared__ float zs[INK_GRC];
+    __shared__ float sw[8][INK_MAXG];
+    const int c = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
     const float* x = X + g * xs;
     const float* m = M + g * ms;
     float sx = 0.f, sm = 0.f;
-    for (int i = tid; i < H; i += blockDim.x) { sx += x[i] * x[i]; sm += m[i] * m[i]; }
-    sx = ink_block_sum(sx, red);
-    sm = ink_block_sum(sm, red);
+    if (H <= 9 * 256) {
+        // loads first (one memory round trip), then the sums
+        float xa[9], ma[9];
+        #pragma unroll
+        for (int t = 0; t < 9; ++t) {
+            const int i = tid + t * 256;
+            xa[t] = i < H ? x[i] : 0.f;
+            ma[t] = i < H ? m[i] : 0.f;
+        }
+        #pragma unroll
+        for (int t = 0; t < 9; ++t) { sx += xa[t] * xa[t]; sm += ma[t] * ma[t]; }
+    } else {
+        for (int i = tid; i < H; i += blockDim.x) { const float a = x[i], b = m[i]; sx += a * a; sm += b * b; }
+    }
+    sx = ink_block_sum(sx, red[0]);
+    sm = ink_block_sum(sm, red[1]);
     const float rx = rsqrtf(sx / (float)H + eps), rm = rsqrtf(sm / (float)H + eps);
-    for (int i = tid; i < H; i += blockDim.x) { z[i] = x[i] * rx; z[H + i] = m[i] * rm; }
+    const int k0 = c * INK_GRC;
+    if (tid < INK_GRC) {
+        const int k = k0 + tid;
+        zs[tid] = k >= 2 * H ? 0.f : (k < H ? x[k] * rx : m[k - H] * rm);
+    }
     __syncthreads();
 
-    // g_r = sum_k z[k] * gd[gi, k, r]: nparts threads per rank, each over a strided slice of k
-    const float* W1 = gd + (size_t)gi * 2 * H * R;
-    const int nparts = blockDim.x / R;
-    if (tid < nparts * R) {
-        const int r = tid % R, part = tid / R;
-        float a = 0.f;
-        for (int k = part; k < 2 * H; k += nparts) a += z[k] * W1[(size_t)k * R + r];
-        gp[part * R + r] = a;
+    // thread (r4, kk): float4 of ranks 4 r4 .. 4 r4 + 3 for rows kk, kk + per, ...
+    const int R4 = R / 4, per = blockDim.x / R4;
+    const int r4 = tid % R4, kk = tid / R4;
+    const float* W = gd + (size_t)(first + g) * 2 * H * R;
+    float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int kl = kk; kl < INK_GRC; kl += per) {
+        const int k = k0 + kl;
+        if (k < 2 * H) {
+            const float z = zs[kl];
+            const float4 w = reinterpret_cast<const float4*>(W + (size_t)k * R)[r4];
+            a.x += z * w.x; a.y += z * w.y; a.z += z * w.z; a.w += z * w.w;
+        }
+    }
+    const int lane = tid & 31, warp = tid >> 5;
+    for (int o = R4; o < 32; o <<= 1) {
+        a.x += __shfl_xor_sync(0xffffffffu, a.x, o);
+        a.y += __shfl_xor_sync(0xffffffffu, a.y, o);
+        a.z += __shfl_xor_sync(0xffffffffu, a.z, o);
+        a.w += __shfl_xor_sync(0xffffffffu, a.w, o);
+    }
+    if (lane < R4) {
+        sw[warp][4 * lane + 0] = a.x;
+        sw[warp][4 * lane + 1] = a.y;
+        sw[warp][4 * lane + 2] = a.z;
+        sw[warp][4 * lane + 3] = a.w;
     }
     __syncthreads();
     if (tid < R) {
         float s = 0.f;
-        for (int p = 0; p < nparts; ++p) s += gp[p * R + tid];
+        for (int w = 0; w < (int)(blockDim.x >> 5); ++w) s += sw[w][tid];
+        part[((size_t)g * NSPL + c) * R + tid] = s;
+    }
+}
+
+__global__ void __launch_bounds__(256) ink_gate_out_kernel(
+    const float* __restrict__ X, long long xs, const float* __restrict__ M, long long ms,
+    const float* __restrict__ gu, const float* __restrict__ part, int first, int H, int R, int NSPL,
+    float* __restrict__ out)
+{
+    __shared__ float pz[16][INK_MAXG];
+    __shared__ float gv[INK_MAXG];
+    __shared__ float sm2[2][2 * INK_GHW];
+    __shared__ float tv[2 * INK_GHW];
+    const int g = blockIdx.y, a0 = blockIdx.x * INK_GHW, tid = threadIdx.x;
+
+    // g_r = sum over the NSPL partials (16 groups of partials, then the groups)
+    for (int idx = tid; idx < 16 * R; idx += blockDim.x) {
+        const int r = idx % R, grp = idx / R;
+        float s = 0.f;
+        #pragma unroll 4
+        for (int c = grp; c < NSPL; c += 16) s += part[((size_t)g * NSPL + c) * R + r];
+        pz[grp][r] = s;
+    }
+    __syncthreads();
+    if (tid < R) {
+        float s = 0.f;
+        for (int q = 0; q < 16; ++q) s += pz[q][tid];
         gv[tid] = s;
     }
     __syncthreads();
-    // t_n = tanh(sum_r g_r * gu[gi, r, n]) for n < 2H; z is no longer read
-    const float* W2 = gu + (size_t)gi * R * 2 * H;
-    for (int n = tid; n < 2 * H; n += blockDim.x) {
-        float s = 0.f;
-        for (int r = 0; r < R; ++r) s += gv[r] * W2[(size_t)r * 2 * H + n];
-        z[n] = tanhf(s);
-    }
+
+    // t_n = tanh(sum_r g_r gu[gi, r, n]); thread (j, rh) sums the rows of half rh; j < 64 forget at h = a0 + j,
+    // j >= 64 gain at h = a0 + j - 64
+    const int j = tid & (2 * INK_GHW - 1), rh = tid / (2 * INK_GHW);
+    const int hh = a0 + (j & (INK_GHW - 1));
+    const int n = (j < INK_GHW ? 0 : H) + (hh < H ? hh : 0);
+    const float* W2 = gu + (size_t)(first + g) * R * 2 * H;
+    const int RH = R / 2;
+    float s = 0.f;
+    #pragma unroll 8
+    for (int r = rh * RH; r < rh * RH + RH; ++r) s += gv[r] * W2[(size_t)r * 2 * H + n];
+    sm2[rh][j] = s;
     __syncthreads();
-    for (int h = tid; h < H; h += blockDim.x)
-        out[g * H + h] = (1.f - z[h]) * x[h] + z[H + h] * m[h];
+    if (tid < 2 * INK_GHW) tv[tid] = tanhf(sm2[0][tid] + sm2[1][tid]);
+    __syncthreads();
+    if (tid < INK_GHW) {
+        const int h = a0 + tid;
+        if (h < H) {
+            const float x = X[g * xs + h], m = M[g * ms + h];
+            out[g * H + h] = (1.f - tv[tid]) * x + tv[INK_GHW + tid] * m;
+        }
+    }
 }
 
 at::Tensor ink_gates(at::Tensor X, at::Tensor M, at::Tensor gd, at::Tensor gu, int64_t first, int64_t G, double eps)
@@ -217,15 +423,22 @@ at::Tensor ink_gates(at::Tensor X, at::Tensor M, at::Tensor gd, at::Tensor gu, i
     const int H = (int)X.size(1), R = (int)gd.size(2);
     TORCH_CHECK(X.dim() == 2 && M.dim() == 2 && X.size(0) == G && M.size(0) == G, "ink_gates: X, M (G, H)");
     TORCH_CHECK(X.stride(1) == 1 && M.stride(1) == 1, "ink_gates: rows must be unit-stride");
-    TORCH_CHECK(R >= 1 && R <= INK_MAXG && 1024 % R == 0, "ink_gates: rank must divide 1024 and be <= 64");
+    TORCH_CHECK(R >= 4 && R <= INK_MAXG && R % 4 == 0 && (R & (R - 1)) == 0, "ink_gates: rank a power of two in [4, 64]");
     TORCH_CHECK(gd.size(1) == 2 * H && gu.size(1) == R && gu.size(2) == 2 * H, "ink_gates: weight shapes");
     TORCH_CHECK(X.scalar_type() == at::kFloat && M.scalar_type() == at::kFloat && gd.is_contiguous() && gu.is_contiguous()
                 && gd.scalar_type() == at::kFloat && gu.scalar_type() == at::kFloat, "ink_gates: fp32 contiguous");
+    TORCH_CHECK(first >= 0 && first + G <= gd.size(0), "ink_gates: gate range");
     const at::cuda::OptionalCUDAGuard guard(X.device());
+    const int NSPL = (2 * H + INK_GRC - 1) / INK_GRC;
+    auto part = at::empty({G, NSPL, R}, X.options());
     auto out = at::empty({G, H}, X.options());
-    ink_gates_kernel<<<(unsigned)G, 1024, 2 * H * sizeof(float), at::cuda::getCurrentCUDAStream()>>>(
-        X.data_ptr<float>(), X.stride(0), M.data_ptr<float>(), M.stride(0), gd.data_ptr<float>(), gu.data_ptr<float>(),
-        (int)first, H, R, (float)eps, out.data_ptr<float>());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    ink_gate_down_kernel<<<dim3(NSPL, (unsigned)G), 256, 0, stream>>>(
+        X.data_ptr<float>(), X.stride(0), M.data_ptr<float>(), M.stride(0), gd.data_ptr<float>(),
+        (int)first, H, R, NSPL, (float)eps, part.data_ptr<float>());
+    ink_gate_out_kernel<<<dim3((H + INK_GHW - 1) / INK_GHW, (unsigned)G), 256, 0, stream>>>(
+        X.data_ptr<float>(), X.stride(0), M.data_ptr<float>(), M.stride(0), gu.data_ptr<float>(),
+        part.data_ptr<float>(), (int)first, H, R, NSPL, out.data_ptr<float>());
     return out;
 }
 
@@ -312,7 +525,19 @@ __global__ void __launch_bounds__(256) ink_q_glue_kernel(
         gate_out[idx] = 1.f / (1.f + expf(-g_f[idx]));
     }
     float s = 0.f;
-    for (int k = tid; k < H; k += blockDim.x) s += q_in[k] * sink_w[h * H + k];
+    if (H <= 9 * 256) {
+        float qa[9], wa[9];
+        #pragma unroll
+        for (int t = 0; t < 9; ++t) {
+            const int k = tid + t * 256;
+            qa[t] = k < H ? q_in[k] : 0.f;
+            wa[t] = k < H ? sink_w[h * H + k] : 0.f;
+        }
+        #pragma unroll
+        for (int t = 0; t < 9; ++t) s += qa[t] * wa[t];
+    } else {
+        for (int k = tid; k < H; k += blockDim.x) s += q_in[k] * sink_w[h * H + k];
+    }
     s = ink_block_sum(s, red);
     if (tid == 0) sink_out[h] = s;
 
@@ -324,6 +549,7 @@ __global__ void __launch_bounds__(256) ink_q_glue_kernel(
     __syncthreads();
     for (int e = tid; e < E; e += blockDim.x) {
         float a = 0.f;
+        #pragma unroll 8
         for (int d = 0; d < R; ++d) a += rsm[d] * rel_proj[d * E + e];
         rel_out[h * E + e] = a;
     }
@@ -381,6 +607,7 @@ __global__ void __launch_bounds__(128) ink_kv_glue_kernel(
         float a[INK_MAXK];
         #pragma unroll
         for (int t = 0; t < INK_MAXK; ++t) a[t] = 0.f;
+        #pragma unroll 6
         for (int i = d; i < H; i += blockDim.x) {
             const float x = in[i];
             #pragma unroll
@@ -445,96 +672,169 @@ void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k
 // head: logits = scale * <q, k> + rel[L - 1 - j] (distance < E), softmax with the sink logit (value 0), o = sum p v,
 // output (o * gate) as fp16.
 // ---------------------------------------------------------------------------------------------------------------------
-__global__ void __launch_bounds__(256) ink_attend_kernel(
-    const float* __restrict__ q, const float* __restrict__ rel, const float* __restrict__ sink,
-    const float* __restrict__ gate, const __half* __restrict__ kf, const __half* __restrict__ vf,
-    long long row0, int L, float sm_scale, int Hq, int Hk, int D, int E, float* __restrict__ logits,
-    __half* __restrict__ o_out)
-{
-    __shared__ float red[32];
-    __shared__ float osum[8][128];
-    __shared__ float inv_s;
-    const int hq = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int G = Hq / Hk, hk = hq / G;
-    const long long KS = (long long)Hk * D;
-    float qv[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) qv[i] = q[hq * D + lane * 4 + i];
-    const float* rel_h = rel + (long long)hq * E;
-    float* lg = logits + (long long)hq * L;
+// Single-query attention, split over key chunks so that every SM gets work (one block per (key chunk, kv head), the three
+// or fewer query heads of a kv head share the K / V loads), then a combine over the chunks with the sink:
+//   part: logits = scale * <q, k> + rel[L - 1 - j] (distance < E), chunk max m_c, p = exp(logit - m_c), l_c = sum p,
+//         o_c = sum p v (fp32), written per query head.
+//   comb: M = max(sink, m_c), den = exp(sink - M) + sum_c exp(m_c - M) l_c, o = sum_c exp(m_c - M) o_c / den * gate (fp16).
+#define INK_ACH 128        // keys per attend block (8 warps x 16 keys)
+#define INK_MAXNC 64       // key chunks per query: L <= 8192
+#define INK_MAXGQ 4        // query heads per kv head
 
-    // pass 1: logits
-    for (int j0 = warp * 8; j0 < L; j0 += 64) {
-        float kk[8][4];
+__global__ void __launch_bounds__(256) ink_attend_part_kernel(
+    const float* __restrict__ q, const float* __restrict__ rel, const __half* __restrict__ kf,
+    const __half* __restrict__ vf, long long row0, int L, float sm_scale, int G, int Hk, int D, int E, int nc,
+    float* __restrict__ po, float* __restrict__ pml)
+{
+    __shared__ float slog[INK_MAXGQ][INK_ACH];
+    __shared__ float sm32[32];
+    __shared__ float osm[16][INK_MAXGQ][128];
+    const int c = blockIdx.x, hk = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const long long KS = (long long)Hk * D;
+    const int j0 = c * INK_ACH;
+    const int n = min(INK_ACH, L - j0);
+
+    // step 1: warp = 16 keys, lane = 4 dims. Logits of the G query heads of this kv head.
+    float qv[INK_MAXGQ][4];
+    #pragma unroll
+    for (int gi = 0; gi < INK_MAXGQ; ++gi)
         #pragma unroll
-        for (int kb = 0; kb < 8; ++kb) {
-            const int j = j0 + kb;
-            if (j < L) ink_load4h(kf + (row0 + j) * KS + hk * D + lane * 4, kk[kb]);
-            else { kk[kb][0] = kk[kb][1] = kk[kb][2] = kk[kb][3] = 0.f; }
-        }
-        float part[8];
+        for (int i = 0; i < 4; ++i)
+            qv[gi][i] = gi < G ? q[(hk * G + gi) * D + lane * 4 + i] : 0.f;
+    float kk[16][4];
+    #pragma unroll
+    for (int t = 0; t < 16; ++t) {
+        const int jl = warp * 16 + t;
+        if (jl < n) ink_load4h(kf + (row0 + j0 + jl) * KS + hk * D + lane * 4, kk[t]);
+        else { kk[t][0] = kk[t][1] = kk[t][2] = kk[t][3] = 0.f; }
+    }
+    float part[INK_MAXGQ][16];
+    #pragma unroll
+    for (int gi = 0; gi < INK_MAXGQ; ++gi)
         #pragma unroll
-        for (int kb = 0; kb < 8; ++kb)
-            part[kb] = qv[0] * kk[kb][0] + qv[1] * kk[kb][1] + qv[2] * kk[kb][2] + qv[3] * kk[kb][3];
+        for (int t = 0; t < 16; ++t)
+            part[gi][t] = qv[gi][0] * kk[t][0] + qv[gi][1] * kk[t][1] + qv[gi][2] * kk[t][2] + qv[gi][3] * kk[t][3];
+    // reduce-scatter over the 64 logits (gi * 16 + t) of the warp: 62 shuffles instead of 320. Round r keeps the half
+    // of its values selected by lane bit r, so lane L ends with the sums of logits 2L and 2L + 1
+    float pv[64];
+    #pragma unroll
+    for (int gi = 0; gi < INK_MAXGQ; ++gi)
         #pragma unroll
-        for (int kb = 0; kb < 8; ++kb) part[kb] = ink_warp_sum(part[kb]);
-        if (lane == 0) {
-            #pragma unroll
-            for (int kb = 0; kb < 8; ++kb) {
-                const int j = j0 + kb;
-                if (j < L) {
-                    float v = part[kb] * sm_scale;
-                    const int dist = L - 1 - j;
-                    if (dist < E) v += rel_h[dist];
-                    lg[j] = v;
-                }
+        for (int t = 0; t < 16; ++t) pv[gi * 16 + t] = part[gi][t];
+    #pragma unroll
+    for (int half = 32, off = 16; half >= 2; half >>= 1, off >>= 1) {
+        const bool b = (lane & off) != 0;
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            if (i < half) {
+                const float send = b ? pv[i] : pv[i + half];
+                const float keep = b ? pv[i + half] : pv[i];
+                pv[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
             }
         }
     }
-    __syncthreads();
-
-    // pass 2: softmax over the keys plus the sink
-    float m = -INFINITY;
-    for (int j = tid; j < L; j += blockDim.x) m = fmaxf(m, lg[j]);
-    m = ink_block_max(m, red);
-    m = fmaxf(m, sink[hq]);
-    float s = 0.f;
-    for (int j = tid; j < L; j += blockDim.x) {
-        const float e = expf(lg[j] - m);
-        lg[j] = e;
-        s += e;
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int idx = 2 * lane + j, gi = idx >> 4, t = idx & 15;
+        const int jl = warp * 16 + t;
+        if (gi < G && jl < n) {
+            float v = pv[j] * sm_scale;
+            const int dist = L - 1 - (j0 + jl);
+            if (dist < E) v += rel[(long long)(hk * G + gi) * E + dist];
+            slog[gi][jl] = v;
+        }
     }
-    s = ink_block_sum(s, red);
-    if (tid == 0) inv_s = 1.f / (s + expf(sink[hq] - m));
     __syncthreads();
 
-    // pass 3: o = sum_j e_j v_j, reduced over the warps
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int j0 = warp * 8; j0 < L; j0 += 64) {
-        float vv[8][4];
+    // step 2: per query head, chunk max and exp (in place), chunk sum
+    for (int gi = 0; gi < G; ++gi) {
+        const float v = tid < n ? slog[gi][tid] : -INFINITY;
+        const float m = ink_block_max(v, sm32);
+        const float e = tid < n ? expf(v - m) : 0.f;
+        const float s = ink_block_sum(e, sm32);
+        if (tid < n) slog[gi][tid] = e;
+        if (tid == 0) {
+            const int hq = hk * G + gi;
+            pml[((long long)hq * nc + c) * 2] = m;
+            pml[((long long)hq * nc + c) * 2 + 1] = s;
+        }
+    }
+    __syncthreads();
+
+    // step 3: o_c = sum_j p_j v_j. Thread: 8 consecutive dims (one 16-byte load per key), keys kg, kg + 16, ... of the
+    // chunk; all 8 loads are issued before the first use. 16 key groups are reduced at the end.
+    const int dg = tid & 15, kg = tid >> 4;
+    uint4 vr[8];
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int jl = kg + 16 * t;
+        vr[t] = jl < n ? *reinterpret_cast<const uint4*>(vf + (row0 + j0 + jl) * KS + hk * D + dg * 8)
+                       : make_uint4(0u, 0u, 0u, 0u);
+    }
+    float acc[INK_MAXGQ][8];
+    #pragma unroll
+    for (int gi = 0; gi < INK_MAXGQ; ++gi)
         #pragma unroll
-        for (int kb = 0; kb < 8; ++kb) {
-            const int j = j0 + kb;
-            if (j < L) ink_load4h(vf + (row0 + j) * KS + hk * D + lane * 4, vv[kb]);
-            else { vv[kb][0] = vv[kb][1] = vv[kb][2] = vv[kb][3] = 0.f; }
+        for (int e = 0; e < 8; ++e) acc[gi][e] = 0.f;
+    #pragma unroll
+    for (int t = 0; t < 8; ++t) {
+        const int jl = kg + 16 * t;
+        const __half2* h2 = reinterpret_cast<const __half2*>(&vr[t]);
+        float v[8];
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const float2 f = __half22float2(h2[p]);
+            v[2 * p] = f.x; v[2 * p + 1] = f.y;
         }
         #pragma unroll
-        for (int kb = 0; kb < 8; ++kb) {
-            const int j = j0 + kb;
-            const float e = j < L ? lg[j] : 0.f;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) acc[i] += e * vv[kb][i];
+        for (int gi = 0; gi < INK_MAXGQ; ++gi) {
+            if (gi < G && jl < n) {
+                const float pj = slog[gi][jl];
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) acc[gi][e] += pj * v[e];
+            }
         }
     }
     #pragma unroll
-    for (int i = 0; i < 4; ++i) osum[warp][lane * 4 + i] = acc[i];
+    for (int gi = 0; gi < INK_MAXGQ; ++gi)
+        if (gi < G) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) osm[kg][gi][dg * 8 + e] = acc[gi][e];
+        }
+    __syncthreads();
+    for (int idx = tid; idx < G * 128; idx += blockDim.x) {      // G * 128 outputs
+        const int gi = idx >> 7, dd = idx & 127;
+        const int hq = hk * G + gi;
+        float s = 0.f;
+        #pragma unroll
+        for (int g2 = 0; g2 < 16; ++g2) s += osm[g2][gi][dd];
+        po[((long long)hq * nc + c) * D + dd] = s;
+    }
+}
+
+__global__ void __launch_bounds__(128) ink_attend_comb_kernel(
+    const float* __restrict__ sink, const float* __restrict__ gate, const float* __restrict__ po,
+    const float* __restrict__ pml, int nc, int D, __half* __restrict__ o_out)
+{
+    __shared__ float w[INK_MAXNC];
+    __shared__ float inv;
+    const int hq = blockIdx.x, tid = threadIdx.x;
+    if (tid == 0) {
+        float M = sink[hq];
+        for (int c = 0; c < nc; ++c) M = fmaxf(M, pml[((long long)hq * nc + c) * 2]);
+        float den = expf(sink[hq] - M);
+        for (int c = 0; c < nc; ++c) {
+            const float e = expf(pml[((long long)hq * nc + c) * 2] - M);
+            w[c] = e;
+            den += e * pml[((long long)hq * nc + c) * 2 + 1];
+        }
+        inv = 1.f / den;
+    }
     __syncthreads();
     if (tid < D) {
         float o = 0.f;
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) o += osum[w][tid];
-        o = o * inv_s * gate[hq * D + tid];
-        o_out[hq * D + tid] = __float2half_rn(o);
+        for (int c = 0; c < nc; ++c) o += w[c] * po[((long long)hq * nc + c) * D + tid];
+        o_out[hq * D + tid] = __float2half_rn(o * inv * gate[hq * D + tid]);
     }
 }
 
@@ -543,19 +843,26 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
 {
     const int Hq = (int)sink.numel(), D = (int)kf.size(2);
     TORCH_CHECK(D == 128 && Hq % Hk == 0 && Hq <= 256, "ink_attend: D must be 128, Hq a multiple of Hk");
-    TORCH_CHECK(L >= 1 && row0 >= 0 && (row0 + L) * (int64_t)(Hk * D) <= kf.numel(), "ink_attend: key range");
+    TORCH_CHECK(Hq / Hk <= INK_MAXGQ, "ink_attend: at most 4 query heads per kv head");
+    TORCH_CHECK(L >= 1 && L <= 8192 && row0 >= 0 && (row0 + L) * (int64_t)(Hk * D) <= kf.numel(), "ink_attend: key range");
     TORCH_CHECK(q.numel() == Hq * D && gate.numel() == Hq * D && rel.numel() == Hq * E, "ink_attend: shapes");
     TORCH_CHECK(q.scalar_type() == at::kFloat && rel.scalar_type() == at::kFloat && sink.scalar_type() == at::kFloat
                 && gate.scalar_type() == at::kFloat && q.is_contiguous() && rel.is_contiguous()
                 && sink.is_contiguous() && gate.is_contiguous(), "ink_attend: fp32 contiguous q/rel/sink/gate");
     TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf, "ink_attend: fp16 cache");
     const at::cuda::OptionalCUDAGuard guard(q.device());
-    auto logits = at::empty({Hq, L}, q.options());
+    const int G = Hq / (int)Hk;
+    const int nc = (int)((L + INK_ACH - 1) / INK_ACH);
+    auto po = at::empty({Hq, nc, D}, q.options());
+    auto pml = at::empty({Hq, nc, 2}, q.options());
     auto o = at::empty({Hq * D}, q.options().dtype(at::kHalf));
-    ink_attend_kernel<<<Hq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(),
+    auto stream = at::cuda::getCurrentCUDAStream();
+    ink_attend_part_kernel<<<dim3(nc, (unsigned)Hk), 256, 0, stream>>>(
+        q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
-        row0, (int)L, (float)sm_scale, Hq, (int)Hk, D, (int)E, logits.data_ptr<float>(),
+        row0, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc, po.data_ptr<float>(), pml.data_ptr<float>());
+    ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
+        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), nc, D,
         reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
     return o;
 }
