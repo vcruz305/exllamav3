@@ -141,6 +141,11 @@ class Inkling2ConvLayerState:
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens >= 0 and (last_history == 0 or num_tokens <= last_history), \
             f"inkling2 conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        if last_history > 0 and self.max_history == 0:
+            raise RuntimeError(
+                "inkling2 conv rewind: this cache has max_history == 0, so no speculative history was kept "
+                "for rewind; create the Cache with max_history > 0 to use recurrent history / rewind"
+            )
         if last_history > 0:
             p = self.conv_state.shape[-1] - num_tokens
             self.conv_state[slot, :, :self.taps].copy_(self.conv_state[slot, :, p - self.taps : p].clone())
