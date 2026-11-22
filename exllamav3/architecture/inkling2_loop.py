@@ -292,6 +292,7 @@ class Inkling2LoopModel(Model):
         super().__init__(config, **kwargs)
         self._tok = None
         self._tok_key = None
+        self._tok_pages_set = None  # page list last uploaded to the token step's device page table
         self._tok_disabled = False
         self.tok_steps = 0          # decode tokens served by ext.InkToken (fast-path hit count)
         self.graph_captures = 0     # CUDA graphs captured for the token step
@@ -386,48 +387,59 @@ class Inkling2LoopModel(Model):
                 list(range(c.loop_start)) + core * c.num_passes + list(range(c.loop_end, c.num_hidden_layers))
             )
 
-    def _tok_ok(self, x: torch.Tensor, params: dict) -> bool:
-        """One sequence, one token, fp16 paged cache with contiguous pages up to the position. Recorded conv history
-        (params recurrent_history, speculative passes) is handled in the step by the record flag"""
+    def _tok_pages(self, x: torch.Tensor, params: dict):
+        """
+        The page list of the sequence up to the position (the page table of the token step), or None when the
+        token path does not apply: one sequence, one token, fp16 paged cache. Any page order is accepted. Recorded
+        conv history (params recurrent_history, speculative passes) is handled in the step by the record flag
+        """
         if self._tok_disabled or x.numel() != 1 or params.get("cache") is None:
-            return False
+            return None
         rs = params.get("recurrent_states")
         if not rs or len(rs) != 1:
-            return False
+            return None
         if any(k in params for k in _TOKEN_BLOCKERS):
-            return False
+            return None
         bt, cs = params.get("block_table"), params.get("cache_seqlens")
         if bt is None or cs is None or bt.is_cuda or cs.is_cuda:
-            return False
+            return None
         pos = int(cs.tolist()[0])
         row = bt.tolist()[0]
         used = pos // PAGE_SIZE + 1
-        return used <= len(row) and all(row[j] == row[0] + j for j in range(used))
+        return row[:used] if used <= len(row) else None
 
     def forward_ls(self, x: torch.Tensor, params: dict):
-        if _TOKEN and self._tok_ok(x, params):
+        pages = self._tok_pages(x, params) if _TOKEN else None
+        if pages is not None:
             key = (params["cache"], params["recurrent_states"][0].cache)
             if self._tok is None or self._tok_key[0] is not key[0] or self._tok_key[1] is not key[1]:
                 try:
                     self._tok = ext.InkToken(_build_token(self, params))
                     self._tok_key = key
+                    self._tok_pages_set = None
                 except Exception as e:
                     self._tok_disabled = True
                     print(f" -- Inkling2 token path off ({e}); Python single-token path")
                     return super().forward_ls(x, params)
             pos = int(params["cache_seqlens"].tolist()[0])
-            base_page = int(params["block_table"].tolist()[0][0])
             slot = params["recurrent_states"][0].slot
             record = bool(params.get("recurrent_history"))
+            if pages != self._tok_pages_set:            # the table changes when a page is added or the sequence is new
+                try:
+                    self._tok.set_table(pages)
+                except Exception as e:
+                    print(f" -- Inkling2 token step: page table not accepted ({e}); Python single-token path")
+                    return super().forward_ls(x, params)
+                self._tok_pages_set = pages
             self.tok_steps += 1
             tok_id = int(x.reshape(-1)[0])
             if not _GRAPH:
-                return self._tok.step(tok_id, pos, base_page, slot, record)
+                return self._tok.step(tok_id, pos, slot, record)
             # CUDA graph: per-token values go through the device buffers (update), the captured step reads them.
             gk = (id(self._tok), slot)
             if self._gkey != gk:
                 self._gkey, self._graphs, self._gwarm = gk, {}, {}
-            self._tok.update(tok_id, pos, base_page, slot)
+            self._tok.update(tok_id, pos, slot)
             if record in self._graphs:
                 g, out = self._graphs[record]
                 g.replay()
