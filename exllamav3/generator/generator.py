@@ -3,6 +3,7 @@ import logging
 import torch
 import os
 from ..model.model import Model
+from ..model.prefill_pipeline import PrefillPipeline
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
 from ..tokenizer.tokenizer import Tokenizer
@@ -24,6 +25,7 @@ from .visualizer import CacheVisualizer
 import time
 from ..util.device_copy import to_device
 import threading
+from collections import deque
 from ..tokenizer import MMEmbedding
 from ..util import profile_opt
 
@@ -70,6 +72,8 @@ class Generator:
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
+        rolling_checkpoint: bool = True,
+        pipelined_prefill: bool = True,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
         draft_confidence: float | None = None,
@@ -245,6 +249,17 @@ class Generator:
             multiple of the page size. Checkpoints land on the first chunk boundary at least this far past the
             previous one, so the interval need not be a multiple of the chunk size. Default is 32768 tokens
 
+        :param rolling_checkpoint:
+            Leave a checkpoint at the last page boundary of every job's output, so that a follow-up prompt
+            extending it replays less than a page instead of up to a checkpoint interval. States that can't
+            roll back in place keep one copy per active job, updated at every page and outside
+            recurrent_cache_size until the job ends. Ignored if model doesn't use recurrent states
+
+        :param pipelined_prefill:
+            With the model split across devices, let them work on different prefill chunks at once, each device
+            on its own thread (see PrefillPipeline). Ignored where a split can't: tensor parallel, CPU expert
+            offload, attention pinned to one device, a draft model on several devices or reading the target's cache
+
         :param kwargs:
         """
 
@@ -373,6 +388,8 @@ class Generator:
         self.disk_cache_flush_on_idle = disk_cache_flush_on_idle
         self.disk_cache_write_interval = disk_cache_write_interval
         self._write_behind_time = 0.0
+        # Pages still to queue in the idle flush in progress (see flush_cache_to_disk), None between passes
+        self._flush_pass = None
         if cpu_cache_size:
             tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
             self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
@@ -442,6 +459,22 @@ class Generator:
             "checkpoint interval must be a multiple of the page size (256)"
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval_pp = recurrent_checkpoint_interval_pp
+        self.rolling_checkpoint = rolling_checkpoint and self.recurrent_cache is not None
+
+        # One pipeline per model: a retired generator may not have been closed
+        previous = getattr(self.model, "pipeline", None)
+        if previous is not None:
+            previous.close()
+        self.pipeline = None
+        plan = PrefillPipeline.plan(self.model, cache, draft_model) if pipelined_prefill else None
+        if plan is not None:
+            on_idle = self.recurrent_cache.write_settled if self.recurrent_cache is not None else None
+            self.pipeline = PrefillPipeline(self.model, *plan, on_idle = on_idle)
+        self.model.pipeline = self.pipeline
+        if draft_model is not None:
+            draft_model.pipeline = self.pipeline
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.pipeline = self.pipeline
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
@@ -698,6 +731,7 @@ class Generator:
         if job in self.pending_jobs:
             self.pending_jobs.remove(job)
         elif job in self.active_jobs:
+            job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
@@ -824,6 +858,12 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
 
+        # Generation runs in the foreground, on devices and draft state the prefill pipeline has finished with
+        if self.pipeline is not None:
+            if self.pipeline.busy and any(job.is_prefill_done() for job in self.active_jobs):
+                self.pipeline.flush()
+            self.reap_pipeline_failures(results)
+
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
         draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
         round_start = None
@@ -888,6 +928,13 @@ class Generator:
         RAM, in the tensor-parallel ranks too), the CPU page cache tier (cpu_cache_size of pinned memory),
         the pinned staging and draft buffers, and the filter thread pool.
         """
+        if self.pipeline is not None:
+            self.pipeline.close()
+            self.model.pipeline = None
+            if self.draft_model is not None:
+                self.draft_model.pipeline = None
+            self.recurrent_cache and setattr(self.recurrent_cache, "pipeline", None)
+            self.pipeline = None
         if self.disk_page_cache is not None:
             # Persist what is still only in VRAM or RAM, then let the writer drain before its sources go away.
             # After abort() (generator error), nothing is written
@@ -922,7 +969,13 @@ class Generator:
         max_pages limits the number of pages queued in one call. Each page takes a CPU-tier slot until its
         write is complete. If the pages are more than the free slots, the tier must wait for the writer, and
         this call stops the generator for that time. With a limit, the call stops early and sets "more" in the
-        result. The idle loop then calls again (see idle_work).
+        result. The idle loop then calls again (see idle_work), and the next call continues the same pass: the
+        pages are listed once, at the first call, so the pass ends even when the tiers below VRAM hold fewer
+        pages than VRAM does. (Listing them again on every call would find the pages the pass itself evicted
+        from the disk tier, write them again, and never end.) on_queue_drained starts a new pass.
+
+        One pass writes at most what the disk tier's root budget holds: the most recently used pages that
+        fit, since any more would only evict pages written by the same pass.
         """
         disk = self.disk_page_cache
         tier = self.cpu_page_cache
@@ -930,8 +983,15 @@ class Generator:
         if disk is None:
             return queued
         pt = self.pagetable
-        pages = list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
-        queued["pages"], queued["more"] = self._queue_pages_to_disk(pages, max_pages)
+        if max_pages is None:
+            queued["pages"], _ = self._queue_pages_to_disk(self._flush_candidates(), None)
+            self._flush_pass = None
+        else:
+            if getattr(self, "_flush_pass", None) is None:
+                self._flush_pass = deque(self._flush_candidates())
+            queued["pages"], queued["more"] = self._queue_pages_to_disk(self._flush_pass, max_pages, consume = True)
+            if not queued["more"]:
+                self._flush_pass = None
         rc = self.recurrent_cache
         if rc is not None and rc.disk_tier is not None:
             # Checkpoints follow their pages: every complete page is queued above, so an anchored checkpoint
@@ -963,25 +1023,50 @@ class Generator:
         return queued
 
 
-    def _queue_pages_to_disk(self, pages, budget: int | None) -> tuple[int, bool]:
+    def _flush_candidates(self) -> list:
+        """
+        The pages a full flush would queue now (see _queue_pages_to_disk), in page table order, limited to
+        the most recently used ones that fit in the disk tier's root budget
+        """
+        disk, pt = self.disk_page_cache, self.pagetable
+        pages = [
+            page for page in list(pt.unreferenced_pages.values()) + list(pt.referenced_pages.values())
+            if self._page_needs_flush(page)
+        ]
+        limit = disk.root_size // max(disk.page_file_size, 1)
+        if len(pages) > limit:
+            keep = set(map(id, sorted(pages, key = lambda p: p.access_serial, reverse = True)[:limit]))
+            pages = [page for page in pages if id(page) in keep]
+        return pages
+
+
+    def _page_needs_flush(self, page) -> bool:
+        """A complete, content-hashed, persistable page in VRAM that is in neither the CPU nor the disk tier"""
+        disk, tier = self.disk_page_cache, self.cpu_page_cache
+        h = page.phash
+        if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
+            return False
+        return not (h in tier or disk.has_page(h) or h in disk.pending_pages)
+
+
+    def _queue_pages_to_disk(self, pages, budget: int | None, consume: bool = False) -> tuple[int, bool]:
         """
         Queue the complete, content-hashed, persistable pages among `pages` that are in VRAM but in neither the
         CPU nor the disk tier, through the CPU tier (its store is the write-through point; the copy to host
         memory goes on the current stream, after the kernels that wrote the page and before any that could
-        write it again). Stops after `budget` pages. Returns (pages queued, stopped early).
+        write it again). Stops after `budget` pages. Returns (pages queued, stopped early). With consume,
+        `pages` is a deque and the pages looked at are taken from it, so the next call continues after them.
         """
-        disk, tier, pt = self.disk_page_cache, self.cpu_page_cache, self.pagetable
+        tier, pt = self.cpu_page_cache, self.pagetable
         queued = 0
-        for page in pages:
-            h = page.phash
-            if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
-                continue
-            if h in tier or disk.has_page(h) or h in disk.pending_pages:
-                continue
-            if budget is not None and queued >= budget:
-                return queued, True
-            tier.store(page, pt.access_serial)
-            queued += 1
+        for page in (pages if not consume else list(pages)):
+            if self._page_needs_flush(page):
+                if budget is not None and queued >= budget:
+                    return queued, True
+                tier.store(page, pt.access_serial)
+                queued += 1
+            if consume:
+                pages.popleft()
         return queued, False
 
 
@@ -1007,6 +1092,9 @@ class Generator:
         budget = self.cpu_page_cache.max_slots // 4 - len(disk.pending_pages)
         if budget <= 0:
             return
+        # A sequence's position runs ahead of the devices while prefill chunks are in flight
+        if self.pipeline is not None:
+            self.pipeline.flush()
         pages = []
         for job in self.active_jobs:
             for seq in job.sequences:
@@ -1045,15 +1133,20 @@ class Generator:
         if self.disk_page_cache is not None and self.disk_cache_flush_on_idle and \
                 not self.disk_page_cache.write_disabled:
             # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
-            # step only; the async generator does the rest while idle (idle_work)
+            # step only; the async generator does the rest while idle (idle_work). A new pass, over what the
+            # jobs since the last one have left in VRAM
+            self._flush_pass = None
             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
+        if self.pipeline is not None:
+            self.pipeline.flush()
         if self.recurrent_cache is not None:
-            self.recurrent_cache.prune_stranded()
             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
-            # is actually returned (the next stash reallocates once)
-            host_pool.release()
-            if self.model.loaded_tp:
-                self.model.tp_dispatch_all(mp_host_pool_release, ())
+            # is actually returned (the next stash reallocates once). Without pruning the pool holds
+            # about one checkpoint per job that just ended, which the next turn's stashes reuse
+            if self.recurrent_cache.prune_stranded():
+                host_pool.release()
+                if self.model.loaded_tp:
+                    self.model.tp_dispatch_all(mp_host_pool_release, ())
         self.pagetable.defrag()
         # Dynamic expert placement: apply any pending swap sweep now, between generations —
         # a placement change perturbs the logits slightly (same expert, different device
@@ -1066,6 +1159,7 @@ class Generator:
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
             job.maybe_stash_recurrent(self.recurrent_cache)
+            job.update_rolling_checkpoint()
 
 
     def update_visualizer(self):
@@ -2005,24 +2099,23 @@ class Generator:
         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
         # must advance between positions.
         else:
-            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+            W = batch_logits.shape[1]
+            # Pass 1 over the batch: every job whose positions are independent (see batchable below) launches
+            # its W samplers now, staging the device results in one pinned buffer, (bsz, W); the whole batch
+            # then pays one synchronize instead of one per job, and the per-job walk below is host-only. A
+            # per-job synchronize would drain the GPU sixty times a round at large batch sizes, with the host's
+            # bookkeeping for each job falling into the drained gap
+            staged_jobs = {}
+            pinned_w = getattr(self, "draft_sample_pinned", None)
+            if pinned_w is None or pinned_w.shape[0] < batch_size or pinned_w.shape[1] < W:
+                pinned_w = torch.empty((max(batch_size, 32), max(W, 8)), dtype = torch.long, pin_memory = True)
+                self.draft_sample_pinned = pinned_w
+            any_cuda = False
+            row = 0
+            for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a == b: continue
-                job_logits = batch_logits[a:b, :, :]
-                accepted_length = 1
-                rejected = 0
-                W = batch_logits.shape[1]
-
-                # Positions within a job are independent when no per-position constraint advances between
-                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
-                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
-                # window (token healing, new_tokens < 0, is covered by the last test). Then all samplers
-                # launch up front in serial-loop order (each position's RNG draw is unchanged) and the W
-                # sampled tokens read back through one pinned buffer and one synchronize, as in the
-                # no-draft path, leaving a host-only accept/reject walk. Constrained jobs keep the serial
-                # loop below.
-                # A dormant triggered filter can activate on a token inside the window and constrain the
-                # positions after it, and a pending constrain_output_now injection is consumed one token per
-                # sampled position; both keep the serial loop
+                r = row
+                row += 1
                 batchable = (
                     not _NO_BATCH_READBACK
                     and b - a == 1
@@ -2036,28 +2129,41 @@ class Generator:
                     # each accepted producer position, so the window cannot be pre-sampled
                     and job.token_budget is None
                 )
-                staged = None
-                if batchable:
-                    rng_state = job.rng.getstate()
-                    staged = []
-                    any_cuda = False
-                    for i in range(W):
-                        token_logits = job_logits[:, i:i + 1, :]
-                        sampled = job.receive_logits(token_logits)
-                        is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
-                        staged.append((sampled, is_cuda))
-                        any_cuda |= is_cuda
-                    if any_cuda:
-                        pinned_w = getattr(self, "draft_sample_pinned", None)
-                        if pinned_w is None or pinned_w.shape[1] < W:
-                            pinned_w = torch.empty((1, max(W, 8)), dtype = torch.long, pin_memory = True)
-                            self.draft_sample_pinned = pinned_w
-                        for i, (sampled, is_cuda) in enumerate(staged):
-                            if is_cuda:
-                                pinned_w[0:1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
-                                staged[i] = ((pinned_w[0:1, i:i + 1],) + sampled[1:], False)
-                        torch.cuda.synchronize(batch_logits.device)
+                if not batchable:
+                    continue
+                job_logits = batch_logits[a:b, :, :]
+                rng_state = job.rng.getstate()
+                staged = []
+                for i in range(W):
+                    sampled = job.receive_logits(job_logits[:, i:i + 1, :])
+                    is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
+                    if is_cuda:
+                        pinned_w[r:r + 1, i:i + 1].copy_(sampled[0].view(1, 1), non_blocking = True)
+                        sampled = (pinned_w[r:r + 1, i:i + 1],) + sampled[1:]
+                        any_cuda = True
+                    staged.append((sampled, False))
+                staged_jobs[id(job)] = (staged, rng_state)
+            if any_cuda:
+                torch.cuda.synchronize(batch_logits.device)
+            for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                if a == b: continue
+                job_logits = batch_logits[a:b, :, :]
+                accepted_length = 1
+                rejected = 0
 
+                # Positions within a job are independent when no per-position constraint advances between
+                # them: no active filter (masks are rebuilt per accepted position), no sampling past IDs
+                # (repetition penalty), no banned-string checkpoint, and outside the min_new_tokens mask
+                # window (token healing, new_tokens < 0, is covered by the last test). Such jobs had their
+                # samplers launched in pass 1 above, in serial-loop order (each position's RNG draw is
+                # unchanged), and read back with the batch; the walk here is host-only. Constrained jobs
+                # take the serial loop: a dormant triggered filter can activate on a token inside the window
+                # and constrain the positions after it, and a pending constrain_output_now injection is
+                # consumed one token per sampled position
+                staged = None
+                st = staged_jobs.get(id(job))
+                if st is not None:
+                    staged, rng_state = st
                 for i in range(W):
                     positions_used = i + 1
                     token_logits = job_logits[:, i:i + 1, :]
@@ -2120,7 +2226,7 @@ class Generator:
                     # sampled target token matches the draft token. A recurrent checkpoint boundary also stops
                     # draft acceptance so state can be stashed at an exact page boundary.
                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                        cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                        cp_boundary = batch_states is not None and job.is_stash_boundary()
                         if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
                             rejected = reject_remainder(job, j, i, batch_states)
                             break
@@ -2302,6 +2408,7 @@ class Generator:
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
+            job.commit_recurrent_checkpoint()
             job.deallocate_pages()
             self.active_jobs.remove(job)
 
@@ -2314,6 +2421,14 @@ class Generator:
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.on_queue_drained()
+
+
+    def reap_pipeline_failures(self, results: list):
+        """Fail the jobs whose work in the prefill pipeline raised, which only comes out once it has moved on"""
+        for job, error in self.pipeline.take_failures():
+            if job is not None:
+                self.reap_failed_job(job, error, results)
+            self.pipeline.forget_owner(job)
 
 
     def reap_failed_job(self, job, error, results: list):
