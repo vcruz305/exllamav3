@@ -55,6 +55,8 @@ def test_queue_drained_hook_enters_inference_mode():
         # Merged layout: idle housekeeping first saves the sparse drafting head's
         # placement profile; this generator has none
         sparse_head = None
+        # Likewise the pipeline: Generator.__init__ always sets it (None when no split pipeline is planned)
+        pipeline = None
         pagetable = SimpleNamespace(defrag = lambda: seen.append(torch.is_inference_mode_enabled()))
         model = SimpleNamespace(config = SimpleNamespace(infer_params = SimpleNamespace(moe_cpu_swap_pending = False)))
 

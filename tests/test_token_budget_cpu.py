@@ -170,7 +170,8 @@ JOB_METHODS = {
     "_maybe_force_token_budget", "_advance_token_budget", "_token_budget_can_end", "_pop_forced_token",
     "receive_logits", "receive_sample", "set_sampler", "set_filters", "set_banned_strings",
     "_init_banned_strings", "_check_banned_strings", "_release_banned_hold",
-    "hash_deferred_pages", "prepare_for_requeue", "prepare_logit_mask",
+    "hash_deferred_pages", "prepare_for_requeue", "prepare_logit_mask", "commit_recurrent_checkpoint",
+    "is_stash_boundary", "rolls_checkpoint",
 }
 Job = _load_class(JOB_PATH, "Job", NAMESPACE, JOB_METHODS)
 
@@ -221,7 +222,7 @@ def make_job(**kwargs):
     kwargs.setdefault("max_new_tokens", 100)
     job = Job(**kwargs)
     generator = NS(tokenizer=Tokenizer(), draft_model=None, ngram_match_min=0, hybrid_draft_tokens=0,
-                   recurrent_cache=None, padded_vocab_size=VOCAB)
+                   recurrent_cache=None, rolling_checkpoint=False, padded_vocab_size=VOCAB)
     _attach(job, generator)
     return job
 
@@ -278,6 +279,9 @@ def run_mtp(job, proposals, scores=None, batch_verify=True):
         "_NO_BATCH_READBACK": not batch_verify,
         "draft_tokens": torch.tensor([proposals], dtype=torch.long),
         "batch_logits": scores, "logit_mapping": [0, 1], "batch_states": [state],
+        # iterate_gen sets batch_size (sequences of prefill-complete jobs) above this branch; the pinned
+        # readback buffer sizing in the branch reads it. The single job here is one sequence
+        "batch_size": len(job.sequences),
         "accepted_lengths": [], "completed_jobs": [], "requeuing_jobs": [],
         "rewound_jobs": set(), "j": 0, "results": [],
     }
@@ -815,6 +819,7 @@ class SyncGenerator:
         self.ngram_match_min = 0
         self.hybrid_draft_tokens = 0
         self.recurrent_cache = None
+        self.rolling_checkpoint = False  # no recurrent cache: Job.commit_recurrent_checkpoint returns early
         self.padded_vocab_size = VOCAB
         self.drained = 0
         self.closed = False
