@@ -21,7 +21,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .block_sparse_mlp_routing import (
-    RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
+    RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP, _gate_t,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
 )
 
@@ -90,6 +90,12 @@ COOPMK_PLAN = int(os.environ.get("EXL3_COOPMK_PLAN", "3"))
 # off (the uniform-K layers then take the per-expert path again); EXL3_MOE_COOP_MIXEDK=0 turns off
 # CoopMK alone, and =1 forces it on any activation / GPU
 SOFTCAP_COOP = os.environ.get("EXL3_MOE_SOFTCAP_COOP", "1") != "0"
+# Device-only one-row MoE (exllamav3_ext/quant/exl3_moe_row.cu, ext.MoeRow): router, top-k and the softcapped experts
+# in one C++ call per layer, bitrates read on the device. Used for the one-row decode calls of silu_softcap layers
+# that qualify (_moe_row_setup, built on the first such call). EXL3_MOE_ROW=0 restores the previous paths.
+MOE_ROW = os.environ.get("EXL3_MOE_ROW", "1") != "0"
+# Call arguments that take the general path (captures, all-expert or sensitivity passes, TP warmup, autosplit)
+_MOE_ROW_BLOCKERS = ("capture_qmaps", "capture_sens", "activate_all_experts", "autosplit_measure", "tp_warmup")
 
 
 def _coop_mixedk_enabled(device, activation_fn = None) -> bool:
@@ -575,6 +581,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc_sh_exp = False
         self.coopmk = None
         self.coopmk_out = None
+        self.moe_row = None
+        self.moe_row_out = None
+        self.moe_row_tried = False
         self.fused_mode_buffers = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
@@ -1019,6 +1028,73 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
               f"variants A {self.coopmk.stage_variants(0)} B {self.coopmk.stage_variants(1)}")
 
 
+    def _moe_row_setup(self):
+        """Bind the device-only one-row MoE (ext.MoeRow, exl3_moe_row.cu) to a silu_softcap layer that qualifies
+        (EXL3_MOE_ROW=1). Router, top-k and the experts run in one C++ call per row with the per-expert bitrates and
+        pointers read on the device. The layer keeps every other path (self.moe_row is None) when it does not
+        qualify: other activations, shared/latent/normed/offloaded/TP layers, or non-integer bitrates"""
+        self.moe_row = None
+        self.moe_row_out = None
+        if not MOE_ROW or not hasattr(ext, "MoeRow"):
+            return
+        if not (self.gated and self.activation_fn == "silu_softcap" and self.is_quantized):
+            return
+        if self.routing_fn is not routing_ds3 or self.routing_gate is None or self.routing_cfg is None:
+            return
+        if (self.router_pre_norm or self.routed_pre_norm or self.routed_post_norm or self.latent_in is not None
+                or self.latent_out is not None or self.shared_experts or self.cpu_split_first is not None
+                or self.cpu_offload or self.routing_device is not None or self.tp_reduce
+                or getattr(self, "alt_residual_channel", False)):
+            return
+        E = self.num_experts
+        if self.num_local_experts != E or len(self.gates) != E or len(self.ups) != E or len(self.downs) != E:
+            return
+        lins = self.gates + self.ups + self.downs
+        if any(l.inner.bias is not None for l in lins):
+            return
+        ks = [float(l.inner.K) for l in lins]
+        if any(k != int(k) or not 1 <= int(k) <= 8 for k in ks):
+            return
+        if len({bool(l.inner.mcg) for l in lins}) != 1 or len({bool(l.inner.mul1) for l in lins}) != 1:
+            return
+        mcg, mul1 = bool(lins[0].inner.mcg), bool(lins[0].inner.mul1)
+        H = self.ups[0].in_features
+        I = self.intermediate_size_padded
+        if (H != self.hidden_size or self.gates[0].in_features != H or self.downs[0].out_features != H
+                or self.downs[0].in_features != I or self.ups[0].out_features != I or H % 128 or I % 128):
+            return
+        cfg = self.routing_cfg
+        if cfg.n_group != 1 or cfg.topk_group != 1:
+            return
+        # Same lazy builds routing_ds3 does on its first call (the setup runs on the first decode row, after the
+        # deferred weights are materialised; cloning at load time captured stale tensors)
+        gate_t = _gate_t(cfg)
+        if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
+            cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
+        bias = cfg.e_score_bias_f32
+        dev = self.device
+        ptrs = torch.tensor(
+            [[[l.inner.trellis.data_ptr() for l in ls], [l.inner.suh.data_ptr() for l in ls],
+              [l.inner.svh.data_ptr() for l in ls]] for ls in (self.gates, self.ups, self.downs)],
+            dtype = torch.long, device = dev).reshape(9, E).contiguous()
+        kt = torch.tensor([[int(l.inner.K) for l in ls] for ls in (self.gates, self.ups, self.downs)],
+                          dtype = torch.int32, device = dev).reshape(3, E).contiguous()
+        cb = 1 if mcg else (2 if mul1 else 0)
+        self.moe_row = ext.MoeRow(
+            H = H, I = I, E = E, top_k = self.num_experts_per_tok, ptrs = ptrs, kt = kt, cb = cb,
+            cap_g = float(self.act_limit), cap_u = float(self.act_limit2), gate_t = gate_t,
+            bias_f32 = bias, route_scale = float(cfg.routed_scaling_factor))
+        self.moe_row_out = torch.empty((1, H), dtype = torch.float, device = dev)
+        print(f" -- Device-only one-row MoE in {self.key}: E {E}, top-{self.num_experts_per_tok}, "
+              f"n_group {cfg.n_group} topk_group {cfg.topk_group} scale {float(cfg.routed_scaling_factor)}, "
+              f"K {int(kt.min())}..{int(kt.max())}, codebook {'mcg' if mcg else 'mul1'}")
+
+    def _moe_row_forward(self, x: torch.Tensor):
+        """One row through ext.MoeRow (routing included): one C++ call, fp32 routed sum into moe_row_out"""
+        self.moe_row.forward(x.view(-1), self.moe_row_out)
+        return self.moe_row_out.view(x.shape[:-1] + (self.expert_size,))
+
+
     def _coopmk_forward(self, y, selected_experts, routing_weights, eshape):
         """Routed sum of bsz <= MAX_BSZN tokens through the cooperative runtime-K kernels: two
         launches (three at bsz > 1), launch-only, no host synchronization"""
@@ -1153,7 +1229,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
-
 
     def _batch_recon_layer(self, y):
         """Per-module batched reconstruct state (moe_batch_recon.BatchReconLayer), built on
@@ -1297,6 +1372,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.coopmk = None
         self.coopmk_out = None
+        self.moe_row = None
+        self.moe_row_out = None
+        self.moe_row_tried = False
         self.fused_mode_buffers = None
         self.batch_recon = None
         if self.multi_gate is not None:
@@ -1341,6 +1419,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        # Device-only one-row MoE (EXL3_MOE_ROW=1): routing included, one C++ call, no Python routing. Built on the first
+        # one-row decode call (after load), never inside a CUDA graph capture
+        if (MOE_ROW and not self.moe_row_tried and x.numel() == self.hidden_size and x.dtype == torch.half
+                and x.is_contiguous() and not torch.cuda.is_current_stream_capturing()
+                and not any(k in params for k in _MOE_ROW_BLOCKERS)):
+            self.moe_row_tried = True
+            self._moe_row_setup()
+        if (self.moe_row is not None and x.numel() == self.hidden_size and x.dtype == torch.half
+                and x.is_contiguous() and not any(k in params for k in _MOE_ROW_BLOCKERS)):
+            return self._moe_row_forward(x)
 
         if self.alt_residual_channel:
             y = params["residual"].view(-1, self.hidden_size)
