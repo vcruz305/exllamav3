@@ -1,11 +1,13 @@
 from __future__ import annotations
 from typing_extensions import override
 import math
+import os
 import torch
 import torch.nn.functional as F
 from ...model.config import Config
 from ...constants import PAGE_SIZE
 from ...cache.recurrent import host_copy
+from ...ext import exllamav3_ext as ext
 from ..module import Module
 from ..linear import Linear
 
@@ -35,6 +37,10 @@ STATE_KEY = "inkling2"
 # the K/V rows (the cache's). Validation against an fp32 reference raises both to take the rounding out
 ACT_DTYPE = torch.half
 KV_DTYPE = torch.half
+
+# Single-token (T == 1, one sequence, paged cache) decode runs the pure-tensor segments as one CUDA kernel each
+# (exllamav3_ext/inkling2.cu, see Inkling2Block._forward_t1). INKLING2_T1=0 keeps the eager path for A/B and checks.
+_T1 = os.environ.get("INKLING2_T1", "1") != "0"
 
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -478,8 +484,41 @@ class Inkling2Attention(Module):
         w = fold["static"] + dyn                                                # (bsz, seq, H, C/H, k)
         return (win.reshape(bsz, seq, H, C // H, k) * w).sum(-1).reshape(bsz, seq, C)
 
-    def project(self, q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, tau: torch.Tensor | None,
-                params: dict, ring: Inkling2Ring):
+    def project_t1(self, q_in, k_in, v_in, tau: float, params: dict, ring: "Inkling2Ring", slot: int,
+                   kf: torch.Tensor, vf: torch.Tensor, row: int):
+        """
+        project() for one token (T == 1, one sequence) with the K/V rows written to cache row `row`: the linears run
+        as usual, the query side and the K/V side (short conv, history, norms, cache write) run as one kernel each.
+        Returns q (Hq * D), rel (Hq * E), sink (Hq), gate (Hq * D), all fp32 flat.
+        """
+        qh = q_in.to(ACT_DTYPE).contiguous()
+        same = k_in is q_in and v_in is q_in
+        kh = qh if same else k_in.to(ACT_DTYPE).contiguous()
+        vh = qh if same else v_in.to(ACT_DTYPE).contiguous()
+        q_f = self.q_proj.forward(qh, params).reshape(-1)
+        r_f = self.r_proj.forward(qh, params).reshape(-1)
+        g_f = self.g_proj.forward(qh, params).reshape(-1)
+        k_raw = self.k_proj.forward(kh, params).reshape(-1)
+        v_raw = self.v_proj.forward(vh, params).reshape(-1)
+        q, rel, sink, gate = ext.ink_q_glue(
+            q_f, r_f, g_f, q_in.reshape(-1), self.q_scale.reshape(-1), self.rel_scale.reshape(-1),
+            self.rel_proj, self.sink_proj, float(self.qk_clip), float(self.rel_clip), float(tau),
+        )
+        C = self.num_kv_heads * self.head_dim
+        fk, fv = self.k_fold, self.v_fold
+        ext.ink_kv_glue(
+            k_raw, v_raw, ring.state[slot, :2 * C], k_in.reshape(-1), v_in.reshape(-1),
+            fk["w"] if "w" in fk else fk["static"], fv["w"] if "w" in fv else fv["static"],
+            fk.get("proj"), fv.get("proj"), kf, vf, row, self.ksize - 1, ring.record,
+            float(self.qk_clip), float(self.eps),
+        )
+        return q, rel, sink, gate
+
+    def attend_t1(self, q, rel, sink, gate, kf: torch.Tensor, vf: torch.Tensor, row0: int, L: int) -> torch.Tensor:
+        """Single query over cache rows [row0, row0 + L), output (o * gate) fp16 flat (Hq * D)"""
+        return ext.ink_attend(q, rel, sink, gate, kf, vf, row0, L, self.sm_scale, self.num_kv_heads, self.rel_extent)
+
+    def project(self, q_in, k_in, v_in, tau: torch.Tensor | None, params: dict, ring: Inkling2Ring):
         """
         Returns q (bsz, seq, Hq, D), k / v (bsz, seq, Hkv, D), relative logits (bsz, seq, Hq, rel_extent),
         sink logits (bsz, seq, Hq) and output gate (bsz, seq, Hq * D). tau: log-scaling factor (bsz, seq) or None
@@ -842,6 +881,85 @@ class Inkling2Block(Module):
             t.update(g.tensors())
         return t
 
+    def _t1_rows(self, params: dict, ring: Inkling2Ring, bsz: int, seq: int):
+        """Block-table rows when the single-token kernels apply (one sequence, contiguous pages), else None"""
+        if not _T1 or bsz != 1 or seq != 1 or ring.state is None or len(ring.slots) != 1:
+            return None
+        bt = params.get("block_table")
+        if params.get("cache") is None or bt is None or bt.is_cuda:
+            return None
+        rows = bt.tolist()
+        if not all(row[j] == row[0] + j for row in rows for j in range(len(row))):
+            return None
+        return rows
+
+    def _forward_t1(self, x: torch.Tensor, st: Inkling2State, messages, ring: Inkling2Ring, params: dict,
+                    rows: list) -> torch.Tensor:
+        """
+        Single-token forward of one sequence on a paged cache: the same computation as the general path, with each
+        pure-tensor segment as one kernel. x: (1, 1, dim) fp32, already loop-bookkept by forward().
+        """
+        attn = self.attn
+        H, kvc, taps = self.hidden_size, self.kv_channels, self.ksize - 1
+        instance = params.get("layer_instance", 0)
+        slot = ring.slots[0]
+        cache, bt = params["cache"], params["block_table"]
+        pos = int(params["cache_seqlens"].tolist()[0])
+        base = rows[0][0] * PAGE_SIZE
+        flat = base + pos
+        lo = 0 if attn.sliding_window is None else max(0, pos - (attn.sliding_window - 1))
+        row0 = base + lo
+        L = flat + 1 - row0
+        kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], bt, instance = instance)
+        kf = kc.view(-1, attn.num_kv_heads, attn.head_dim)
+        vf = vc.view(-1, attn.num_kv_heads, attn.head_dim)
+        tau = attn._tau_host(pos) if attn.log_scaling is not None else 1.0
+
+        # attention residual over the block states, message gates, norms -> the sublayer inputs
+        xf = x.reshape(H)
+        if self.layer_idx == 0:
+            hs = xf.view(1, H)
+        else:
+            hs = ext.ink_attn_res(st.block_states + [xf], self.queries_t["attn"], self.eps)      # (nq, H)
+        if messages is None and not self.is_full:
+            y = F.rms_norm(hs[0], (H,), self.qkv_norm[0], self.eps).view(1, 1, H)
+            q_in = k_in = v_in = y
+        else:
+            X = hs if hs.shape[0] == 3 else hs.expand(3, H)
+            if messages is not None:
+                X = ext.ink_gates(X, messages.reshape(4, H)[0:3], self.gate_down, self.gate_up, 0, 3, self.eps)
+            y = F.rms_norm(X, (H,), None, self.eps) * self.qkv_norm                             # (3, H)
+            q_in, k_in, v_in = (y[i].view(1, 1, H) for i in range(3))
+
+        q, rel, sink, gate = attn.project_t1(q_in, k_in, v_in, tau, params, ring, slot, kf, vf, flat)
+        o = attn.attend_t1(q, rel, sink, gate, kf, vf, row0, L)
+        cache.update_layer(self.layer_idx, params["cache_seqlens"], bt, kc, vc, 1, instance)
+        a = attn.o_proj.forward(o.view(1, 1, -1), params, out_dtype = torch.float)              # (1, 1, H)
+
+        # attention output conv; a block boundary also appends the block state (the residual is then the conv output)
+        c_attn = 2 * kvc
+        if self.is_block_boundary:
+            st.block_states = st.block_states + [x]
+            residual = ext.ink_sconv(ring.state[slot, c_attn:c_attn + H], a.reshape(H), self.convs_f["attn"], None,
+                                     taps, ring.record)
+        else:
+            residual = ext.ink_sconv(ring.state[slot, c_attn:c_attn + H], a.reshape(H), self.convs_f["attn"], xf,
+                                     taps, ring.record)
+        residual = residual.view(1, 1, H)
+
+        # MLP input: attention residual over the (extended) block states, message gate, norm
+        m = ext.ink_attn_res(st.block_states + [residual.reshape(H)], self.queries_t["mlp"], self.eps)   # (1, H)
+        if messages is not None:
+            m = ext.ink_gates(m, messages.reshape(4, H)[3:4], self.gate_down, self.gate_up, 3, 1, self.eps)
+        mn = F.rms_norm(m, (H,), self.norms["mlp"], self.eps).view(1, 1, H)
+        mlp_in = mn if isinstance(self.mlp, Inkling2MoE) else mn.to(ACT_DTYPE).contiguous()
+        m_out = self.mlp.forward(mlp_in, params)
+
+        c_mlp = 2 * kvc + H
+        out = ext.ink_sconv(ring.state[slot, c_mlp:c_mlp + H], m_out.reshape(H), self.convs_f["mlp"],
+                            residual.reshape(H), taps, ring.record)
+        return out.view(1, 1, H)
+
     def _norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
         return F.rms_norm(x.float(), (self.hidden_size,), self.norms[name], self.eps)
 
@@ -912,6 +1030,10 @@ class Inkling2Block(Module):
                 prev_block, prev_out = st.prev_pass
                 messages = attn_res([prev_block.to(dev)], prev_out.to(dev), self.msg_query_t)
         st.block_states = [s if s.device == dev else s.to(dev) for s in st.block_states]
+        ring = self._ring(params, instance)
+        rows = self._t1_rows(params, ring, bsz, seq)
+        if rows is not None:
+            return self._forward_t1(x, st, messages, ring, params, rows)
 
         block_residual = x
         if self.layer_idx == 0:
@@ -920,7 +1042,6 @@ class Inkling2Block(Module):
             hs = attn_res(st.block_states, x, self.queries_t["attn"])
         q_in, k_in, v_in = self._attn_inputs(hs, messages)
 
-        ring = self._ring(params, instance)
         a = self.attention(q_in, k_in, v_in, params, instance, ring)
         a = self._sconv(a, "attn", _with_history(ring.exchange(2 * self.kv_channels, a), a, self.ksize - 1))
 

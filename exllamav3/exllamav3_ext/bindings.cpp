@@ -14,6 +14,7 @@
 #include "rope.cuh"
 #include "activation.cuh"
 #include "softcap.cuh"
+#include "inkling2.cuh"
 #include "sparse_head.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
@@ -120,6 +121,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
+    m.def("ink_attn_res", &ink_attn_res, "Inkling2 single-token attention residual");
+    m.def("ink_gates", &ink_gates, "Inkling2 single-token message gates");
+    m.def("ink_sconv", &ink_sconv, "Inkling2 single-token short conv with ring update");
+    m.def("ink_q_glue", &ink_q_glue, "Inkling2 single-token query glue");
+    m.def("ink_kv_glue", &ink_kv_glue, "Inkling2 single-token K/V glue and cache write");
+    m.def("ink_attend", &ink_attend, "Inkling2 single-token attention over cache rows");
     m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
