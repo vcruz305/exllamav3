@@ -85,6 +85,9 @@ def _exl3_bc(lin, name: str):
 # Whole-token decode (exllamav3_ext/inkling2_token.cu): one extension call per token instead of the Python block
 # loop. INKLING2_TOKEN=0 keeps the Python single-token path (Inkling2Block._forward_t1) for A/B checks.
 _TOKEN = os.environ.get("INKLING2_TOKEN", "1") != "0"
+# Multi-row token forwards (T = 2..9, no recurrent history). Off by default: the sequential rows are slower than the
+# general path beyond two rows until the batched kernels exist (see PROGRESS.md).
+_TOKEN_T = os.environ.get("INKLING2_TOKEN_T", "0") == "1"
 # exl3_mlin for the q, r, g, k, v projections of the token step (rounding-level change vs the per-linear BC path)
 _MLIN_TOK = os.environ.get("INKLING2_TOK_MLIN", "1") != "0"
 # CUDA-graph replay of the token step (per record flag); INKLING2_GRAPH=0 runs the same step eagerly
@@ -92,6 +95,10 @@ _GRAPH = os.environ.get("INKLING2_GRAPH", "1") != "0"
 # Call arguments that select the general path (capture, overrides, reconstruct, all-expert or sensitivity passes)
 _TOKEN_BLOCKERS = ("capture", "capture_qmaps", "capture_sens", "ovr", "reconstruct", "activate_all_experts",
                    "autosplit_measure", "tp_warmup")
+
+
+# Largest forward (rows) the token step takes: the verify window of the drafter (one sequence, one pass).
+TOK_ROWS_MAX = 9
 
 
 def _build_token(model, params: dict):
@@ -428,7 +435,13 @@ class Inkling2LoopModel(Model):
         conv history (params recurrent_history, speculative passes) is handled in the step by the record flag
         """
         # A drafter's tap request needs the per-layer states of every row, which only the Python path exports
-        if self._tok_disabled or x.numel() != 1 or params.get("cache") is None:
+        T = x.numel()
+        if self._tok_disabled or not (1 <= T <= TOK_ROWS_MAX) or params.get("cache") is None:
+            return None
+        # The sequential multi-row step (update_rows / step_rows) is exact without recurrent history only: with
+        # history recording the rows of one forward must see each other's conv inputs in the window, which the
+        # per-row token steps do not provide (the batched conv kernel is needed). Such forwards take the general path.
+        if T > 1 and (not _TOKEN_T or not _GRAPH or params.get("recurrent_history")):
             return None
         if params.get("export_state_layers") and (not _GRAPH or self._tok_tap_plan(params) is None):
             return None
@@ -438,11 +451,11 @@ class Inkling2LoopModel(Model):
         if any(k in params for k in _TOKEN_BLOCKERS):
             return None
         bt, cs = params.get("block_table"), params.get("cache_seqlens")
-        if bt is None or cs is None or bt.is_cuda or cs.is_cuda:
+        if bt is None or cs is None or bt.is_cuda or cs.is_cuda or bt.shape[0] != 1 or cs.numel() != 1:
             return None
         pos = int(cs.tolist()[0])
         row = bt.tolist()[0]
-        used = pos // PAGE_SIZE + 1
+        used = (pos + T - 1) // PAGE_SIZE + 1       # pages up to the last row of the forward
         return row[:used] if used <= len(row) else None
 
     def prefill_ls(self, x: torch.Tensor, params: dict):
@@ -496,38 +509,44 @@ class Inkling2LoopModel(Model):
                     return super().forward_ls(x, params)
                 self._tok_pages_set = pages
             self.tok_steps += 1
-            tok_id = int(x.reshape(-1)[0])
-            if not _GRAPH:
-                return self._tok.step(tok_id, pos, slot, record)
+            toks = [int(t) for t in x.reshape(-1).tolist()]
+            T = len(toks)
+            if not _GRAPH:                  # T == 1 only (see _tok_pages)
+                return self._tok.step(toks[0], pos, slot, record)
             # CUDA graph: per-token values go through the device buffers (update), the captured step reads them.
             gk = (id(self._tok), slot, tap_key)
             if self._gkey != gk:
                 self._gkey, self._graphs, self._gwarm = gk, {}, {}
-            self._tok.update(tok_id, pos, slot)
-            out = self._tok_step_graph(record)
+            if T == 1:
+                self._tok.update(toks[0], pos, slot)
+            else:
+                self._tok.update_rows(toks, pos, slot)
+            out = self._tok_step_graph(record, T)
             if plan:
                 # the taps of this token, in the order the general path appends them (visit order, final last)
                 tb = self._tok.tapbuf()
                 params.setdefault("export_states", []).extend(
-                    tb[k, :1].reshape(1, 1, -1).clone() for k in range(len(plan[0])))
+                    tb[k, :T].reshape(1, T, -1).clone() for k in range(len(plan[0])))
             return out
         return super().forward_ls(x, params)
 
-    def _tok_step_graph(self, record: bool):
-        """One token step through the captured graph of this record flag (eager for the first two calls)."""
-        if record in self._graphs:
-            g, out = self._graphs[record]
+    def _tok_step_graph(self, record: bool, T: int):
+        """The forward of T staged rows through the captured graph of (T, record) (eager for the first two calls)."""
+        key = (T, record)
+        step = self._tok.step_dev if T == 1 else self._tok.step_rows
+        if key in self._graphs:
+            g, out = self._graphs[key]
             g.replay()
             return out.clone()
-        n = self._gwarm.get(record, 0)
+        n = self._gwarm.get(key, 0)
         if n < 2:                       # eager steps first: cuBLAS handles and allocator state before capture
-            self._gwarm[record] = n + 1
-            return self._tok.step_dev(record).clone()
-        g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes this token once
+            self._gwarm[key] = n + 1
+            return step(record).clone()
+        g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes the forward once
         with torch.cuda.graph(g):
-            out = self._tok.step_dev(record)
+            out = step(record)
         g.replay()
-        self._graphs[record] = (g, out)
+        self._graphs[key] = (g, out)
         self.graph_captures += 1
         return out.clone()
 

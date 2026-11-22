@@ -210,6 +210,9 @@ struct InkToken {
     at::Tensor tapbuf;
     std::vector<int64_t> tapb_;
     int64_t tapf_ = -1;
+    // T-row path (milestone 4): rows of the device parameter buffers are S = 2 + 3 NB int64 (pos, windows, token)
+    // and NB doubles (tau); row r of a forward starts at r * S / r * NB. Tcur_ = rows of the staged forward.
+    int64_t Tcur_ = 1;
 
     explicit InkToken(const py::dict& s)
     {
@@ -236,14 +239,50 @@ struct InkToken {
         cap_ = (int64_t)1 << 40;
         for (auto& b : blocks) cap_ = std::min<int64_t>(cap_, b.kf.size(0) / page);
         pt_ = at::zeros({cap_}, emb.options().dtype(at::kInt));
-        dI = at::zeros({1 + 3 * NB + 1}, emb.options().dtype(at::kLong));
-        dD = at::zeros({NB}, emb.options().dtype(at::kDouble));
+        dI = at::zeros({TMAX * (2 + 3 * NB)}, emb.options().dtype(at::kLong));
+        dD = at::zeros({TMAX * NB}, emb.options().dtype(at::kDouble));
         for (int k = 0; k < 4; ++k) {
-            hI[k] = at::empty({1 + 3 * NB + 1}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
-            hD[k] = at::empty({NB}, at::TensorOptions().dtype(at::kDouble).pinned_memory(true));
+            hI[k] = at::empty({TMAX * (2 + 3 * NB)}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+            hD[k] = at::empty({TMAX * NB}, at::TensorOptions().dtype(at::kDouble).pinned_memory(true));
         }
         tapbuf = at::zeros({4, TMAX, H}, emb.options().dtype(at::kHalf));
         tapb_.assign(NB, -1);
+    }
+
+    // Host side of a forward over T = toks.size() rows (one sequence, positions pos0 .. pos0 + T - 1): fills a pinned
+    // slot row by row and copies it to the device (stream-ordered, no kernel launch: outside any graph capture).
+    void update_rows(const std::vector<int64_t>& toks, int64_t pos0, int64_t slot)
+    {
+        const int64_t T = (int64_t)toks.size();
+        TORCH_CHECK(T >= 1 && T <= TMAX, "InkToken: 1..9 rows per forward");
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        slot_ = slot;
+        Tcur_ = T;
+        const int k = hs_;
+        hs_ = (hs_ + 1) % 4;
+        if (evs_[k].isCreated()) evs_[k].synchronize();
+        const int64_t S = 2 + 3 * NB;
+        int64_t* I = hI[k].data_ptr<int64_t>();
+        double* Dd = hD[k].data_ptr<double>();
+        for (int64_t r = 0; r < T; ++r) {
+            int64_t* Ir = I + r * S;
+            double* Dr = Dd + r * NB;
+            const int64_t pos = pos0 + r;
+            Ir[0] = pos;
+            for (int64_t i = 0; i < NB; ++i) {
+                const InkBlock& b = blocks[i];
+                const int64_t lo = (b.W < 0) ? 0 : std::max<int64_t>(0, pos - (b.W - 1));
+                const int64_t L = pos + 1 - lo;
+                Ir[1 + 3 * i] = lo;
+                Ir[2 + 3 * i] = L;
+                Ir[3 + 3 * i] = (L + INK_ACH_H - 1) / INK_ACH_H;
+                Dr[i] = b.log_scaling ? 1.0 + b.alpha * std::log(std::max(((double)(pos + 1)) / b.nfloor, 1.0)) : 1.0;
+            }
+            Ir[1 + 3 * NB] = toks[r];
+        }
+        dI.narrow(0, 0, T * S).copy_(hI[k].narrow(0, 0, T * S), /*non_blocking=*/true);
+        dD.narrow(0, 0, T * NB).copy_(hD[k].narrow(0, 0, T * NB), /*non_blocking=*/true);
+        evs_[k].record(at::cuda::getCurrentCUDAStream());
     }
 
     // Tap export configuration: tapb[bi] = slot (0..3) of block call bi or -1; tapf = slot of the normed final state
@@ -440,13 +479,16 @@ struct InkToken {
         return logits.view({1, 1, Vpad}).narrow(-1, 0, V);
     }
 
-    at::Tensor step_dev(bool record)
+    // One token of the staged forward: row r of the device parameter buffers (r = 0 for the T = 1 step).
+    at::Tensor step_row(int64_t r, bool record)
     {
+        const int64_t S = 2 + 3 * NB;
+        const int64_t base = r * S, dbase = r * NB;
         const at::cuda::OptionalCUDAGuard guard(emb.device());
         const int64_t Hc = H;
 
         // Embedding: F.embedding(...).float(), then rms * norm weight
-        at::Tensor e = at::embedding(emb, dI.narrow(0, 1 + 3 * NB, 1)).to(at::kFloat);
+        at::Tensor e = at::embedding(emb, dI.narrow(0, base + 1 + 3 * NB, 1)).to(at::kFloat);
         at::Tensor        x = at::mul(at::rms_norm(e, {Hc}, c10::nullopt, eps_emb), emb_norm);   // (1, H) fp32
 
         std::vector<at::Tensor> bs;                     // block states, (1, H) fp32 each
@@ -478,7 +520,7 @@ struct InkToken {
             }
 
             // drafter tap: the block input after the loop bookkeeping (what Inkling2Block exports)
-            if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, 0, 1).copy_(x);
+            if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, r, 1).copy_(x);
 
             // Attention residual -> sublayer inputs
             at::Tensor hs;
@@ -527,16 +569,16 @@ struct InkToken {
             }
             std::vector<at::Tensor> qg = ink_q_glue_dev(
                 q_f.reshape(-1), r_f.reshape(-1), g_f.reshape(-1), q_in.reshape(-1), b.q_scale, b.rel_scale,
-                b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip, dD.narrow(0, bi, 1));
+                b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip, dD.narrow(0, dbase + bi, 1));
             at::Tensor rs = b.ring.select(0, slot_);                                  // (ch, ld)
             ink_kv_glue_dev(k_raw, v_raw, rs.narrow(0, 0, 2 * b.kvc), k_in.reshape(-1), v_in.reshape(-1), b.kw, b.vw,
-                        b.kp, b.vp, b.kf, b.vf, dI.narrow(0, 0, 1), pt_, taps, record, b.qk_clip, b.eps);
+                        b.kp, b.vp, b.kf, b.vf, dI.narrow(0, base, 1), pt_, taps, record, b.qk_clip, b.eps);
 
             // Attention over the logical keys of the window, output projection
             
             
             
-            at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_, dI.narrow(0, 1 + 3 * bi, 3),
+            at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_, dI.narrow(0, base + 1 + 3 * bi, 3),
                                           b.sm_scale, b.Hk, b.E);
             at::Tensor a = b.o->run_alloc(o.view({1, -1}), H, true);                   // (1, H) fp32
 
@@ -578,10 +620,21 @@ struct InkToken {
         fsrc.push_back(x);
         at::Tensor fx = attn_res_torch(fsrc, fin_q_t);                                 // (1, H): Inkling2Final's torch attn_res
         at::Tensor xn = at::mul(at::rms_norm(fx, {Hc}, c10::nullopt, eps_fin), fin_norm).to(at::kHalf).contiguous();
-        if (tapf_ >= 0) tapbuf.select(0, tapf_).narrow(0, 0, 1).copy_(xn);
+        if (tapf_ >= 0) tapbuf.select(0, tapf_).narrow(0, r, 1).copy_(xn);
         at::Tensor logits = head->run_alloc(xn, Vpad, false);                           // LinearEXL3.forward at one row
         if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
-        return logits.view({1, 1, Vpad}).narrow(-1, 0, V);
+        return logits.narrow(-1, 0, V);                                                      // (1, V)
+    }
+
+    at::Tensor step_dev(bool record) { return step_row(0, record).unsqueeze(0); }      // (1, 1, V)
+
+    // All Tcur_ rows of the staged forward, one token after another (each row sees the state the previous rows
+    // wrote). Returns (1, Tcur_, V).
+    at::Tensor step_rows(bool record)
+    {
+        std::vector<at::Tensor> rows;
+        for (int64_t r = 0; r < Tcur_; ++r) rows.push_back(step_row(r, record));
+        return at::cat(rows, 0).unsqueeze(0);
     }
 };
 
@@ -594,5 +647,7 @@ void ink_token_bind(py::module_& m)
         .def("update", &InkToken::update, py::arg("token"), py::arg("pos"), py::arg("slot"))
         .def("step_dev", &InkToken::step_dev, py::arg("record"))
         .def("set_taps", &InkToken::set_taps, py::arg("tapb"), py::arg("tapf"))
+        .def("update_rows", &InkToken::update_rows, py::arg("tokens"), py::arg("pos0"), py::arg("slot"))
+        .def("step_rows", &InkToken::step_rows, py::arg("record"))
         .def("tapbuf", [](InkToken& t) { return t.tapbuf; });
 }
