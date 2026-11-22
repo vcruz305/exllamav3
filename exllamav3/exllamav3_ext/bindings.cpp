@@ -27,6 +27,7 @@
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_mlin.cuh"   // fused one-row EXL3 linears (exl3_mlin)
 #include "quant/exl3_gemv_int8.cuh"
 #include "quant/frac.cuh"
 #include "cpu/moe_mul1.h"
@@ -196,6 +197,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
+    m.def("exl3_mlin", &exl3_mlin_tensors, "exl3_mlin: fused one-row EXL3 linears (in, trellis, suh, svh, out, counters, mcg, mul1)");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat",
           py::arg("shape_idx"), py::arg("size_m"), py::arg("size_k"), py::arg("size_n"), py::arg("bits"), py::arg("half_k") = false);
