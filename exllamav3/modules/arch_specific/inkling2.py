@@ -889,7 +889,11 @@ class Inkling2Block(Module):
         if params.get("cache") is None or bt is None or bt.is_cuda:
             return None
         rows = bt.tolist()
-        if not all(row[j] == row[0] + j for row in rows for j in range(len(row))):
+        # Only the pages holding positions 0..pos have to be contiguous: the generator hands over a table
+        # padded with unused entries
+        used = int(params["cache_seqlens"].tolist()[0]) // PAGE_SIZE + 1
+        row = rows[0]
+        if used > len(row) or not all(row[j] == row[0] + j for j in range(used)):
             return None
         return rows
 
