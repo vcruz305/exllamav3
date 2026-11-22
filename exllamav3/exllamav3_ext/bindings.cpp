@@ -15,6 +15,7 @@
 #include "activation.cuh"
 #include "softcap.cuh"
 #include "inkling2.cuh"
+#include "inkling2_token.cuh"
 #include "sparse_head.cuh"
 #include "routing.cuh"
 #include "gdn.cuh"
@@ -128,6 +129,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ink_q_glue", &ink_q_glue, "Inkling2 single-token query glue");
     m.def("ink_kv_glue", &ink_kv_glue, "Inkling2 single-token K/V glue and cache write");
     m.def("ink_attend", &ink_attend, "Inkling2 single-token attention over cache rows");
+    ink_token_bind(m);
     m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");
 
     m.def("routing_ds3_nogroup", &routing_ds3_nogroup, "routing_ds3_nogroup");
