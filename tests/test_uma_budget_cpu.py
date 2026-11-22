@@ -101,9 +101,12 @@ class BudgetTests(unittest.TestCase):
             body = getattr(node, "body", None)
             if not isinstance(body, list):
                 continue
+            # The attention-device block (caps["attn_device"]) also assigns free_now, from attn_dev; this
+            # check is the load-device one, so select the statement that measures load_device
             starts = [i for i, stmt in enumerate(body) if isinstance(stmt, ast.Assign)
                       and any(isinstance(n, ast.Name) and n.id == "free_now"
-                              for target in stmt.targets for n in ast.walk(target))]
+                              for target in stmt.targets for n in ast.walk(target))
+                      and "load_device" in ast.unparse(stmt.value)]
             if starts:
                 start = starts[0]
                 end = next(i for i in range(start, len(body)) if isinstance(body[i], ast.If)

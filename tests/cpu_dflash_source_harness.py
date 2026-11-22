@@ -173,6 +173,10 @@ NS_GLOBALS = {
     "PageTable": CPUPageTable, "SeqTensor": SeqTensor,
     "ThreadPoolExecutor": lambda **kw: None,
     "DraftConfidenceCalibrator": lambda confidence: NS(confidence=confidence),
+    # Generator.__init__ calls PrefillPipeline.plan(model, cache, draft) (pipelined_prefill defaults to True).
+    # The real plan() returns None for a model without fwd_modules, as this stub model has, so no pipeline
+    # is built; the stub reproduces that outcome without importing the torch-backed module.
+    "PrefillPipeline": NS(plan=lambda model, cache, draft_model=None: None),
     "ext": NS(BC_SAM=lambda: NS()), "cuda_sync_active": lambda: None,
     "tensor_hash_checksum": lambda tensor, prev: hashlib.blake2b(
         (prev or b"") + repr(tensor.tolist()).encode(), digest_size=16).digest(),
