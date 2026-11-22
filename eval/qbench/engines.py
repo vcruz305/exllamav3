@@ -46,8 +46,21 @@ HF_ROUTER_KEYS = (".mlp.gate.weight", ".block_sparse_moe.gate.weight", ".router.
 GGUF_ROUTER_KEYS = ("ffn_gate_inp.weight",)
 
 
-def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
-    n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
+def row_views(ids: torch.Tensor, lengths: list[int] | None) -> list[torch.Tensor]:
+    """Per-row (1, len) views of right-padded ids, cut to each row's own length when given
+    (positions past the last scored one are causally inert, so this only saves compute)"""
+    if lengths is None:
+        return list(ids.split(1))
+    return [ids[r:r + 1, :n] for r, n in enumerate(lengths)]
+
+
+def apply_mult_noise(x: torch.Tensor, eps: float, gens: dict) -> torch.Tensor:
+    """Generators can't cross devices and activations do (an unquantized embedding runs on the CPU), so gens
+    holds one per device"""
+    if x.device not in gens:
+        gens[x.device] = torch.Generator(device = x.device)
+        gens[x.device].manual_seed(1)
+    n = torch.randn(x.shape, generator = gens[x.device], device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
 
@@ -67,16 +80,16 @@ class Exl3Backend:
             "module_streamed": True,
         }
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         from exllamav3.modules import Linear
         modules = self.model.modules
         # Per-row params, prepared by the architecture as Model.forward does before the module
         # chain (attention layout, recurrence, DeepSeek-V4's hash-routing ids / image chunks);
         # they carry state across modules, so each row keeps its own dict
         params_rows = [{} for _ in range(ids.shape[0])]
-        states = [self.model.prepare_inputs(row, p) for row, p in zip(ids.split(1), params_rows)]
-        gen = torch.Generator(device = self.device)
-        gen.manual_seed(1)
+        rows = row_views(ids, lengths)
+        states = [self.model.prepare_inputs(row, p) for row, p in zip(rows, params_rows)]
+        gens = {}
 
         sum_bits = sum_numel = head_bits = head_numel = 0
         with ProgressBar("Streaming", len(modules)) as pb:
@@ -109,7 +122,7 @@ class Exl3Backend:
                 logits_layer = idx == len(modules) - 1
                 for r in range(len(states)):
                     params = params_rows[r]
-                    params.setdefault("input_ids", ids[r:r + 1])
+                    params.setdefault("input_ids", rows[r])
                     x = module.prepare_for_device(states[r], params)
                     x = module.forward(x, params)
                     # Modules may hand back a view of a shared g_tensor_cache workspace (mHC /
@@ -117,7 +130,7 @@ class Exl3Backend:
                     if torch.is_tensor(x):
                         x = x.clone()
                     if noise_eps and idx < len(modules) - 2 and x.is_floating_point():
-                        x = apply_mult_noise(x, noise_eps, gen)
+                        x = apply_mult_noise(x, noise_eps, gens)
                     if logits_layer:
                         callback(r, x)
                         states[r] = None
@@ -198,13 +211,14 @@ class TransformersBackend:
             # built unquantized (plain Linear modules), so the quantization config must not
             # reach from_config. Supported: compressed-tensors pack-quantized (AWQ-style int
             # groups), compressed-tensors mixed-precision / nvfp4-pack-quantized /
-            # float-quantized (llm-compressor FP8-channel + NVFP4 mixes), and ModelOpt mixed
-            # FP8 / NVFP4. Evaluation is weight-only in all cases: the deployed stacks'
-            # activation quant (static or dynamic fp8/fp4) and fp8 kv cache are not emulated,
-            # so results are the checkpoint's weight fidelity under bf16 compute
+            # float-quantized (llm-compressor FP8-channel + NVFP4 mixes), ModelOpt mixed
+            # FP8 / NVFP4, and MLX affine packs. Evaluation is weight-only in all cases: the
+            # deployed stacks' activation quant (static or dynamic fp8/fp4) and fp8 kv cache are
+            # not emulated, so results are the checkpoint's weight fidelity under bf16 compute
             self.ct_bits = None
             self.dequant_scaled = False
             self.scale_block = ()
+            self.mlx = None
             self.quant_desc = "none (checkpoint dtype)"
             qcfg = getattr(config, "quantization_config", None)
             if qcfg is not None:
@@ -247,6 +261,17 @@ class TransformersBackend:
                     # gpt-oss-style: MoE expert tensors stored as <name>_blocks (packed fp4
                     # e2m1 pairs) + <name>_scales (e8m0); resolved per-tensor by sidecar
                     pass
+                elif qm is None and q_get("bits") is not None and q_get("group_size") is not None:
+                    # MLX pack (mlx-lm / mlx-vlm conversion): no quant_method, the defaults as
+                    # top-level keys and, for mixed packs, one {bits, group_size} entry per
+                    # module path. Quantized Linear and Embedding modules store <stem>.weight
+                    # (packed uint32), <stem>.scales and <stem>.biases
+                    self.mlx = dict(qcfg) if isinstance(qcfg, dict) else qcfg.to_dict()
+                    modes = {self.mlx.get("mode", "affine")} | \
+                        {v.get("mode", "affine") for v in self.mlx.values() if isinstance(v, dict)}
+                    if modes != {"affine"}:
+                        raise ValueError(f"Streaming does not support MLX quantization modes {sorted(modes)}")
+                    self.quant_desc = f"mlx affine, {q_get('bits')} bits, group size {q_get('group_size')}"
                 else:
                     raise ValueError(f"Streaming does not support this quantization_config: {qm}")
                 delattr(config, "quantization_config")
@@ -396,6 +421,22 @@ class TransformersBackend:
                         mod_name.replace(".language_model.model.", ".language_model.", 1),
                         self.tensor_index[mod_name])
 
+            # MLX packs follow the mlx-lm module tree, where a multimodal wrapper holds the whole
+            # CausalLM as language_model ("language_model.model.layers.*", "language_model.lm_head.*")
+            if self.mlx is not None:
+                for ck_name, fn in raw_map.items():
+                    if ck_name.startswith("language_model."):
+                        self.tensor_index.setdefault(ck_name[len("language_model."):], (fn, ck_name))
+
+            # mlx-lm rewrites some tensors when it converts a checkpoint, and packs store the
+            # rewritten form. Conv kernels are channels-last (any model; undone by shape in
+            # _materialize). Qwen3.5's zero-centered RMSNorm gains are stored as 1 + weight
+            self.mlx_norm_shift = ()
+            if self.mlx is not None and any(mt.startswith("qwen3_5") for mt in model_types):
+                self.mlx_norm_shift = (
+                    ".input_layernorm.weight", ".post_attention_layernorm.weight", "model.norm.weight",
+                    ".q_norm.weight", ".k_norm.weight")
+
             # Real (init-valued) buffers up front on the compute device
             for m in self.model.modules():
                 for k, b in m._buffers.items():
@@ -423,21 +464,25 @@ class TransformersBackend:
             self.head_weight_name = f"{self.prefix[id(head)]}.weight" if head is not None else None
             self.embed_weight_name = f"{self.prefix[id(embed)]}.weight"
         else:
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
-                )
-            except ValueError:
-                from transformers import AutoModelForImageTextToText
-                self.model = AutoModelForImageTextToText.from_pretrained(
-                    source,
-                    dtype = dtype,
-                    device_map = options.get("device_map", "auto"),
-                    trust_remote_code = options.get("trust_remote_code", True),
-                )
+            # model_class: image_text_to_text loads the multimodal wrapper even where a text-only
+            # CausalLM class exists. Needed when a quantized checkpoint's module paths only match the
+            # wrapper (AutoRound/GPTQ block_name_to_quantize = model.language_model.layers): under
+            # the CausalLM class nothing gets replaced and the packed weights silently go unloaded
+            from transformers import AutoModelForImageTextToText
+            model_class = options.get("model_class", "causal_lm")
+            assert model_class in ("causal_lm", "image_text_to_text"), f"Unknown model_class: {model_class}"
+            load_args = dict(
+                dtype = dtype,
+                device_map = options.get("device_map", "auto"),
+                trust_remote_code = options.get("trust_remote_code", True),
+            )
+            if model_class == "image_text_to_text":
+                self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
+            else:
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(source, **load_args)
+                except ValueError:
+                    self.model = AutoModelForImageTextToText.from_pretrained(source, **load_args)
             self.model.eval()
 
         self.time_step_limit = self._apply_time_step_limit(options.get("time_step_limit"))
@@ -610,11 +655,7 @@ class TransformersBackend:
         gens = {}
         def hook(module, inputs, output):
             out = output[0] if isinstance(output, tuple) else output
-            if out.device not in gens:
-                g = torch.Generator(device = out.device)
-                g.manual_seed(1)
-                gens[out.device] = g
-            out = apply_mult_noise(out, noise_eps, gens[out.device])
+            out = apply_mult_noise(out, noise_eps, gens)
             if isinstance(output, tuple):
                 return (out,) + output[1:]
             return out
@@ -665,6 +706,40 @@ class TransformersBackend:
                 zp = zp - (1 << (bits - 1))
             q = q - zp.repeat_interleave(group, dim = 1)
         return q.to(torch.float32) * scale.repeat_interleave(group, dim = 1)
+
+    def _dequant_mlx(self, stem):
+        """Dequantize an MLX affine weight (mlx.core.quantize): unsigned ints packed LSB-first
+        into one contiguous bitstream of uint32 words per row, w = q * scale + bias with a scale
+        and a bias per group of inputs. The bit width follows from the shapes, so a mixed pack
+        only needs its per-module group sizes. Runs on the compute device in row chunks and
+        returns the compute dtype: embedding and head tables are too large to unpack in one piece"""
+        packed = self._read_shard(f"{stem}.weight").view(torch.int32)
+        scales = self._read_shard(f"{stem}.scales")
+        biases = self._read_shard(f"{stem}.biases")
+        assert packed.ndim == 2 and scales.shape == biases.shape, f"{stem}: unexpected MLX quantized layout"
+        ck_stem = self.tensor_index[f"{stem}.weight"][1][:-len(".weight")]
+        spec = self.mlx.get(ck_stem)
+        spec = spec if isinstance(spec, dict) else self.mlx
+        gs = spec["group_size"]
+        rows, words = packed.shape
+        n = scales.shape[1] * gs
+        bits = words * 32 // n
+        assert bits * n == words * 32 and bits == spec.get("bits", bits), \
+            f"{stem}: {words} words per row do not hold {n} values of {spec.get('bits')} bits"
+        dev = self.device
+        offs = torch.arange(n, device = dev, dtype = torch.int64) * bits
+        w0, sh = offs >> 5, offs & 31
+        out = torch.empty((rows, n), dtype = self.dtype, device = dev)
+        step = max(1, (1 << 27) // n)
+        for a in range(0, rows, step):
+            p = packed[a : a + step].to(dev).to(torch.int64) & 0xFFFFFFFF
+            p = torch.nn.functional.pad(p, (0, 1))
+            q = ((p[:, w0] | (p[:, w0 + 1] << 32)) >> sh) & ((1 << bits) - 1)
+            w = q.to(torch.float32).view(-1, n // gs, gs)
+            w = w * scales[a : a + step].to(dev, torch.float32).unsqueeze(-1)
+            w += biases[a : a + step].to(dev, torch.float32).unsqueeze(-1)
+            out[a : a + step] = w.view(-1, n)
+        return out
 
     # fp4 e2m1 magnitudes for codes 0-7; codes 8-15 mirror negative (sign is the msb)
     NVFP4_LUT = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
@@ -769,7 +844,8 @@ class TransformersBackend:
             if name.endswith(".weight"):
                 # ModelOpt-style scale sidecars stored next to the weight itself
                 stem = name[:-len(".weight")]
-                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale"):
+                for s in ("weight_scale", "weight_scale_2", "weight_scale_inv", "input_scale", "input_global_scale", "scale",
+                          "scales", "biases"):
                     if f"{stem}.{s}" in self.tensor_index:
                         total += 8 * self._nbytes(f"{stem}.{s}")
             # Underscore sidecars on suffix-less fused tensors (fp8 expert stacks)
@@ -813,6 +889,9 @@ class TransformersBackend:
     def _get_tensor(self, name):
         import re
         if name in self.tensor_index:
+            if self.mlx is not None and name.endswith(".weight") \
+                    and f"{name[:-len('.weight')]}.scales" in self.tensor_index:
+                return self._dequant_mlx(name[:-len(".weight")])
             # ModelOpt, ct-float-quantized and fp8 keep the quantized tensor under the plain
             # .weight name; the scale sidecar marks it as needing dequant. Fused fp8 expert
             # tensors (Mistral-Small-4 experts.gate_up_proj etc.) carry the same _scale_inv
@@ -924,7 +1003,7 @@ class TransformersBackend:
         prefix = self.prefix[id(module)]
         sd = {}
         shims = []
-        for pn, _ in module.named_parameters():
+        for pn, p in module.named_parameters():
             full = f"{prefix}.{pn}" if prefix else pn
             if full not in self.tensor_index and full.endswith(".weight") \
                     and f"{full[: -len('.weight')]}.shard_0.weight" in self.tensor_index:
@@ -933,7 +1012,16 @@ class TransformersBackend:
                 shims.append(pn)
                 continue
             t = self._get_tensor(full)
-            if t.is_floating_point() and not (t.dtype == torch.float32 and self._plain_fp32(full)):
+            mlx_fp32 = False
+            if self.mlx is not None:
+                if t.ndim >= 3 and t.shape != p.shape:
+                    t = t.movedim(-1, 1)
+                if t.ndim == 1 and full.endswith(self.mlx_norm_shift):
+                    # Kept in fp32: the difference is not always representable in bf16, and the
+                    # norm adds the 1 back in fp32, which restores the stored gain exactly
+                    t = t.float() - 1.0
+                    mlx_fp32 = True
+            if t.is_floating_point() and not (t.dtype == torch.float32 and (mlx_fp32 or self._plain_fp32(full))):
                 t = t.to(self.device, self.dtype)
             else:
                 t = t.to(self.device)
@@ -1056,7 +1144,7 @@ class TransformersBackend:
                     sub._parameters[pn] = torch.nn.Parameter(p.to("meta"), requires_grad = False)
 
     @torch.inference_mode()
-    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def _run_streaming(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         base, head = self._text_parts()
         layers = self._decoder_layers()
         embed = self.model.get_input_embeddings()
@@ -1097,7 +1185,7 @@ class TransformersBackend:
 
         nz = ids != 0
         row_len = (ids.shape[1] - nz.flip(1).int().argmax(dim = 1)) * nz.any(dim = 1).int()
-        row_len = row_len.clamp(min = 1).tolist()
+        row_len = row_len.clamp(min = 1).tolist() if lengths is None else list(lengths)
         num_rows = ids.shape[0]
 
         pb_state = {"n": 0}
@@ -1210,14 +1298,14 @@ class TransformersBackend:
                 h.remove()
 
     @torch.inference_mode()
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         if self.streaming:
-            return self._run_streaming(ids, callback, noise_eps)
+            return self._run_streaming(ids, callback, noise_eps, lengths)
         hooks = self._noise_hooks(noise_eps) if noise_eps else []
         try:
             with ProgressBar("Evaluating", ids.shape[0]) as pb:
                 for r in range(ids.shape[0]):
-                    row = ids[r:r + 1].to(self.model.device)
+                    row = row_views(ids, lengths)[r].to(self.model.device)
                     out = self.model(input_ids = row, use_cache = False)
                     callback(r, out.logits)
                     del out
@@ -1362,14 +1450,15 @@ class LlamaCppBackend:
             "llama_cpp": getattr(llama_cpp, "__version__", "?"),
         }
 
-    def run(self, ids: torch.Tensor, callback, noise_eps: float = None):
+    def run(self, ids: torch.Tensor, callback, noise_eps: float = None, lengths: list[int] | None = None):
         assert not noise_eps, "Noise injection not supported for llamacpp engine"
         with ProgressBar("Evaluating", ids.shape[0]) as pb:
             for r in range(ids.shape[0]):
                 self.model.reset()
-                self.model.eval(ids[r].tolist())
+                row = row_views(ids, lengths)[r]
+                self.model.eval(row[0].tolist())
                 logits = torch.from_numpy(self.model.scores).unsqueeze(0)
-                logits = logits[:, :ids.shape[1]].to(self.device)
+                logits = logits[:, :row.shape[1]].to(self.device)
                 callback(r, logits)
                 pb.update(r + 1)
 
