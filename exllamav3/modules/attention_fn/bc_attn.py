@@ -128,6 +128,17 @@ def _get_sm_count(device: torch.device | int) -> int:
     return _sm_count[idx]
 
 
+def _module_window_size(module):
+    """BCAttn.window_size for a module. A module with window_arg() (the fork's attn.py) returns the
+    window itself: an int, or (left, right) when window_right is set. A module without it (upstream
+    v1.6.7) keeps window_right next to sliding_window, which only applies to a sliding window (>= 0)."""
+    if hasattr(module, "window_arg"):
+        return module.window_arg()
+    sw = module.sliding_window
+    wr = getattr(module, "window_right", 0)
+    return (sw, wr) if wr and sw >= 0 else sw
+
+
 class BCAttn:
     """Python-side owner of one ext.BC_Attention (per attention module and cache layer):
     collects the projection/norm/rope/cache handles at construction and compiles + registers the
@@ -158,9 +169,7 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        sw = module.window_arg() if hasattr(module, "window_arg") else module.sliding_window
-        wr = getattr(module, "window_right", 0)
-        self.window_size = (sw, wr) if wr and sw >= 0 else sw
+        self.window_size = _module_window_size(module)
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
