@@ -444,7 +444,10 @@ class DSV4Attention(Module):
         self.idx_wq_b = None
         self.idx_weights = None
         self.idx_wk = self.idx_k_norm = None
-        self.kv_source = None if layer_type == "sliding" else layer_idx if kv_source is None else kv_source
+        # V4.1 (layer_type "v41", DSV41Attention) has no pool here: the subclass sets kv_source after this
+        # constructor, to its own layer for the kv sources only. The fork's base built no compressor, indexer
+        # or kv_cache capability for "v41", so a pool owner for every "v41" layer would be wrong.
+        self.kv_source = None if layer_type in ("sliding", "v41") else layer_idx if kv_source is None else kv_source
         self.kv_owner = kv_owner
         self.indexer_mode = indexer_mode or ("full" if layer_type == "csa" else None)
         self.q_head_norm = q_head_norm
@@ -838,6 +841,12 @@ class DSV4Attention(Module):
                 "candidate_topk_blocks": self.candidate_topk_blocks,
                 "candidate_block_size": self.candidate_block_size,
             },
+            # V4.1 fields, consumed by tp_import (kw.update) and passed on to DSV41Attention
+            "kwargs41": {_a: getattr(self, _a) for _a in (
+                "is_kv_source", "is_index_source", "kv_source_layer",
+                "index_source_layer", "candidate_role", "candidate_topk_blocks",
+                "candidate_block_size", "ref_quant",
+            ) if hasattr(self, _a)},
             # A reader links to its pool owner's rank-local instance on import (every rank holds every
             # attention layer, the pools replicated)
             "kv_owner_key": self.kv_owner.key if self.kv_owner is not None else None,

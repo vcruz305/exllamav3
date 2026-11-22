@@ -342,7 +342,8 @@ class DSV4LayerState:
         self.idx_buf_kv = self.idx_buf_gate = None
         self.comp_ovl = self.idx_ovl = None
 
-        if module.compressor is not None:
+        if module.compressor is not None and module.layer_type != "v41":
+            # V4.1 layers keep their pending rows in DSV41LayerState; the fork allocated no compressor buffers for them
             m = module.compress_rate
             w = module.compressor.wkv.out_features_unpadded
             self.buf_rows = PAGE_SIZE + m
