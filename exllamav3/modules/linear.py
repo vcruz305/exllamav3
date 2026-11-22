@@ -780,6 +780,39 @@ class Linear(Module):
         return x
 
 
+    def row_out(self, device: torch.device) -> torch.Tensor:
+        """Preallocated (1, out_features) output buffer for forward_row, in this linear's output dtype"""
+        return torch.empty((1, self.out_features), dtype = self.out_dtype or torch.half, device = device)
+
+
+    def forward_row(self, x: torch.Tensor, out: torch.Tensor, params: dict | None = None) -> torch.Tensor:
+        """
+        Single-row call into a preallocated out (see row_out). x is one contiguous row of in_features values in
+        the input dtype (fp16). For an EXL3 inner without padding, pre/post scale, softcap, output trim, LoRA,
+        capture, override or reconstruct, this issues the same bc.run call that forward() makes for one row
+        (same kernel, same autotune entry), minus the wrapper work and the output allocation, so the result is
+        bit-identical. Anything else falls back to forward() and copies into out. Returns out viewed to
+        (*x.shape[:-1], out_features), as forward() returns it.
+        """
+        p = params if params is not None else {}
+        shape = (*x.shape[:-1], self.out_features)      # same shape forward() returns
+        if (
+            type(self.inner) is LinearEXL3
+            and x.numel() == self.in_features == self.in_features_unpadded
+            and self.out_features == self.out_features_unpadded
+            and out.dim() == 2 and out.shape[-1] == self.out_features
+            and out.dtype == (self.out_dtype or torch.half)
+            and x.is_contiguous() and out.is_contiguous()
+            and self.pre_scale == 1.0 and self.post_scale == 1.0 and self.softcap == 0.0
+            and not self.trim_padded_out and not self.lora_a_tensors
+            and not any(k in p for k in ("capture", "ovr", "reconstruct"))
+        ):
+            self.inner.bc.run(x if x.dim() == 2 else x.view(1, -1), out)
+            return out.view(shape)
+        out.copy_(self.forward(x, p).reshape(1, -1))
+        return out.view(shape)
+
+
     def apply_lora(self, lora_input: torch.Tensor, x: torch.Tensor):
         orig_shape = lora_input.shape
         flat = lora_input.view(-1, orig_shape[-1])
