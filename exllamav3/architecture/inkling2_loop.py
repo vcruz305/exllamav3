@@ -302,6 +302,7 @@ class Inkling2LoopModel(Model):
         self.tok_steps = 0          # decode tokens served by ext.InkToken (fast-path hit count)
         self.graph_captures = 0     # CUDA graphs captured for the token step
         self._gkey, self._graphs, self._gwarm = None, {}, {}
+        self._tok_taps_set = None   # tap configuration currently set on the token step
         c = config
 
         self.modules += [
@@ -397,6 +398,29 @@ class Inkling2LoopModel(Model):
         self.n_visits = c.loop_start + c.num_passes * (c.loop_end - c.loop_start) + (c.num_hidden_layers - c.loop_end)
         self.modules[self.logit_layer_idx].final_visit = self.n_visits
 
+    def _tok_tap_plan(self, params: dict):
+        """
+        Token-path plan for the drafter taps requested in params["export_state_layers"]: (visits, tapb, tapf), the
+        visits in export order (the order of the general path's export_states), tapb[bi] = output slot of block call
+        bi or -1, tapf = slot of the normed final state or -1. None when a requested visit is not one the token step
+        exports (more than four, or outside the visits of the forward).
+        """
+        exp = params.get("export_state_layers")
+        if not exp:
+            return None
+        visits = sorted(set(int(v) for v in exp))
+        final = self.n_visits
+        if len(visits) > 4 or any(v < 0 or v > final for v in visits):
+            return None
+        tapb = [-1] * self.n_visits
+        tapf = -1
+        for slot, v in enumerate(visits):
+            if v == final:
+                tapf = slot
+            else:
+                tapb[v] = slot
+        return tuple(visits), tapb, tapf
+
     def _tok_pages(self, x: torch.Tensor, params: dict):
         """
         The page list of the sequence up to the position (the page table of the token step), or None when the
@@ -404,7 +428,9 @@ class Inkling2LoopModel(Model):
         conv history (params recurrent_history, speculative passes) is handled in the step by the record flag
         """
         # A drafter's tap request needs the per-layer states of every row, which only the Python path exports
-        if self._tok_disabled or x.numel() != 1 or params.get("cache") is None or params.get("export_state_layers"):
+        if self._tok_disabled or x.numel() != 1 or params.get("cache") is None:
+            return None
+        if params.get("export_state_layers") and (not _GRAPH or self._tok_tap_plan(params) is None):
             return None
         rs = params.get("recurrent_states")
         if not rs or len(rs) != 1:
@@ -442,6 +468,7 @@ class Inkling2LoopModel(Model):
                     self._tok = ext.InkToken(_build_token(self, params))
                     self._tok_key = key
                     self._tok_pages_set = None
+                    self._tok_taps_set = None
                 except Exception as e:
                     self._tok_disabled = True
                     print(f" -- Inkling2 token path off ({e}); Python single-token path")
@@ -449,6 +476,18 @@ class Inkling2LoopModel(Model):
             pos = int(params["cache_seqlens"].tolist()[0])
             slot = params["recurrent_states"][0].slot
             record = bool(params.get("recurrent_history"))
+            plan = self._tok_tap_plan(params) if params.get("export_state_layers") else None
+            tap_key = plan[0] if plan else None
+            if self._tok_taps_set != (tap_key, plan[1:] if plan else None):
+                try:
+                    if plan:
+                        self._tok.set_taps(plan[1], plan[2])
+                    else:
+                        self._tok.set_taps([-1] * self.n_visits, -1)
+                except Exception as e:
+                    print(f" -- Inkling2 token step: tap plan not accepted ({e}); Python single-token path")
+                    return super().forward_ls(x, params)
+                self._tok_taps_set = (tap_key, plan[1:] if plan else None)
             if pages != self._tok_pages_set:            # the table changes when a page is added or the sequence is new
                 try:
                     self._tok.set_table(pages)
@@ -461,26 +500,36 @@ class Inkling2LoopModel(Model):
             if not _GRAPH:
                 return self._tok.step(tok_id, pos, slot, record)
             # CUDA graph: per-token values go through the device buffers (update), the captured step reads them.
-            gk = (id(self._tok), slot)
+            gk = (id(self._tok), slot, tap_key)
             if self._gkey != gk:
                 self._gkey, self._graphs, self._gwarm = gk, {}, {}
             self._tok.update(tok_id, pos, slot)
-            if record in self._graphs:
-                g, out = self._graphs[record]
-                g.replay()
-                return out.clone()
-            n = self._gwarm.get(record, 0)
-            if n < 2:                       # eager steps first: cuBLAS handles and allocator state before capture
-                self._gwarm[record] = n + 1
-                return self._tok.step_dev(record).clone()
-            g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes this token once
-            with torch.cuda.graph(g):
-                out = self._tok.step_dev(record)
-            g.replay()
-            self._graphs[record] = (g, out)
-            self.graph_captures += 1
-            return out.clone()
+            out = self._tok_step_graph(record)
+            if plan:
+                # the taps of this token, in the order the general path appends them (visit order, final last)
+                tb = self._tok.tapbuf()
+                params.setdefault("export_states", []).extend(
+                    tb[k, :1].reshape(1, 1, -1).clone() for k in range(len(plan[0])))
+            return out
         return super().forward_ls(x, params)
+
+    def _tok_step_graph(self, record: bool):
+        """One token step through the captured graph of this record flag (eager for the first two calls)."""
+        if record in self._graphs:
+            g, out = self._graphs[record]
+            g.replay()
+            return out.clone()
+        n = self._gwarm.get(record, 0)
+        if n < 2:                       # eager steps first: cuBLAS handles and allocator state before capture
+            self._gwarm[record] = n + 1
+            return self._tok.step_dev(record).clone()
+        g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes this token once
+        with torch.cuda.graph(g):
+            out = self._tok.step_dev(record)
+        g.replay()
+        self._graphs[record] = (g, out)
+        self.graph_captures += 1
+        return out.clone()
 
     @override
     def unload(self):

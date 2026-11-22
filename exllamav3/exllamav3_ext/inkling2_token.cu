@@ -204,6 +204,13 @@ struct InkToken {
     int64_t cap_ = 0;
     std::vector<int64_t> pt_host_;
 
+    // drafter taps (milestone 3): tapb_[bi] = tapbuf slot of block call bi (-1: none), tapf_ = slot of the normed
+    // final state. tapbuf is fp16 (4, TMAX, H); row 0 holds the T = 1 tap. Set by set_taps() before capture.
+    static constexpr int64_t TMAX = 9;
+    at::Tensor tapbuf;
+    std::vector<int64_t> tapb_;
+    int64_t tapf_ = -1;
+
     explicit InkToken(const py::dict& s)
     {
         H = get<int64_t>(s, "H");
@@ -235,6 +242,19 @@ struct InkToken {
             hI[k] = at::empty({1 + 3 * NB + 1}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
             hD[k] = at::empty({NB}, at::TensorOptions().dtype(at::kDouble).pinned_memory(true));
         }
+        tapbuf = at::zeros({4, TMAX, H}, emb.options().dtype(at::kHalf));
+        tapb_.assign(NB, -1);
+    }
+
+    // Tap export configuration: tapb[bi] = slot (0..3) of block call bi or -1; tapf = slot of the normed final state
+    // or -1. Changes the captured graph (the caller keys its graphs on it).
+    void set_taps(const std::vector<int64_t>& tapb, int64_t tapf)
+    {
+        TORCH_CHECK((int64_t)tapb.size() == NB, "InkToken: one tap entry per block call");
+        for (int64_t t : tapb) TORCH_CHECK(t >= -1 && t < 4, "InkToken: tap slot");
+        TORCH_CHECK(tapf >= -1 && tapf < 4, "InkToken: tap slot");
+        tapb_ = tapb;
+        tapf_ = tapf;
     }
 
     // Page table of the sequence (logical page i -> cache page pages[i]). Only the pages that hold positions up to the
@@ -457,6 +477,9 @@ struct InkToken {
                 }
             }
 
+            // drafter tap: the block input after the loop bookkeeping (what Inkling2Block exports)
+            if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, 0, 1).copy_(x);
+
             // Attention residual -> sublayer inputs
             at::Tensor hs;
             if (b.l0) {
@@ -555,6 +578,7 @@ struct InkToken {
         fsrc.push_back(x);
         at::Tensor fx = attn_res_torch(fsrc, fin_q_t);                                 // (1, H): Inkling2Final's torch attn_res
         at::Tensor xn = at::mul(at::rms_norm(fx, {Hc}, c10::nullopt, eps_fin), fin_norm).to(at::kHalf).contiguous();
+        if (tapf_ >= 0) tapbuf.select(0, tapf_).narrow(0, 0, 1).copy_(xn);
         at::Tensor logits = head->run_alloc(xn, Vpad, false);                           // LinearEXL3.forward at one row
         if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
         return logits.view({1, 1, Vpad}).narrow(-1, 0, V);
@@ -568,5 +592,7 @@ void ink_token_bind(py::module_& m)
         .def("set_table", &InkToken::set_table, py::arg("pages"))
         .def("step", &InkToken::step, py::arg("token"), py::arg("pos"), py::arg("slot"), py::arg("record"))
         .def("update", &InkToken::update, py::arg("token"), py::arg("pos"), py::arg("slot"))
-        .def("step_dev", &InkToken::step_dev, py::arg("record"));
+        .def("step_dev", &InkToken::step_dev, py::arg("record"))
+        .def("set_taps", &InkToken::set_taps, py::arg("tapb"), py::arg("tapf"))
+        .def("tapbuf", [](InkToken& t) { return t.tapbuf; });
 }
