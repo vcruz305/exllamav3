@@ -192,12 +192,17 @@ struct InkToken {
     at::Tensor emb, emb_norm, fin_q_t, fin_norm, ids;
     std::shared_ptr<BC_LinearEXL3> head;
     std::vector<InkBlock> blocks;
-    // device-side per-token state (graph-replayable): dI = [flat, (row0, L, nc) per block, token], dD = tau per block.
+    // device-side per-token state (graph-replayable): dI = [pos, (lo, L, nc) per block, token], dD = tau per block.
     // Written by update() from pinned host slots; a slot is reused only after its copy event has completed.
     int64_t slot_ = 0, NB = 0;
     at::Tensor dI, dD, hI[4], hD[4];
     at::cuda::CUDAEvent evs_[4];
     int hs_ = 0;
+    // page table of the sequence: logical page -> cache page, device int32 with capacity cap_ (one entry per cache
+    // page). Uploaded by set_table() when it changes; the buffer keeps its address, so a captured step reads it.
+    at::Tensor pt_;
+    int64_t cap_ = 0;
+    std::vector<int64_t> pt_host_;
 
     explicit InkToken(const py::dict& s)
     {
@@ -220,6 +225,10 @@ struct InkToken {
             blocks.push_back(parse_block(item.cast<py::dict>()));
         }
         NB = (int64_t)blocks.size();
+        TORCH_CHECK(page == INK_PAGE, "InkToken: page size must be INK_PAGE");
+        cap_ = (int64_t)1 << 40;
+        for (auto& b : blocks) cap_ = std::min<int64_t>(cap_, b.kf.size(0) / page);
+        pt_ = at::zeros({cap_}, emb.options().dtype(at::kInt));
         dI = at::zeros({1 + 3 * NB + 1}, emb.options().dtype(at::kLong));
         dD = at::zeros({NB}, emb.options().dtype(at::kDouble));
         for (int k = 0; k < 4; ++k) {
@@ -228,24 +237,37 @@ struct InkToken {
         }
     }
 
+    // Page table of the sequence (logical page i -> cache page pages[i]). Only the pages that hold positions up to the
+    // current one are read; the copy happens when the table changes (not per token). Stream-ordered, outside any
+    // captured region: a graph replay reads the buffer at its address.
+    void set_table(const std::vector<int64_t>& pages)
+    {
+        TORCH_CHECK((int64_t)pages.size() <= cap_, "InkToken: page table longer than the cache");
+        for (int64_t p : pages) TORCH_CHECK(p >= 0 && p < cap_, "InkToken: page index outside the cache");
+        if (pages == pt_host_) return;
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        std::vector<int32_t> h(pages.begin(), pages.end());
+        pt_.narrow(0, 0, (int64_t)h.size()).copy_(at::tensor(h));
+        pt_host_ = pages;
+    }
+
     // Host side of one token: fills the next pinned slot and copies it to the device buffers (async, stream-ordered).
     // Call before step_dev(); no kernel launches here, so it is outside any CUDA graph.
-    void update(int64_t token, int64_t pos, int64_t base_page, int64_t slot)
+    void update(int64_t token, int64_t pos, int64_t slot)
     {
         const at::cuda::OptionalCUDAGuard guard(emb.device());
         slot_ = slot;
-        const int64_t base = base_page * page, flat = base + pos;
         const int k = hs_;
         hs_ = (hs_ + 1) % 4;
         if (evs_[k].isCreated()) evs_[k].synchronize();
         int64_t* I = hI[k].data_ptr<int64_t>();
         double* Dd = hD[k].data_ptr<double>();
-        I[0] = flat;
+        I[0] = pos;
         for (int64_t i = 0; i < NB; ++i) {
             const InkBlock& b = blocks[i];
             const int64_t lo = (b.W < 0) ? 0 : std::max<int64_t>(0, pos - (b.W - 1));
-            const int64_t row0 = base + lo, L = flat + 1 - row0;
-            I[1 + 3 * i] = row0;
+            const int64_t L = pos + 1 - lo;
+            I[1 + 3 * i] = lo;
             I[2 + 3 * i] = L;
             I[3 + 3 * i] = (L + INK_ACH_H - 1) / INK_ACH_H;
             Dd[i] = b.log_scaling ? 1.0 + b.alpha * std::log(std::max(((double)(pos + 1)) / b.nfloor, 1.0)) : 1.0;
@@ -256,11 +278,9 @@ struct InkToken {
         evs_[k].record(at::cuda::getCurrentCUDAStream());
     }
 
-    at::Tensor step(int64_t token, int64_t pos, int64_t base_page, int64_t slot, bool record)
+    at::Tensor step(int64_t token, int64_t pos, int64_t slot, bool record)
     {
         const at::cuda::OptionalCUDAGuard guard(emb.device());
-        const int64_t base = base_page * page;          // first flat cache row of the sequence
-        const int64_t flat = base + pos;                // row of the new token
         const int64_t Hc = H;
 
         // Embedding: F.embedding(...).float(), then rms * norm weight
@@ -349,13 +369,12 @@ struct InkToken {
                 b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip, tau);
             at::Tensor rs = b.ring.select(0, slot);                                  // (ch, ld)
             ink_kv_glue(k_raw, v_raw, rs.narrow(0, 0, 2 * b.kvc), k_in.reshape(-1), v_in.reshape(-1), b.kw, b.vw,
-                        b.kp, b.vp, b.kf, b.vf, flat, taps, record, b.qk_clip, b.eps);
+                        b.kp, b.vp, b.kf, b.vf, pos, pt_, taps, record, b.qk_clip, b.eps);
 
-            // Attention over the cache rows of the window, output projection
+            // Attention over the logical keys of the window, output projection
             const int64_t lo = (b.W < 0) ? 0 : std::max<int64_t>(0, pos - (b.W - 1));
-            const int64_t row0 = base + lo;
-            const int64_t L = flat + 1 - row0;
-            at::Tensor o = ink_attend(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, row0, L, b.sm_scale, b.Hk, b.E);
+            const int64_t L = pos + 1 - lo;
+            at::Tensor o = ink_attend(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_, lo, L, b.sm_scale, b.Hk, b.E);
             at::Tensor a = b.o->run_alloc(o.view({1, -1}), H, true);                   // (1, H) fp32
 
             // Attention output short conv; a block boundary also appends the block state
@@ -488,13 +507,14 @@ struct InkToken {
                 b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip, dD.narrow(0, bi, 1));
             at::Tensor rs = b.ring.select(0, slot_);                                  // (ch, ld)
             ink_kv_glue_dev(k_raw, v_raw, rs.narrow(0, 0, 2 * b.kvc), k_in.reshape(-1), v_in.reshape(-1), b.kw, b.vw,
-                        b.kp, b.vp, b.kf, b.vf, dI.narrow(0, 0, 1), taps, record, b.qk_clip, b.eps);
+                        b.kp, b.vp, b.kf, b.vf, dI.narrow(0, 0, 1), pt_, taps, record, b.qk_clip, b.eps);
 
-            // Attention over the cache rows of the window, output projection
+            // Attention over the logical keys of the window, output projection
             
             
             
-            at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, dI.narrow(0, 1 + 3 * bi, 3), b.sm_scale, b.Hk, b.E);
+            at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_, dI.narrow(0, 1 + 3 * bi, 3),
+                                          b.sm_scale, b.Hk, b.E);
             at::Tensor a = b.o->run_alloc(o.view({1, -1}), H, true);                   // (1, H) fp32
 
             // Attention output short conv; a block boundary also appends the block state
@@ -545,9 +565,8 @@ void ink_token_bind(py::module_& m)
 {
     py::class_<InkToken, std::shared_ptr<InkToken>>(m, "InkToken")
         .def(py::init<const py::dict&>())
-        .def("step", &InkToken::step, py::arg("token"), py::arg("pos"), py::arg("base_page"), py::arg("slot"),
-             py::arg("record"))
-        .def("update", &InkToken::update, py::arg("token"), py::arg("pos"), py::arg("base_page"),
-             py::arg("slot"))
+        .def("set_table", &InkToken::set_table, py::arg("pages"))
+        .def("step", &InkToken::step, py::arg("token"), py::arg("pos"), py::arg("slot"), py::arg("record"))
+        .def("update", &InkToken::update, py::arg("token"), py::arg("pos"), py::arg("slot"))
         .def("step_dev", &InkToken::step_dev, py::arg("record"));
 }

@@ -42,6 +42,18 @@ KV_DTYPE = torch.half
 # (exllamav3_ext/inkling2.cu, see Inkling2Block._forward_t1). INKLING2_T1=0 keeps the eager path for A/B and checks.
 _T1 = os.environ.get("INKLING2_T1", "1") != "0"
 
+# Device page tables of the single-token path, one entry (the last one) per process: the page list of the sequence
+# as an int32 tensor on the device. Rebuilt only when the list changes (a new page or a new sequence).
+_PT_CACHE = [None, None]
+
+
+def _page_table(pages: list, device) -> torch.Tensor:
+    key = (device, tuple(pages))
+    if _PT_CACHE[0] != key:
+        _PT_CACHE[0] = key
+        _PT_CACHE[1] = torch.tensor(pages, dtype = torch.int32, device = device)
+    return _PT_CACHE[1]
+
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
     # One fused kernel on CUDA; same math as x * rsqrt(mean(x^2) + eps), which is 5 aten ops when written out
@@ -490,11 +502,11 @@ class Inkling2Attention(Module):
         return (win.reshape(bsz, seq, H, C // H, k) * w).sum(-1).reshape(bsz, seq, C)
 
     def project_t1(self, q_in, k_in, v_in, tau: float, params: dict, ring: "Inkling2Ring", slot: int,
-                   kf: torch.Tensor, vf: torch.Tensor, row: int):
+                   kf: torch.Tensor, vf: torch.Tensor, pos: int, pt: torch.Tensor):
         """
-        project() for one token (T == 1, one sequence) with the K/V rows written to cache row `row`: the linears run
-        as usual, the query side and the K/V side (short conv, history, norms, cache write) run as one kernel each.
-        Returns q (Hq * D), rel (Hq * E), sink (Hq), gate (Hq * D), all fp32 flat.
+        project() for one token (T == 1, one sequence) at logical position pos: the linears run as usual, the query
+        side and the K/V side (short conv, history, norms, cache write through the page table pt) run as one kernel
+        each. Returns q (Hq * D), rel (Hq * E), sink (Hq), gate (Hq * D), all fp32 flat.
         """
         qh = q_in.to(ACT_DTYPE).contiguous()
         same = k_in is q_in and v_in is q_in
@@ -514,14 +526,15 @@ class Inkling2Attention(Module):
         ext.ink_kv_glue(
             k_raw, v_raw, ring.state[slot, :2 * C], k_in.reshape(-1), v_in.reshape(-1),
             fk["w"] if "w" in fk else fk["static"], fv["w"] if "w" in fv else fv["static"],
-            fk.get("proj"), fv.get("proj"), kf, vf, row, self.ksize - 1, ring.record,
+            fk.get("proj"), fv.get("proj"), kf, vf, pos, pt, self.ksize - 1, ring.record,
             float(self.qk_clip), float(self.eps),
         )
         return q, rel, sink, gate
 
-    def attend_t1(self, q, rel, sink, gate, kf: torch.Tensor, vf: torch.Tensor, row0: int, L: int) -> torch.Tensor:
-        """Single query over cache rows [row0, row0 + L), output (o * gate) fp16 flat (Hq * D)"""
-        return ext.ink_attend(q, rel, sink, gate, kf, vf, row0, L, self.sm_scale, self.num_kv_heads, self.rel_extent)
+    def attend_t1(self, q, rel, sink, gate, kf: torch.Tensor, vf: torch.Tensor, pt: torch.Tensor, lo: int,
+                  L: int) -> torch.Tensor:
+        """Single query over the logical keys [lo, lo + L) (page table pt), output (o * gate) fp16 flat (Hq * D)"""
+        return ext.ink_attend(q, rel, sink, gate, kf, vf, pt, lo, L, self.sm_scale, self.num_kv_heads, self.rel_extent)
 
     def project(self, q_in, k_in, v_in, tau: torch.Tensor | None, params: dict, ring: Inkling2Ring):
         """
@@ -887,18 +900,18 @@ class Inkling2Block(Module):
         return t
 
     def _t1_rows(self, params: dict, ring: Inkling2Ring, bsz: int, seq: int):
-        """Block-table rows when the single-token kernels apply (one sequence, contiguous pages), else None"""
+        """Block-table rows when the single-token kernels apply (one sequence, pages up to the position), else None.
+        The pages need not be contiguous or ordered: the kernels translate every logical position through the table"""
         if not _T1 or bsz != 1 or seq != 1 or ring.state is None or len(ring.slots) != 1:
             return None
         bt = params.get("block_table")
         if params.get("cache") is None or bt is None or bt.is_cuda:
             return None
         rows = bt.tolist()
-        # Only the pages holding positions 0..pos have to be contiguous: the generator hands over a table
-        # padded with unused entries
+        # Only the pages holding positions 0..pos have to be in the table: the generator hands over a table padded
+        # with unused entries
         used = int(params["cache_seqlens"].tolist()[0]) // PAGE_SIZE + 1
-        row = rows[0]
-        if used > len(row) or not all(row[j] == row[0] + j for j in range(used)):
+        if used > len(rows[0]):
             return None
         return rows
 
@@ -914,11 +927,9 @@ class Inkling2Block(Module):
         slot = ring.slots[0]
         cache, bt = params["cache"], params["block_table"]
         pos = int(params["cache_seqlens"].tolist()[0])
-        base = rows[0][0] * PAGE_SIZE
-        flat = base + pos
+        pt = _page_table(rows[0][:pos // PAGE_SIZE + 1], x.device)
         lo = 0 if attn.sliding_window is None else max(0, pos - (attn.sliding_window - 1))
-        row0 = base + lo
-        L = flat + 1 - row0
+        L = pos + 1 - lo
         kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], bt, instance = instance)
         kf = kc.view(-1, attn.num_kv_heads, attn.head_dim)
         vf = vc.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -940,8 +951,8 @@ class Inkling2Block(Module):
             y = F.rms_norm(X, (H,), None, self.eps) * self.qkv_norm                             # (3, H)
             q_in, k_in, v_in = (y[i].view(1, 1, H) for i in range(3))
 
-        q, rel, sink, gate = attn.project_t1(q_in, k_in, v_in, tau, params, ring, slot, kf, vf, flat)
-        o = attn.attend_t1(q, rel, sink, gate, kf, vf, row0, L)
+        q, rel, sink, gate = attn.project_t1(q_in, k_in, v_in, tau, params, ring, slot, kf, vf, pos, pt)
+        o = attn.attend_t1(q, rel, sink, gate, kf, vf, pt, lo, L)
         cache.update_layer(self.layer_idx, params["cache_seqlens"], bt, kc, vc, 1, instance)
         a = attn.o_proj.forward(o.view(1, 1, -1), params, out_dtype = torch.float)              # (1, 1, H)
 

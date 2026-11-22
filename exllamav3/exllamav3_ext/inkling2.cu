@@ -613,10 +613,12 @@ __global__ void __launch_bounds__(128) ink_kv_glue_kernel(
     const float* __restrict__ k_in, const float* __restrict__ v_in,
     const float* __restrict__ wk, const float* __restrict__ wv,
     const float* __restrict__ pk, const float* __restrict__ pv,
-    __half* __restrict__ kc, __half* __restrict__ vc, long long row_h, const long long* __restrict__ row_p, int C, int H, int D, int taps, int record,
-    float qk_clip, float eps)
+    __half* __restrict__ kc, __half* __restrict__ vc, long long pos_h, const long long* __restrict__ pos_p,
+    const int* __restrict__ pt, int C, int H, int D, int taps, int record, float qk_clip, float eps)
 {
-    const long long row = row_p ? row_p[0] : row_h;
+    // the new token's cache row: logical position -> page table -> physical row
+    const long long pos = pos_p ? pos_p[0] : pos_h;
+    const long long row = (long long)pt[pos / INK_PAGE] * INK_PAGE + pos % INK_PAGE;
     __shared__ float red[32];
     __shared__ float dyn[INK_MAXK];
     const int h = blockIdx.x, which = blockIdx.y, d = threadIdx.x;
@@ -671,7 +673,7 @@ __global__ void __launch_bounds__(128) ink_kv_glue_kernel(
 
 void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k_in, at::Tensor v_in, at::Tensor wk,
                  at::Tensor wv, c10::optional<at::Tensor> pk, c10::optional<at::Tensor> pv, at::Tensor kf,
-                 at::Tensor vf, int64_t row, int64_t taps, bool record, double qk_clip, double eps)
+                 at::Tensor vf, int64_t pos, at::Tensor pt, int64_t taps, bool record, double qk_clip, double eps)
 {
     const int Hk = (int)kf.size(1), D = (int)kf.size(2), C = Hk * D, H = (int)k_in.numel();
     TORCH_CHECK(D == 128 && Hk * D == k_raw.numel() && v_raw.numel() == C, "ink_kv_glue: D must be 128, C = Hk * D");
@@ -680,7 +682,8 @@ void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k
     TORCH_CHECK(taps + 1 <= INK_MAXK && taps >= 1, "ink_kv_glue: taps");
     TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf && kf.is_contiguous() && vf.is_contiguous(),
                 "ink_kv_glue: fp16 contiguous cache");
-    TORCH_CHECK(row >= 0 && (row + 1) * C <= kf.numel(), "ink_kv_glue: row outside the cache");
+    TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_kv_glue: pt is a device int32 table");
+    TORCH_CHECK(pos >= 0 && pos / INK_PAGE < pt.numel(), "ink_kv_glue: position outside the page table");
     const at::cuda::OptionalCUDAGuard guard(st.device());
     const float* pkp = pk.has_value() ? pk->data_ptr<float>() : nullptr;
     const float* pvp = pv.has_value() ? pv->data_ptr<float>() : nullptr;
@@ -689,12 +692,12 @@ void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k
         k_raw.data_ptr<float>(), v_raw.data_ptr<float>(), st.data_ptr<float>(), st.stride(0),
         k_in.data_ptr<float>(), v_in.data_ptr<float>(), wk.data_ptr<float>(), wv.data_ptr<float>(), pkp, pvp,
         reinterpret_cast<__half*>(kf.data_ptr<at::Half>()), reinterpret_cast<__half*>(vf.data_ptr<at::Half>()),
-        row, nullptr, C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
+        (long long)pos, nullptr, pt.data_ptr<int>(), C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
 }
 
 void ink_kv_glue_dev(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k_in, at::Tensor v_in, at::Tensor wk,
                  at::Tensor wv, c10::optional<at::Tensor> pk, c10::optional<at::Tensor> pv, at::Tensor kf,
-                 at::Tensor vf, at::Tensor row_dev, int64_t taps, bool record, double qk_clip, double eps)
+                 at::Tensor vf, at::Tensor pos_dev, at::Tensor pt, int64_t taps, bool record, double qk_clip, double eps)
 {
     const int Hk = (int)kf.size(1), D = (int)kf.size(2), C = Hk * D, H = (int)k_in.numel();
     TORCH_CHECK(D == 128 && Hk * D == k_raw.numel() && v_raw.numel() == C, "ink_kv_glue: D must be 128, C = Hk * D");
@@ -703,7 +706,9 @@ void ink_kv_glue_dev(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tens
     TORCH_CHECK(taps + 1 <= INK_MAXK && taps >= 1, "ink_kv_glue: taps");
     TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf && kf.is_contiguous() && vf.is_contiguous(),
                 "ink_kv_glue: fp16 contiguous cache");
-    TORCH_CHECK(row_dev.numel() == 1 && row_dev.is_cuda(), "ink_kv_glue_dev: row must be a device scalar");
+    TORCH_CHECK(pos_dev.numel() == 1 && pos_dev.is_cuda() && pos_dev.scalar_type() == at::kLong,
+                "ink_kv_glue_dev: pos must be a device int64 scalar");
+    TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_kv_glue: pt is a device int32 table");
     const at::cuda::OptionalCUDAGuard guard(st.device());
     const float* pkp = pk.has_value() ? pk->data_ptr<float>() : nullptr;
     const float* pvp = pv.has_value() ? pv->data_ptr<float>() : nullptr;
@@ -712,154 +717,167 @@ void ink_kv_glue_dev(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tens
         k_raw.data_ptr<float>(), v_raw.data_ptr<float>(), st.data_ptr<float>(), st.stride(0),
         k_in.data_ptr<float>(), v_in.data_ptr<float>(), wk.data_ptr<float>(), wv.data_ptr<float>(), pkp, pvp,
         reinterpret_cast<__half*>(kf.data_ptr<at::Half>()), reinterpret_cast<__half*>(vf.data_ptr<at::Half>()),
-        0LL, reinterpret_cast<const long long*>(row_dev.data_ptr<int64_t>()), C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
+        0LL, reinterpret_cast<const long long*>(pos_dev.data_ptr<int64_t>()), pt.data_ptr<int>(),
+        C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
 }
 
+
 // ---------------------------------------------------------------------------------------------------------------------
-// Single-query attention over cache rows [row0, row0 + L) (the query sits at the last of them), one block per query
-// head: logits = scale * <q, k> + rel[L - 1 - j] (distance < E), softmax with the sink logit (value 0), o = sum p v,
-// output (o * gate) as fp16.
+// Single-query attention over the logical keys [lo, lo + L) of one sequence (the query is the last of them), one
+// block per query head group: logits = scale * <q, k> + rel[L - 1 - j] (distance < E), softmax with the sink logit
+// (value 0), o = sum p v, output (o * gate) as fp16. The key at logical position p is cache row
+// pt[p / INK_PAGE] * INK_PAGE + p % INK_PAGE (page table pt, device int32), so any page order works.
 // ---------------------------------------------------------------------------------------------------------------------
-// Single-query attention, split over key chunks so that every SM gets work (one block per (key chunk, kv head), the three
-// or fewer query heads of a kv head share the K / V loads), then a combine over the chunks with the sink:
+// Split over key chunks so that every SM gets work: grid (INK_GRID, kv heads), block b handles chunks b, b + grid, ...
+// The three or fewer query heads of a kv head share the K / V loads. Then a combine over the chunks with the sink:
 //   part: logits = scale * <q, k> + rel[L - 1 - j] (distance < E), chunk max m_c, p = exp(logit - m_c), l_c = sum p,
-//         o_c = sum p v (fp32), written per query head.
-//   comb: M = max(sink, m_c), den = exp(sink - M) + sum_c exp(m_c - M) l_c, o = sum_c exp(m_c - M) o_c / den * gate (fp16).
-#define INK_ACH 128        // keys per attend block (8 warps x 16 keys)
-#define INK_MAXNC 64       // key chunks per query: L <= 8192
-static_assert(INK_ACH == INK_ACH_H, "chunk size must match inkling2.cuh");
+//         o_c = sum p v (fp32), written per query head at chunk slot c (stride nstride).
+//   comb: M = max(sink, m_c), den = exp(sink - M) + sum_c exp(m_c - M) l_c, o = sum_c exp(m_c - M) o_c / den * gate.
+// A captured CUDA graph uses the same grid at any position: chunks past the window are skipped.
+#define INK_ACH 128        // keys per chunk (8 warps x 16 keys)
 #define INK_MAXGQ 4        // query heads per kv head
+static_assert(INK_ACH == INK_ACH_H, "chunk size must match inkling2.cuh");
 
 __global__ void __launch_bounds__(256) ink_attend_part_kernel(
     const float* __restrict__ q, const float* __restrict__ rel, const __half* __restrict__ kf,
-    const __half* __restrict__ vf, long long row0, int L, float sm_scale, int G, int Hk, int D, int E, int nc,
-    float* __restrict__ po, float* __restrict__ pml, const long long* __restrict__ par_p)
+    const __half* __restrict__ vf, const int* __restrict__ pt, long long lo, int L, float sm_scale, int G, int Hk,
+    int D, int E, int nstride, float* __restrict__ po, float* __restrict__ pml, const long long* __restrict__ par_p)
 {
-    if (par_p) { row0 = par_p[0]; L = (int)par_p[1]; }
+    if (par_p) { lo = par_p[0]; L = (int)par_p[1]; }
     __shared__ float slog[INK_MAXGQ][INK_ACH];
     __shared__ float sm32[32];
     __shared__ float osm[16][INK_MAXGQ][128];
-    const int c = blockIdx.x, hk = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    __shared__ long long srow[INK_ACH];                        // cache row of each key of the chunk
+    const int hk = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const long long KS = (long long)Hk * D;
-    const int j0 = c * INK_ACH;
-    const int n = min(INK_ACH, L - j0);
-    if (j0 >= L) return;                     // chunk beyond the window (device-sized grid)
+    const int nc = (L + INK_ACH - 1) / INK_ACH;
 
-    // step 1: warp = 16 keys, lane = 4 dims. Logits of the G query heads of this kv head.
-    float qv[INK_MAXGQ][4];
-    #pragma unroll
-    for (int gi = 0; gi < INK_MAXGQ; ++gi)
-        #pragma unroll
-        for (int i = 0; i < 4; ++i)
-            qv[gi][i] = gi < G ? q[(hk * G + gi) * D + lane * 4 + i] : 0.f;
-    float kk[16][4];
-    #pragma unroll
-    for (int t = 0; t < 16; ++t) {
-        const int jl = warp * 16 + t;
-        if (jl < n) ink_load4h(kf + (row0 + j0 + jl) * KS + hk * D + lane * 4, kk[t]);
-        else { kk[t][0] = kk[t][1] = kk[t][2] = kk[t][3] = 0.f; }
-    }
-    float part[INK_MAXGQ][16];
-    #pragma unroll
-    for (int gi = 0; gi < INK_MAXGQ; ++gi)
-        #pragma unroll
-        for (int t = 0; t < 16; ++t)
-            part[gi][t] = qv[gi][0] * kk[t][0] + qv[gi][1] * kk[t][1] + qv[gi][2] * kk[t][2] + qv[gi][3] * kk[t][3];
-    // reduce-scatter over the 64 logits (gi * 16 + t) of the warp: 62 shuffles instead of 320. Round r keeps the half
-    // of its values selected by lane bit r, so lane L ends with the sums of logits 2L and 2L + 1
-    float pv[64];
-    #pragma unroll
-    for (int gi = 0; gi < INK_MAXGQ; ++gi)
-        #pragma unroll
-        for (int t = 0; t < 16; ++t) pv[gi * 16 + t] = part[gi][t];
-    #pragma unroll
-    for (int half = 32, off = 16; half >= 2; half >>= 1, off >>= 1) {
-        const bool b = (lane & off) != 0;
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            if (i < half) {
-                const float send = b ? pv[i] : pv[i + half];
-                const float keep = b ? pv[i + half] : pv[i];
-                pv[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
-            }
+    for (int c = blockIdx.x; c < nc; c += gridDim.x) {
+        const int j0 = c * INK_ACH;
+        const int n = min(INK_ACH, L - j0);
+        if (tid < n) {
+            const long long p = lo + j0 + tid;                 // logical position of the key
+            srow[tid] = (long long)pt[p / INK_PAGE] * INK_PAGE + p % INK_PAGE;
         }
-    }
-    #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int idx = 2 * lane + j, gi = idx >> 4, t = idx & 15;
-        const int jl = warp * 16 + t;
-        if (gi < G && jl < n) {
-            float v = pv[j] * sm_scale;
-            const int dist = L - 1 - (j0 + jl);
-            if (dist < E) v += rel[(long long)(hk * G + gi) * E + dist];
-            slog[gi][jl] = v;
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // step 2: per query head, chunk max and exp (in place), chunk sum
-    for (int gi = 0; gi < G; ++gi) {
-        const float v = tid < n ? slog[gi][tid] : -INFINITY;
-        const float m = ink_block_max(v, sm32);
-        const float e = tid < n ? expf(v - m) : 0.f;
-        const float s = ink_block_sum(e, sm32);
-        if (tid < n) slog[gi][tid] = e;
-        if (tid == 0) {
-            const int hq = hk * G + gi;
-            pml[((long long)hq * nc + c) * 2] = m;
-            pml[((long long)hq * nc + c) * 2 + 1] = s;
-        }
-    }
-    __syncthreads();
-
-    // step 3: o_c = sum_j p_j v_j. Thread: 8 consecutive dims (one 16-byte load per key), keys kg, kg + 16, ... of the
-    // chunk; all 8 loads are issued before the first use. 16 key groups are reduced at the end.
-    const int dg = tid & 15, kg = tid >> 4;
-    uint4 vr[8];
-    #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-        const int jl = kg + 16 * t;
-        vr[t] = jl < n ? *reinterpret_cast<const uint4*>(vf + (row0 + j0 + jl) * KS + hk * D + dg * 8)
-                       : make_uint4(0u, 0u, 0u, 0u);
-    }
-    float acc[INK_MAXGQ][8];
-    #pragma unroll
-    for (int gi = 0; gi < INK_MAXGQ; ++gi)
+        // step 1: warp = 16 keys, lane = 4 dims. Logits of the G query heads of this kv head.
+        float qv[INK_MAXGQ][4];
         #pragma unroll
-        for (int e = 0; e < 8; ++e) acc[gi][e] = 0.f;
-    #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-        const int jl = kg + 16 * t;
-        const __half2* h2 = reinterpret_cast<const __half2*>(&vr[t]);
-        float v[8];
-        #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            const float2 f = __half22float2(h2[p]);
-            v[2 * p] = f.x; v[2 * p + 1] = f.y;
-        }
-        #pragma unroll
-        for (int gi = 0; gi < INK_MAXGQ; ++gi) {
-            if (gi < G && jl < n) {
-                const float pj = slog[gi][jl];
-                #pragma unroll
-                for (int e = 0; e < 8; ++e) acc[gi][e] += pj * v[e];
-            }
-        }
-    }
-    #pragma unroll
-    for (int gi = 0; gi < INK_MAXGQ; ++gi)
-        if (gi < G) {
+        for (int gi = 0; gi < INK_MAXGQ; ++gi)
             #pragma unroll
-            for (int e = 0; e < 8; ++e) osm[kg][gi][dg * 8 + e] = acc[gi][e];
-        }
-    __syncthreads();
-    for (int idx = tid; idx < G * 128; idx += blockDim.x) {      // G * 128 outputs
-        const int gi = idx >> 7, dd = idx & 127;
-        const int hq = hk * G + gi;
-        float s = 0.f;
+            for (int i = 0; i < 4; ++i)
+                qv[gi][i] = gi < G ? q[(hk * G + gi) * D + lane * 4 + i] : 0.f;
+        float kk[16][4];
         #pragma unroll
-        for (int g2 = 0; g2 < 16; ++g2) s += osm[g2][gi][dd];
-        po[((long long)hq * nc + c) * D + dd] = s;
+        for (int t = 0; t < 16; ++t) {
+            const int jl = warp * 16 + t;
+            if (jl < n) ink_load4h(kf + srow[jl] * KS + hk * D + lane * 4, kk[t]);
+            else { kk[t][0] = kk[t][1] = kk[t][2] = kk[t][3] = 0.f; }
+        }
+        float part[INK_MAXGQ][16];
+        #pragma unroll
+        for (int gi = 0; gi < INK_MAXGQ; ++gi)
+            #pragma unroll
+            for (int t = 0; t < 16; ++t)
+                part[gi][t] = qv[gi][0] * kk[t][0] + qv[gi][1] * kk[t][1] + qv[gi][2] * kk[t][2] + qv[gi][3] * kk[t][3];
+        // reduce-scatter over the 64 logits (gi * 16 + t) of the warp: 62 shuffles instead of 320. Round r keeps the half
+        // of its values selected by lane bit r, so lane L ends with the sums of logits 2L and 2L + 1
+        float pv[64];
+        #pragma unroll
+        for (int gi = 0; gi < INK_MAXGQ; ++gi)
+            #pragma unroll
+            for (int t = 0; t < 16; ++t) pv[gi * 16 + t] = part[gi][t];
+        #pragma unroll
+        for (int half = 32, off = 16; half >= 2; half >>= 1, off >>= 1) {
+            const bool b = (lane & off) != 0;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < half) {
+                    const float send = b ? pv[i] : pv[i + half];
+                    const float keep = b ? pv[i + half] : pv[i];
+                    pv[i] = keep + __shfl_xor_sync(0xffffffffu, send, off);
+                }
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int idx = 2 * lane + j, gi = idx >> 4, t = idx & 15;
+            const int jl = warp * 16 + t;
+            if (gi < G && jl < n) {
+                float v = pv[j] * sm_scale;
+                const int dist = L - 1 - (j0 + jl);
+                if (dist < E) v += rel[(long long)(hk * G + gi) * E + dist];
+                slog[gi][jl] = v;
+            }
+        }
+        __syncthreads();
+
+        // step 2: per query head, chunk max and exp (in place), chunk sum
+        for (int gi = 0; gi < G; ++gi) {
+            const float v = tid < n ? slog[gi][tid] : -INFINITY;
+            const float m = ink_block_max(v, sm32);
+            const float e = tid < n ? expf(v - m) : 0.f;
+            const float s = ink_block_sum(e, sm32);
+            if (tid < n) slog[gi][tid] = e;
+            if (tid == 0) {
+                const int hq = hk * G + gi;
+                pml[((long long)hq * nstride + c) * 2] = m;
+                pml[((long long)hq * nstride + c) * 2 + 1] = s;
+            }
+        }
+        __syncthreads();
+
+        // step 3: o_c = sum_j p_j v_j. Thread: 8 consecutive dims (one 16-byte load per key), keys kg, kg + 16, ... of
+        // the chunk; all 8 loads are issued before the first use. 16 key groups are reduced at the end.
+        const int dg = tid & 15, kg = tid >> 4;
+        uint4 vr[8];
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int jl = kg + 16 * t;
+            vr[t] = jl < n ? *reinterpret_cast<const uint4*>(vf + srow[jl] * KS + hk * D + dg * 8)
+                           : make_uint4(0u, 0u, 0u, 0u);
+        }
+        float acc[INK_MAXGQ][8];
+        #pragma unroll
+        for (int gi = 0; gi < INK_MAXGQ; ++gi)
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) acc[gi][e] = 0.f;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int jl = kg + 16 * t;
+            const __half2* h2 = reinterpret_cast<const __half2*>(&vr[t]);
+            float v[8];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const float2 f = __half22float2(h2[p]);
+                v[2 * p] = f.x; v[2 * p + 1] = f.y;
+            }
+            #pragma unroll
+            for (int gi = 0; gi < INK_MAXGQ; ++gi) {
+                if (gi < G && jl < n) {
+                    const float pj = slog[gi][jl];
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[gi][e] += pj * v[e];
+                }
+            }
+        }
+        #pragma unroll
+        for (int gi = 0; gi < INK_MAXGQ; ++gi)
+            if (gi < G) {
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) osm[kg][gi][dg * 8 + e] = acc[gi][e];
+            }
+        __syncthreads();
+        for (int idx = tid; idx < G * 128; idx += blockDim.x) {      // G * 128 outputs
+            const int gi = idx >> 7, dd = idx & 127;
+            const int hq = hk * G + gi;
+            float s = 0.f;
+            #pragma unroll
+            for (int g2 = 0; g2 < 16; ++g2) s += osm[g2][gi][dd];
+            po[((long long)hq * nstride + c) * D + dd] = s;
+        }
+        __syncthreads();                                             // shared buffers free for the next chunk
     }
 }
 
@@ -869,7 +887,7 @@ __global__ void __launch_bounds__(128) ink_attend_comb_kernel(
     __half* __restrict__ o_out)
 {
     const int ncn = par_p ? (int)par_p[2] : nc;
-    __shared__ float w[INK_MAXNC];
+    __shared__ float w[INK_NSTORE];
     __shared__ float inv;
     const int hq = blockIdx.x, tid = threadIdx.x;
     if (tid == 0) {
@@ -891,18 +909,27 @@ __global__ void __launch_bounds__(128) ink_attend_comb_kernel(
     }
 }
 
-at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
-                      int64_t row0, int64_t L, double sm_scale, int64_t Hk, int64_t E)
+static void ink_attend_check(const at::Tensor& q, const at::Tensor& rel, const at::Tensor& sink, const at::Tensor& gate,
+                             const at::Tensor& kf, const at::Tensor& vf, const at::Tensor& pt, int64_t Hk, int64_t E)
 {
     const int Hq = (int)sink.numel(), D = (int)kf.size(2);
     TORCH_CHECK(D == 128 && Hq % Hk == 0 && Hq <= 256, "ink_attend: D must be 128, Hq a multiple of Hk");
     TORCH_CHECK(Hq / Hk <= INK_MAXGQ, "ink_attend: at most 4 query heads per kv head");
-    TORCH_CHECK(L >= 1 && L <= 8192 && row0 >= 0 && (row0 + L) * (int64_t)(Hk * D) <= kf.numel(), "ink_attend: key range");
     TORCH_CHECK(q.numel() == Hq * D && gate.numel() == Hq * D && rel.numel() == Hq * E, "ink_attend: shapes");
     TORCH_CHECK(q.scalar_type() == at::kFloat && rel.scalar_type() == at::kFloat && sink.scalar_type() == at::kFloat
                 && gate.scalar_type() == at::kFloat && q.is_contiguous() && rel.is_contiguous()
                 && sink.is_contiguous() && gate.is_contiguous(), "ink_attend: fp32 contiguous q/rel/sink/gate");
     TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf, "ink_attend: fp16 cache");
+    TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_attend: pt is a device int32 table");
+}
+
+at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
+                      at::Tensor pt, int64_t lo, int64_t L, double sm_scale, int64_t Hk, int64_t E)
+{
+    ink_attend_check(q, rel, sink, gate, kf, vf, pt, Hk, E);
+    TORCH_CHECK(L >= 1 && L <= (int64_t)INK_NSTORE * INK_ACH && lo >= 0, "ink_attend: key range");
+    TORCH_CHECK((lo + L - 1) / INK_PAGE < pt.numel(), "ink_attend: keys outside the page table");
+    const int Hq = (int)sink.numel(), D = (int)kf.size(2);
     const at::cuda::OptionalCUDAGuard guard(q.device());
     const int G = Hq / (int)Hk;
     const int nc = (int)((L + INK_ACH - 1) / INK_ACH);
@@ -910,36 +937,38 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
     auto pml = at::empty({Hq, nc, 2}, q.options());
     auto o = at::empty({Hq * D}, q.options().dtype(at::kHalf));
     auto stream = at::cuda::getCurrentCUDAStream();
-    ink_attend_part_kernel<<<dim3(nc, (unsigned)Hk), 256, 0, stream>>>(
+    ink_attend_part_kernel<<<dim3(nc < INK_GRID ? nc : INK_GRID, (unsigned)Hk), 256, 0, stream>>>(
         q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
-        row0, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc, po.data_ptr<float>(), pml.data_ptr<float>(), nullptr);
+        pt.data_ptr<int>(), (long long)lo, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc,
+        po.data_ptr<float>(), pml.data_ptr<float>(), nullptr);
     ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
         sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), nc, nc, nullptr, D,
         reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
     return o;
 }
 
-// Same as ink_attend with the window in a device tensor par = [row0, L, nc] (int64, nc = ceil(L / INK_ACH)); the
-// grid is fixed at INK_MAXNC chunks and idle chunks exit, so a captured CUDA graph replays at any position.
+// Same as ink_attend with the window in a device tensor par = [lo, L, nc] (int64, nc = ceil(L / INK_ACH)); the grid
+// is fixed (INK_GRID x kv heads) and the split buffers hold INK_NSTORE chunks, so a captured CUDA graph replays at
+// any position up to INK_NSTORE * INK_ACH keys.
 at::Tensor ink_attend_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
-                          at::Tensor par, double sm_scale, int64_t Hk, int64_t E)
+                          at::Tensor pt, at::Tensor par, double sm_scale, int64_t Hk, int64_t E)
 {
-    const int Hq = (int)sink.numel(), D = (int)kf.size(2);
-    TORCH_CHECK(D == 128 && Hq % Hk == 0 && Hq <= 256 && Hq / Hk <= INK_MAXGQ, "ink_attend_dev: shape");
+    ink_attend_check(q, rel, sink, gate, kf, vf, pt, Hk, E);
     TORCH_CHECK(par.numel() == 3 && par.scalar_type() == at::kLong && par.is_cuda(), "ink_attend_dev: par");
+    const int Hq = (int)sink.numel(), D = (int)kf.size(2);
     const int G = Hq / (int)Hk;
-    auto po = at::empty({Hq, INK_MAXNC, D}, q.options());
-    auto pml = at::empty({Hq, INK_MAXNC, 2}, q.options());
+    auto po = at::empty({Hq, INK_NSTORE, D}, q.options());
+    auto pml = at::empty({Hq, INK_NSTORE, 2}, q.options());
     auto o = at::empty({Hq * D}, q.options().dtype(at::kHalf));
     auto stream = at::cuda::getCurrentCUDAStream();
-    ink_attend_part_kernel<<<dim3(INK_MAXNC, (unsigned)Hk), 256, 0, stream>>>(
+    ink_attend_part_kernel<<<dim3(INK_GRID, (unsigned)Hk), 256, 0, stream>>>(
         q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
-        0LL, 1, (float)sm_scale, G, (int)Hk, D, (int)E, INK_MAXNC, po.data_ptr<float>(), pml.data_ptr<float>(),
-        reinterpret_cast<const long long*>(par.data_ptr<int64_t>()));
+        pt.data_ptr<int>(), 0LL, 1, (float)sm_scale, G, (int)Hk, D, (int)E, INK_NSTORE,
+        po.data_ptr<float>(), pml.data_ptr<float>(), reinterpret_cast<const long long*>(par.data_ptr<int64_t>()));
     ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
-        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), INK_MAXNC, INK_MAXNC,
-        reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
+        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), INK_NSTORE,
+        INK_NSTORE, reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
     return o;
 }
