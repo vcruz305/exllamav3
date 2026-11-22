@@ -88,6 +88,9 @@ _TOKEN = os.environ.get("INKLING2_TOKEN", "1") != "0"
 # Multi-row token forwards (T = 2..9, no recurrent history). Off by default: the sequential rows are slower than the
 # general path beyond two rows until the batched kernels exist (see PROGRESS.md).
 _TOKEN_T = os.environ.get("INKLING2_TOKEN_T", "0") == "1"
+# Batched multi-row forward (InkToken::step_rows2, the rows share the linears, head and experts; records the rewind
+# history). INKLING2_TOKEN_BATCH=0 keeps the sequential rows (no record support)
+_TOKEN_BATCH = os.environ.get("INKLING2_TOKEN_BATCH", "0") != "0"
 # exl3_mlin for the q, r, g, k, v projections of the token step (rounding-level change vs the per-linear BC path)
 _MLIN_TOK = os.environ.get("INKLING2_TOK_MLIN", "1") != "0"
 # CUDA-graph replay of the token step (per record flag); INKLING2_GRAPH=0 runs the same step eagerly
@@ -441,7 +444,7 @@ class Inkling2LoopModel(Model):
         # The sequential multi-row step (update_rows / step_rows) is exact without recurrent history only: with
         # history recording the rows of one forward must see each other's conv inputs in the window, which the
         # per-row token steps do not provide (the batched conv kernel is needed). Such forwards take the general path.
-        if T > 1 and (not _TOKEN_T or not _GRAPH or params.get("recurrent_history")):
+        if T > 1 and (not _TOKEN_T or not _GRAPH or (params.get("recurrent_history") and not _TOKEN_BATCH)):
             return None
         if params.get("export_state_layers") and (not _GRAPH or self._tok_tap_plan(params) is None):
             return None
@@ -479,6 +482,7 @@ class Inkling2LoopModel(Model):
             if self._tok is None or self._tok_key[0] is not key[0] or self._tok_key[1] is not key[1]:
                 try:
                     self._tok = ext.InkToken(_build_token(self, params))
+                    self._tok.set_batched(_TOKEN_BATCH)
                     self._tok_key = key
                     self._tok_pages_set = None
                     self._tok_taps_set = None

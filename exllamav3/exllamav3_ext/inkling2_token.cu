@@ -9,6 +9,7 @@
 // Stage 1: scalars (position, cache row, window, tau) are host arguments. Stage 2 replaces them with a device
 // parameter buffer so the step can be captured.
 #include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -42,6 +43,10 @@ static at::Tensor attn_res_torch(const std::vector<at::Tensor>& srcs, const at::
     w = at::softmax(w, 0);                                                     // over the sources
     return at::matmul(w.transpose(0, 1), stacked);                             // (nq, H)
 }
+
+// debugging: block inputs of the token or row step (InkToken::dump_on)
+static std::vector<at::Tensor> g_dump;
+static bool g_dump_on = false;
 
 struct InkBlock {
     int64_t layer = 0, instance = 0, Hq = 0, Hk = 0, D = 0, R = 0, E = 0, kvc = 0, W = -1;
@@ -213,6 +218,8 @@ struct InkToken {
     // T-row path (milestone 4): rows of the device parameter buffers are S = 2 + 3 NB int64 (pos, windows, token)
     // and NB doubles (tau); row r of a forward starts at r * S / r * NB. Tcur_ = rows of the staged forward.
     int64_t Tcur_ = 1;
+    // batched rows (step_rows2) or the sequential rows (step_row per row; no record support)
+    bool batched_ = true;
 
     explicit InkToken(const py::dict& s)
     {
@@ -519,6 +526,7 @@ struct InkToken {
                 }
             }
 
+            if (g_dump_on) g_dump.push_back(x.detach().clone());
             // drafter tap: the block input after the loop bookkeeping (what Inkling2Block exports)
             if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, r, 1).copy_(x);
 
@@ -628,10 +636,240 @@ struct InkToken {
 
     at::Tensor step_dev(bool record) { return step_row(0, record).unsqueeze(0); }      // (1, 1, V)
 
+    // Row-batched forward of the Tcur_ staged rows (one sequence, positions pos0 .. pos0 + T - 1). Batched over the
+    // rows: embedding, norms, the attention linears, the head, the routing ds3 group and the expert kernels (chunks of
+    // 8 rows). Per row, in order: the K/V cache write and the conv history step (row r sees rows < r), the attention
+    // over the cache, the attention-residual sources and the router gemv. record: the live conv history is restored
+    // after the rows and the rewind tail takes the window [history | rows] (what Inkling2Ring._store writes).
+    at::Tensor step_rows2(bool record)
+    {
+        const int64_t T = Tcur_, S = 2 + 3 * NB;
+        TORCH_CHECK(T >= 1 && T <= TMAX, "InkToken: 1..9 rows per forward");
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        const int64_t Hc = H;
+        auto row = [](const at::Tensor& t, int64_t r) { return t.narrow(0, r, 1); };
+        // debugging switch (bisection of the batched forward): 1 linears per row, 2 MoE per row, 4 router groups per row
+        const char* dbg_env = std::getenv("INKLING2_ROWS_MASK");
+        const int64_t dbgm = dbg_env ? std::atoi(dbg_env) : 0;
+        auto lin = [&](const std::shared_ptr<BC_LinearEXL3>& L, const at::Tensor& inp, int64_t nout) -> at::Tensor {
+            if (!(dbgm & 1)) return L->run_alloc(inp, nout, true).view({T, -1});
+            std::vector<at::Tensor> v;
+            for (int64_t r = 0; r < T; ++r) v.push_back(L->run_alloc(row(inp, r), nout, true).view({1, -1}));
+            return at::cat(v, 0);
+        };
+
+        at::Tensor tk = dI.view({TMAX, S}).narrow(0, 0, T).select(1, 1 + 3 * NB).contiguous();
+        at::Tensor e = at::embedding(emb, tk).to(at::kFloat);
+        at::Tensor x = at::mul(at::rms_norm(e, {Hc}, c10::nullopt, eps_emb), emb_norm);       // (T, H) fp32
+
+        std::vector<at::Tensor> bs;                     // block states, (T, H) fp32 each
+        at::Tensor pre_x;
+        std::vector<at::Tensor> pre_bs;
+        at::Tensor prev_b, prev_o;
+
+        int64_t bi = -1;
+        for (auto& b : blocks) {
+            ++bi;
+            at::Tensor rs = b.ring.select(0, slot_);                                       // (ch, ld)
+            const int64_t Ch = rs.size(0), ld = rs.size(1), kv2 = 2 * b.kvc;
+            at::Tensor Hs, Xr;
+            if (record) {
+                Hs = rs.narrow(1, 0, taps).clone();                                       // live history before the rows
+                Xr = at::empty({T, Ch}, rs.options());                                    // conv inputs, one row each
+            }
+
+            at::Tensor msgs;                                                               // (T, 4, H)
+            bool has_msg = false;
+            if (b.in_loop) {
+                if (b.loop_start) {
+                    if (b.instance == 0) {
+                        pre_x = x;
+                        pre_bs = bs;
+                    } else {
+                        prev_b = bs.back();
+                        prev_o = x;
+                        x = pre_x;
+                        bs = pre_bs;
+                    }
+                }
+                if (b.instance > 0) {
+                    std::vector<at::Tensor> ms;
+                    for (int64_t r = 0; r < T; ++r)
+                        ms.push_back(([](at::Tensor h, int64_t nq) { TORCH_CHECK(h.size(0) == nq, "InkToken: attention residual NQ"); return h; })(attn_res_torch(std::vector<at::Tensor>{row(prev_b, r), row(prev_o, r)}, b.msg_t), 4));
+                    msgs = at::stack(ms, 0);
+                    has_msg = true;
+                }
+            }
+
+            if (g_dump_on) g_dump.push_back(x.detach().clone());
+            if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, 0, T).copy_(x);
+
+            // attention residual -> sublayer inputs, per row. ink_attn_res returns (NQ, H): NQ = 3 on full blocks
+            // (q, k, v mixes), 1 otherwise. Each row keeps its own (NQ, H); (T, H) is only formed for the plain path.
+            std::vector<at::Tensor> hv;
+            for (int64_t r = 0; r < T; ++r) {
+                if (b.l0) {
+                    hv.push_back(row(x, r));
+                    continue;
+                }
+                std::vector<at::Tensor> srcs;
+                for (auto& s : bs) srcs.push_back(row(s, r));
+                srcs.push_back(row(x, r));
+                at::Tensor h = ink_attn_res(srcs, b.q_attn_t, b.eps);
+                TORCH_CHECK(h.size(0) == (b.full ? 3 : 1), "InkToken: attention residual NQ");
+                hv.push_back(h);
+            }
+            at::Tensor q_in, k_in, v_in;
+            bool same = false;
+            if (!has_msg && !b.full) {
+                at::Tensor hs = b.l0 ? x : at::cat(hv, 0);                                 // (T, H), one query per row
+                at::Tensor y = at::rms_norm(hs, {Hc}, b.qkv_norm[0], b.eps);
+                q_in = y;
+                k_in = y;
+                v_in = y;
+                same = true;
+            } else {
+                std::vector<at::Tensor> xs;
+                for (int64_t r = 0; r < T; ++r) {
+                    at::Tensor X = hv[r].size(0) == 3 ? hv[r] : hv[r].expand({3, Hc});
+                    if (has_msg) X = ink_gates(X, msgs.select(0, r).narrow(0, 0, 3), b.gd, b.gu, 0, 3, b.eps);
+                    xs.push_back(X);
+                }
+                at::Tensor XX = at::stack(xs, 0);                                          // (T, 3, H)
+                at::Tensor y = at::mul(at::rms_norm(XX, {Hc}, c10::nullopt, b.eps), b.qkv_norm);   // (T, 3, H)
+                q_in = y.select(1, 0);
+                k_in = y.select(1, 1);
+                v_in = y.select(1, 2);
+            }
+
+            // projections, batched over the rows
+            at::Tensor qh = q_in.to(at::kHalf).contiguous();
+            at::Tensor kh = same ? qh : k_in.to(at::kHalf).contiguous();
+            at::Tensor vh = same ? qh : v_in.to(at::kHalf).contiguous();
+            at::Tensor q_f = lin(b.q, qh, b.Hq * b.D);
+            at::Tensor r_f = lin(b.r, qh, b.Hq * b.R);
+            at::Tensor g_f = lin(b.g, qh, b.Hq * b.D);
+            at::Tensor k_raw = lin(b.k, kh, b.Hk * b.D);
+            at::Tensor v_raw = lin(b.v, vh, b.Hk * b.D);
+
+            // per row: query glue, K/V glue (conv history step, cache write), attention over the cache
+            at::Tensor ra = rs.narrow(0, kv2, H);                                          // attention conv history
+            at::Tensor rm = rs.narrow(0, kv2 + H, H);                                      // MLP conv history
+            if (b.boundary) bs.push_back(x);
+            std::vector<at::Tensor> ov;
+            for (int64_t r = 0; r < T; ++r) {
+                const int64_t base = r * S, dbase = r * NB;
+                std::vector<at::Tensor> qg = ink_q_glue_dev(
+                    row(q_f, r).reshape(-1), row(r_f, r).reshape(-1), row(g_f, r).reshape(-1), row(q_in, r).reshape(-1),
+                    b.q_scale, b.rel_scale, b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip,
+                    dD.narrow(0, dbase + bi, 1));
+                ink_kv_glue_dev(row(k_raw, r).reshape(-1), row(v_raw, r).reshape(-1), rs.narrow(0, 0, kv2),
+                                row(k_in, r).reshape(-1), row(v_in, r).reshape(-1), b.kw, b.vw, b.kp, b.vp, b.kf, b.vf,
+                                dI.narrow(0, base, 1), pt_, taps, false, b.qk_clip, b.eps);
+                if (record) {
+                    Xr.narrow(0, r, 1).narrow(1, 0, b.kvc).copy_(row(k_raw, r));
+                    Xr.narrow(0, r, 1).narrow(1, b.kvc, b.kvc).copy_(row(v_raw, r));
+                }
+                at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_,
+                                              dI.narrow(0, base + 1 + 3 * bi, 3), b.sm_scale, b.Hk, b.E);
+                ov.push_back(o.reshape({1, -1}));
+            }
+            at::Tensor a = lin(b.o, at::cat(ov, 0).contiguous(), H);   // (T, H) fp32
+
+            // attention output short conv (per row: the history steps in row order)
+            std::vector<at::Tensor> rv;
+            for (int64_t r = 0; r < T; ++r) {
+                at::Tensor ar = row(a, r).reshape(-1);
+                at::Tensor res = b.boundary
+                    ? ink_sconv(ra, ar, b.conv_attn, c10::nullopt, taps, false)
+                    : ink_sconv(ra, ar, b.conv_attn, row(x, r).reshape(-1), taps, false);
+                if (record) Xr.narrow(0, r, 1).narrow(1, kv2, H).copy_(ar.view({1, -1}));
+                rv.push_back(res.view({1, -1}));
+            }
+            at::Tensor RES = at::cat(rv, 0);                                                // (T, H)
+
+            // MLP input: attention residual over the block states, message gate, norm
+            std::vector<at::Tensor> mv;
+            for (int64_t r = 0; r < T; ++r) {
+                std::vector<at::Tensor> srcs2;
+                for (auto& s : bs) srcs2.push_back(row(s, r));
+                srcs2.push_back(row(RES, r));
+                mv.push_back(([](at::Tensor h, int64_t nq) { TORCH_CHECK(h.size(0) == nq, "InkToken: attention residual NQ"); return h; })(ink_attn_res(srcs2, b.q_mlp_t, b.eps), 1));                        // (1, H)
+            }
+            at::Tensor M = at::cat(mv, 0);
+            if (has_msg) {
+                std::vector<at::Tensor> gv;
+                for (int64_t r = 0; r < T; ++r)
+                    gv.push_back(ink_gates(row(M, r), msgs.select(0, r).narrow(0, 3, 1), b.gd, b.gu, 3, 1, b.eps));
+                M = at::cat(gv, 0);
+            }
+            at::Tensor mn = at::rms_norm(M, {Hc}, b.norm_mlp, b.eps).to(at::kHalf).contiguous();   // (T, H)
+
+            // router: gemv per row, the group selection over all rows; experts in chunks of 8 rows
+            const int64_t Ne = b.logits.numel(), K = b.sel.numel();
+            at::Tensor LG = at::empty({T, Ne}, b.logits.options());
+            for (int64_t r = 0; r < T; ++r)
+                routing_gemv_f32(row(mn, r).reshape(-1), b.gate_t, row(LG, r).reshape(-1));
+            at::Tensor SEL = at::empty({T, K}, b.sel.options());
+            at::Tensor WW = at::empty({T, K}, b.w.options());
+            if (dbgm & 4) {
+                for (int64_t r = 0; r < T; ++r)
+                    routing_ds3_group(row(LG, r), c10::optional<at::Tensor>(b.bias_f32), row(SEL, r), row(WW, r),
+                                      (float)b.rsf, 0, (int)b.n_group, (int)b.topk_group);
+            } else {
+                routing_ds3_group(LG, c10::optional<at::Tensor>(b.bias_f32), SEL, WW, (float)b.rsf, 0,
+                                  (int)b.n_group, (int)b.topk_group);
+            }
+            at::Tensor MO = at::empty({T, Hc}, x.options());
+            const int64_t CH = (dbgm & 2) ? 1 : 8;
+            for (int64_t c0 = 0; c0 < T; c0 += CH) {
+                const int64_t n = std::min<int64_t>(CH, T - c0);
+                at::Tensor xc = mn.narrow(0, c0, n), sc = SEL.narrow(0, c0, n), wc = WW.narrow(0, c0, n);
+                if (b.coop) b.coopmk->run(xc, sc, wc, c10::nullopt, -1, -1, -1);
+                else b.bc_moe->run_bszN(xc, sc, wc);
+                MO.narrow(0, c0, n).copy_(b.moe_out.narrow(0, 0, n));
+            }
+
+            // MLP output short conv with the residual (per row)
+            std::vector<at::Tensor> xv;
+            for (int64_t r = 0; r < T; ++r) {
+                at::Tensor mo = row(MO, r).reshape(-1);
+                xv.push_back(ink_sconv(rm, mo, b.conv_mlp, row(RES, r).reshape(-1), taps, false).view({1, Hc}));
+                if (record) Xr.narrow(0, r, 1).narrow(1, kv2 + H, H).copy_(mo.view({1, -1}));
+            }
+            x = at::cat(xv, 0);
+
+            if (record) {
+                // Inkling2Ring._store of a recorded pass: live history unchanged, tail = last n columns of [history | rows]
+                rs.narrow(1, 0, taps).copy_(Hs);
+                at::Tensor full = at::cat({Hs, Xr.t()}, 1);                                 // (ch, taps + T)
+                const int64_t n = std::min<int64_t>(ld, taps + T);
+                rs.narrow(1, ld - n, n).copy_(full.narrow(1, taps + T - n, n));
+            }
+        }
+
+        // Final: attention residual over the block states, norm, head (batched), softcap
+        std::vector<at::Tensor> fv;
+        for (int64_t r = 0; r < T; ++r) {
+            std::vector<at::Tensor> fsrc;
+            for (auto& s : bs) fsrc.push_back(row(s, r));
+            fsrc.push_back(row(x, r));
+            fv.push_back(([](at::Tensor h, int64_t nq) { TORCH_CHECK(h.size(0) == nq, "InkToken: attention residual NQ"); return h; })(attn_res_torch(fsrc, fin_q_t), 1));                                   // (1, H)
+        }
+        at::Tensor FX = at::cat(fv, 0);
+        at::Tensor xn = at::mul(at::rms_norm(FX, {Hc}, c10::nullopt, eps_fin), fin_norm).to(at::kHalf).contiguous();
+        if (tapf_ >= 0) tapbuf.select(0, tapf_).narrow(0, 0, T).copy_(xn);
+        at::Tensor logits = head->run_alloc(xn, Vpad, false).view({T, -1});
+        if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
+        return logits.narrow(-1, 0, V).unsqueeze(0);                                       // (1, T, V)
+    }
+
     // All Tcur_ rows of the staged forward, one token after another (each row sees the state the previous rows
     // wrote). Returns (1, Tcur_, V).
     at::Tensor step_rows(bool record)
     {
+        if (batched_) return step_rows2(record);
+        TORCH_CHECK(!record, "InkToken: sequential rows do not record history (set_batched(true))");
         std::vector<at::Tensor> rows;
         for (int64_t r = 0; r < Tcur_; ++r) rows.push_back(step_row(r, record));
         return at::cat(rows, 0).unsqueeze(0);
@@ -649,5 +887,8 @@ void ink_token_bind(py::module_& m)
         .def("set_taps", &InkToken::set_taps, py::arg("tapb"), py::arg("tapf"))
         .def("update_rows", &InkToken::update_rows, py::arg("tokens"), py::arg("pos0"), py::arg("slot"))
         .def("step_rows", &InkToken::step_rows, py::arg("record"))
+        .def("dump_on", [](InkToken&, bool v) { g_dump_on = v; g_dump.clear(); }, py::arg("on"))
+        .def("dump_get", [](InkToken&) { return g_dump; })
+        .def("set_batched", [](InkToken& t, bool v) { t.batched_ = v; }, py::arg("batched"))
         .def("tapbuf", [](InkToken& t) { return t.tapbuf; });
 }
