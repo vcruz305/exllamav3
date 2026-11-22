@@ -13,6 +13,9 @@ from ..modules.module import Module
 from ..modules.linear import Linear
 from ..modules.arch_specific.inkling2 import _side
 
+# INKLING2_MTP_GRAPH=0 runs the Markov walk eagerly (A/B check of the captured graph)
+_MTP_GRAPH = os.environ.get("INKLING2_MTP_GRAPH", "1") != "0"
+
 # Inkling2 MTP component: the DSpark block drafter stored in mtp.safetensors.
 # Semantics follow the vLLM reference (ref nvidia/dspark.py, ops/dspark.py, speculator.py):
 #   - L = processed length. The anchor (last sampled token) sits at position L and is not processed.
@@ -31,11 +34,15 @@ def _rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return x * w.float()
 
 
-def _rope(x: torch.Tensor, pos: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
-    """Neox RoPE on x (T, H, D), fp32; pos (T,) long."""
+def _rope_cs(pos: torch.Tensor, inv_freq: torch.Tensor):
+    """cos/sin tables (T, 1, D/2) for positions pos (T,) long. Shared by every layer of a round."""
     ang = pos.float()[:, None] * inv_freq[None, :]
-    cos = ang.cos()[:, None, :]
-    sin = ang.sin()[:, None, :]
+    return ang.cos()[:, None, :], ang.sin()[:, None, :]
+
+
+def _rope_apply(x: torch.Tensor, cs) -> torch.Tensor:
+    """Neox RoPE on x (T, H, D), fp32, with tables from _rope_cs."""
+    cos, sin = cs
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim = -1)
@@ -176,6 +183,7 @@ class Inkling2MTPModel(Model):
         self._cap = 0
         self._ctx_len = 0
         self._f_rnn = None
+        self._mg = None          # CUDA graph of the Markov walk (sample_from_state), built in _prepare's wake
         self.dev = None
         self.dense_context = True   # unpaged context: the generator must not reuse prefix pages (job.py)
 
@@ -211,6 +219,15 @@ class Inkling2MTPModel(Model):
             fold_b[s : s + 8192] = hc @ ho_b
         self._fold_w, self._fold_b = fold_w, fold_b
         del head
+        # Per-model constants, read every round before (alpha softmax, markov table, mask row, rope frequencies)
+        self._alpha_tab = torch.softmax(self.fuse_weight.t.float(), dim = -1)     # (rows, taps)
+        self._markov_tab = self.markov_w1.t.float()                              # (vocab, rank)
+        self._mask_f = self.mask_embed.t.float().expand(self.block - 1, self.hidden)
+        self._inv = 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2, dtype = torch.float,
+                                                        device = self.dev) / self.head_dim))
+        self._rnn_w_e = self._rnn_w_state[:, self.rank:].contiguous()           # emb part of [state | prev]
+        self._rnn_w_s = self._rnn_w_state[:, : self.rank].contiguous()          # state part
+        self._mg = None
         self._ready = True
 
     def _ensure_cap(self, n: int):
@@ -227,10 +244,10 @@ class Inkling2MTPModel(Model):
         self._cap = new_cap
 
     def _inv_freq(self):
-        return 1.0 / (self.theta ** (torch.arange(0, self.head_dim, 2, dtype = torch.float, device = self.dev) / self.head_dim))
+        return self._inv
 
     def _alpha(self, row: int) -> torch.Tensor:
-        return torch.softmax(self.fuse_weight.t.float()[row], dim = -1)
+        return self._alpha_tab[row]
 
     def _mix(self, taps: torch.Tensor, row: int, norm_w: torch.Tensor) -> torch.Tensor:
         """taps (4, n, H) fp32 -> RMSNorm(sum_t alpha[t] * taps[t]) (fp32)."""
@@ -244,13 +261,12 @@ class Inkling2MTPModel(Model):
         """Context K/V for positions [start, start + n) from taps (4, n, H) fp32."""
         n = taps.shape[1]
         self._ensure_cap(start + n)
-        inv = self._inv_freq()
-        pos = torch.arange(start, start + n, device = self.dev)
+        cs = _rope_cs(torch.arange(start, start + n, device = self.dev), self._inv)
         for i, layer in enumerate(self.layers):
             m = self._mix(taps, i, layer.dflare_norm.t).half()
             k = layer.k_proj_ctx.forward(m, {}).float().view(n, self.kv_heads, self.head_dim)
             v = layer.v_proj_ctx.forward(m, {}).view(n, self.kv_heads, self.head_dim)
-            k = _rope(_rms(k, layer.k_norm_ctx.t, self.eps), pos, inv)
+            k = _rope_apply(_rms(k, layer.k_norm_ctx.t, self.eps), cs)
             self._ctx_k[i][start : start + n] = k.half()
             self._ctx_v[i][start : start + n] = v.half()
 
@@ -267,23 +283,21 @@ class Inkling2MTPModel(Model):
 
         emb = self.embed.embedding[anchor].float()
         x0 = _rms(emb, self.embed.norm_weight, self.embed.eps)          # (1, H)
-        mask = self.mask_embed.t.float().expand(self.block - 1, self.hidden)
-        x = torch.cat([x0, mask], dim = 0)                             # (block, H)
-        pos = torch.arange(L, L + self.block, device = self.dev)
-        inv = self._inv_freq()
+        x = torch.cat([x0, self._mask_f], dim = 0)                     # (block, H)
+        cs = _rope_cs(torch.arange(L, L + self.block, device = self.dev), self._inv)
         for i, layer in enumerate(self.layers):
-            x = self._layer(i, layer, x, pos, L, inv)
+            x = self._layer(i, layer, x, cs, L)
         h = _rms(x, self.norm.t, self.eps)
         return h.half().unsqueeze(0)
 
-    def _layer(self, i, layer, x, pos, L, inv):
+    def _layer(self, i, layer, x, cs, L):
         T = x.shape[0]
         h = _rms(x, layer.input_norm.t, self.eps).half()
         q = layer.q_proj.forward(h, {}).float().view(T, self.heads, self.head_dim)
         k = layer.k_proj.forward(h, {}).float().view(T, self.kv_heads, self.head_dim)
         v = layer.v_proj.forward(h, {}).float().view(T, self.kv_heads, self.head_dim)
-        q = _rope(_rms(q, layer.q_norm.t, self.eps), pos, inv)
-        k = _rope(_rms(k, layer.k_norm.t, self.eps), pos, inv)
+        q = _rope_apply(_rms(q, layer.q_norm.t, self.eps), cs)
+        k = _rope_apply(_rms(k, layer.k_norm.t, self.eps), cs)
         lo = max(0, L - self.window) if layer.local else 0
         K = torch.cat([self._ctx_k[i][lo:L].float(), k], dim = 0)     # (n, Hk, D)
         V = torch.cat([self._ctx_v[i][lo:L].float(), v], dim = 0)
@@ -319,36 +333,70 @@ class Inkling2MTPModel(Model):
         self._f_rnn = self._mix(last, self.n_layers, self.markov_dflare.t)[0]
         self._ctx_len = start + n
 
+    def _markov_core(self, base: torch.Tensor, ctx: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+        """Greedy Markov walk over the block. base (block-1, Vpad) raw head logits, ctx (block-1, 3r) the per-row
+        drive from the target state, anchor (1,) long. Returns (block-1,) long draft ids.
+        The argmax runs on the raw logits: the soft cap is strictly monotone, so the chosen id is unchanged
+        (it can only differ where the cap saturates in fp32, i.e. |logit| beyond ~9 * cap)."""
+        r, V = self.rank, self.vocab_size
+        fold_w, fold_b = self._fold_w[:V], self._fold_b[:V]
+        state_r = torch.zeros(r, dtype = torch.float, device = self.dev)
+        prev = anchor
+        out = []
+        for s in range(self.block - 1):
+            emb = self._markov_tab[prev].reshape(-1)                          # (r,)
+            raw = ctx[s] + self._rnn_w_s @ state_r + self._rnn_w_e @ emb
+            gate = torch.sigmoid(raw[:r])
+            cand = torch.tanh(raw[r : 2 * r])
+            latent = torch.tanh(raw[2 * r :])
+            state_r = gate * state_r + (1.0 - gate) * cand
+            logits = base[s, :V] + fold_w @ latent + fold_b
+            d = torch.argmax(logits).reshape(1)
+            out.append(d)
+            prev = d
+        return torch.cat(out)
+
+    def _markov_graph(self):
+        """The Markov walk captured once as a CUDA graph (fixed shapes): one replay instead of ~150 launches."""
+        if self._mg is not None:
+            return self._mg
+        B, Vp = self.block - 1, self._fold_w.shape[0]
+        self._mg_in = (torch.zeros(B, Vp, dtype = torch.float, device = self.dev),
+                       torch.zeros(B, 3 * self.rank, dtype = torch.float, device = self.dev),
+                       torch.zeros(1, dtype = torch.long, device = self.dev))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._markov_core(*self._mg_in)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            self._mg_out = self._markov_core(*self._mg_in)
+        self._mg = g
+        return g
+
     @torch.inference_mode()
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
         """Greedy block draft: returns (1, block) ids [anchor, draft_1 .. draft_{block-1}]."""
         self._prepare()
         assert self._f_rnn is not None, "MTP drafter: no target context yet"
         anchor = params["mtp_anchor"]
-        r, V = self.rank, self.vocab_size
         h = state[0, 1:].float()                                                # (block-1, H)
         base = self.lm.head.inner.forward(h.half(), {}, torch.float).float()    # raw lm_head (no softcap)
         ctx = (self._rnn_b[None, :] + h @ self._rnn_w_hid.t()
                + (self._f_rnn @ self._rnn_w_frnn.t())[None, :])                 # (block-1, 3r)
-        sc = self.softcap
-        state_r = torch.zeros(r, dtype = torch.float, device = self.dev)
-        prev = anchor
-        drafts = []
-        for s in range(self.block - 1):
-            emb = self.markov_w1.t[prev].float().reshape(-1)                    # (r,)
-            raw = ctx[s] + self._rnn_w_state @ torch.cat([state_r, emb])
-            gate = torch.sigmoid(raw[:r])
-            cand = torch.tanh(raw[r : 2 * r])
-            latent = torch.tanh(raw[2 * r :])
-            state_r = gate * state_r + (1.0 - gate) * cand
-            bias = self._fold_w @ latent + self._fold_b
-            logits = base[s] + bias
-            if sc:
-                logits = sc * torch.tanh(logits / sc)
-            d = torch.argmax(logits[:V]).reshape(1)
-            drafts.append(d)
-            prev = d
-        return torch.cat([anchor] + drafts).view(1, self.block)
+        if _MTP_GRAPH:
+            g = self._markov_graph()
+            self._mg_in[0].copy_(base)
+            self._mg_in[1].copy_(ctx)
+            self._mg_in[2].copy_(anchor)
+            g.replay()
+            drafts = self._mg_out.clone()
+        else:
+            drafts = self._markov_core(base, ctx, anchor)
+        return torch.cat([anchor, drafts]).view(1, self.block)
+
 
     @override
     def prepare_inputs(self, input_ids, params):
