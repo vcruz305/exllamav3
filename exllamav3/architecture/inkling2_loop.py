@@ -84,6 +84,8 @@ def _exl3_bc(lin, name: str):
 # Whole-token decode (exllamav3_ext/inkling2_token.cu): one extension call per token instead of the Python block
 # loop. INKLING2_TOKEN=0 keeps the Python single-token path (Inkling2Block._forward_t1) for A/B checks.
 _TOKEN = os.environ.get("INKLING2_TOKEN", "1") != "0"
+# exl3_mlin for the q, r, g, k, v projections of the token step (rounding-level change vs the per-linear BC path)
+_MLIN_TOK = os.environ.get("INKLING2_TOK_MLIN", "1") != "0"
 # Call arguments that select the general path (capture, overrides, reconstruct, all-expert or sensitivity passes)
 _TOKEN_BLOCKERS = ("capture", "capture_qmaps", "capture_sens", "ovr", "reconstruct", "activate_all_experts",
                    "autosplit_measure", "tp_warmup")
@@ -160,6 +162,7 @@ def _build_token(model, params: dict):
             rel_proj = a.rel_proj, sink_proj = a.sink_proj,
             kf = kc.view(-1, Hk, D), vf = vc.view(-1, Hk, D), ring = ring,
             coop = coop, coopmk = m.coopmk if coop else None, bc_moe = bc_moe, moe_out = moe_out,
+            **_mlin_fields(a, m.device),
             gate_t = cfg.gate_tensor_t, logits = cfg.router_logits_f32_bsz1, bias_f32 = cfg.e_score_bias_f32,
             sel = cfg.selected_experts_bsz1, w = cfg.routing_weights_bsz1,
             rsf = float(cfg.routed_scaling_factor), n_group = int(cfg.n_group), topk_group = int(cfg.topk_group),
@@ -175,6 +178,31 @@ def _build_token(model, params: dict):
         emb = emb.embedding, emb_norm = emb.norm_weight, fin_q_t = fin.query_t, fin_norm = fin.norm_weight,
         head = head.inner.bc, blocks = blocks,
     )
+
+
+def _mlin_fields(a, dev):
+    """exl3_mlin spec of q, r, g, k, v (the one-launch projection path of the token step), or the disabled spec"""
+    off = dict(mlin = False, mlin_t = [], mlin_su = [], mlin_sv = [], mlin_out = [],
+               mlin_cnt = torch.zeros(1, dtype = torch.int32, device = dev))
+    if not _MLIN_TOK:
+        return off
+    lins = [a.q_proj, a.r_proj, a.g_proj, a.k_proj, a.v_proj]
+
+    def plain(l):
+        i = l.inner
+        return (type(i) is LinearEXL3 and getattr(i, "K", None) == 6 and getattr(i, "mul1", False)
+                and not getattr(i, "mcg", False) and getattr(i, "bias", None) is None
+                and getattr(i, "out_dtype", torch.float) == torch.float and l.pre_scale == 1.0 and l.post_scale == 1.0
+                and l.softcap == 0.0 and not l.trim_padded_out and not l.lora_a_tensors
+                and l.in_features == l.in_features_unpadded and l.out_features == l.out_features_unpadded
+                and l.out_features % 128 == 0 and l.in_features % 128 == 0)
+    if not all(plain(l) for l in lins):
+        print(" -- Inkling2 token path: exl3_mlin not used for a block (linears are not plain K=6 mul1)")
+        return off
+    outs = [torch.empty((1, l.out_features), dtype = torch.float, device = dev) for l in lins]
+    cnt = torch.zeros(sum(l.out_features // 128 for l in lins), dtype = torch.int32, device = dev)
+    return dict(mlin = True, mlin_t = [l.inner.trellis for l in lins], mlin_su = [l.inner.suh for l in lins],
+                mlin_sv = [l.inner.svh for l in lins], mlin_out = outs, mlin_cnt = cnt)
 
 
 class Inkling2LoopConfig(Config):

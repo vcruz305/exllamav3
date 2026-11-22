@@ -24,6 +24,7 @@
 #include "quant/exl3_moe_coopmk.cuh"
 #include "routing.cuh"
 #include "softcap.cuh"
+#include "quant/exl3_mlin.cuh"
 
 struct InkToken;
 
@@ -41,8 +42,6 @@ static at::Tensor attn_res_torch(const std::vector<at::Tensor>& srcs, const at::
     return at::matmul(w.transpose(0, 1), stacked);                             // (nq, H)
 }
 
-namespace {
-
 struct InkBlock {
     int64_t layer = 0, instance = 0, Hq = 0, Hk = 0, D = 0, R = 0, E = 0, kvc = 0, W = -1;
     bool l0 = false, full = false, boundary = false, in_loop = false, loop_start = false;
@@ -56,10 +55,43 @@ struct InkBlock {
     bool coop = false;
     std::shared_ptr<CoopMK> coopmk;
     std::shared_ptr<BC_BlockSparseMLP> bc_moe;
+    // exl3_mlin for q, r, g, k, v (one launch): trellis / suh / svh per linear, fp32 outs, counters
+    bool mlin = false;
+    std::vector<at::Tensor> mlin_t, mlin_su, mlin_sv, mlin_out;
+    at::Tensor mlin_cnt;
     at::Tensor moe_out, gate_t, logits, bias_f32, sel, w;
     double rsf = 1.0;
     int64_t n_group = 1, topk_group = 1;
 };
+
+static void mlin5(InkBlock& b, const at::Tensor& qh, const at::Tensor& kh, const at::Tensor& vh)
+{
+    ExlMLinBatch bt{};
+    bt.count = 5;
+    bt.K = (int)(b.mlin_t[0].size(2) / 16);
+    bt.cb = 2;                                                  // mul1
+    const at::Tensor* ins[5] = {&qh, &qh, &qh, &kh, &vh};
+    int* cnt = reinterpret_cast<int*>(b.mlin_cnt.data_ptr());
+    int blocks = 0, ctr = 0;
+    for (int i = 0; i < 5; ++i) {
+        const at::Tensor& t = b.mlin_t[i];
+        ExlMLinSpec& s = bt.s[i];
+        s.trellis = reinterpret_cast<const uint16_t*>(t.data_ptr());
+        s.suh = reinterpret_cast<const half*>(b.mlin_su[i].data_ptr());
+        s.svh = reinterpret_cast<const half*>(b.mlin_sv[i].data_ptr());
+        s.in = reinterpret_cast<const half*>(ins[i]->data_ptr());
+        s.out = reinterpret_cast<float*>(b.mlin_out[i].data_ptr());
+        s.counters = cnt + ctr;
+        s.k = (int)t.size(0) * 16;
+        s.n = (int)t.size(1) * 16;
+        s.blk_begin = blocks;
+        blocks += s.n / 32;
+        ctr += s.n / 128;
+    }
+    bt.total_blocks = blocks;
+    exl3_mlin_launch(bt, at::cuda::getCurrentCUDAStream().stream());
+}
+
 
 template <class T>
 T get(const py::dict& d, const char* k)
@@ -128,6 +160,14 @@ InkBlock parse_block(const py::dict& d)
     b.vf = get<at::Tensor>(d, "vf");
     b.ring = get<at::Tensor>(d, "ring");
     b.coop = get<bool>(d, "coop");
+    b.mlin = get<bool>(d, "mlin");
+    if (b.mlin) {
+        b.mlin_t = get<std::vector<at::Tensor>>(d, "mlin_t");
+        b.mlin_su = get<std::vector<at::Tensor>>(d, "mlin_su");
+        b.mlin_sv = get<std::vector<at::Tensor>>(d, "mlin_sv");
+        b.mlin_out = get<std::vector<at::Tensor>>(d, "mlin_out");
+        b.mlin_cnt = get<at::Tensor>(d, "mlin_cnt");
+    }
     if (b.coop) {
         b.coopmk = get<std::shared_ptr<CoopMK>>(d, "coopmk");
     } else {
@@ -144,8 +184,6 @@ InkBlock parse_block(const py::dict& d)
     b.topk_group = get<int64_t>(d, "topk_group");
     return b;
 }
-
-}  // namespace
 
 struct InkToken {
     int64_t H = 0, V = 0, Vpad = 0, taps = 0, page = 256;
@@ -244,11 +282,21 @@ struct InkToken {
             at::Tensor qh = q_in.to(at::kHalf).contiguous();
             at::Tensor kh = same ? qh : k_in.to(at::kHalf).contiguous();
             at::Tensor vh = same ? qh : v_in.to(at::kHalf).contiguous();
-            at::Tensor q_f = b.q->run_alloc(qh, b.Hq * b.D, true);
-            at::Tensor r_f = b.r->run_alloc(qh, b.Hq * b.R, true);
-            at::Tensor g_f = b.g->run_alloc(qh, b.Hq * b.D, true);
-            at::Tensor k_raw = b.k->run_alloc(kh, b.Hk * b.D, true);
-            at::Tensor v_raw = b.v->run_alloc(vh, b.Hk * b.D, true);
+            at::Tensor q_f, r_f, g_f, k_raw, v_raw;
+            if (b.mlin) {
+                mlin5(b, qh, kh, vh);
+                q_f = b.mlin_out[0].reshape(-1);
+                r_f = b.mlin_out[1].reshape(-1);
+                g_f = b.mlin_out[2].reshape(-1);
+                k_raw = b.mlin_out[3].reshape(-1);
+                v_raw = b.mlin_out[4].reshape(-1);
+            } else {
+                q_f = b.q->run_alloc(qh, b.Hq * b.D, true);
+                r_f = b.r->run_alloc(qh, b.Hq * b.R, true);
+                g_f = b.g->run_alloc(qh, b.Hq * b.D, true);
+                k_raw = b.k->run_alloc(kh, b.Hk * b.D, true);
+                v_raw = b.v->run_alloc(vh, b.Hk * b.D, true);
+            }
 
             double tau = 1.0;
             if (b.log_scaling) {
