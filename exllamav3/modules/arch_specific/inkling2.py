@@ -5,6 +5,7 @@ import os
 import torch
 import torch.nn.functional as F
 from ...model.config import Config
+from ...util.tensor import get_for_device
 from ...constants import PAGE_SIZE
 from ...cache.recurrent import host_copy
 from ...ext import exllamav3_ext as ext
@@ -1127,11 +1128,15 @@ class Inkling2Block(Module):
             if all(row[j] == row[0] + j for row in rows for j in range(len(row))):
                 return self._decode_contiguous(q_in, k_in, v_in, params, past, rows, instance, ring)
 
+        # Device views of the staged tables (seeded by the generator's arena upload, so no per-call copy or sync):
+        # positions come from cache_seqlens on the device, the host list gives the shapes
+        block_table = get_for_device(params, "block_table", dev)
+        cs_dev = get_for_device(params, "cache_seqlens", dev)
         ar = torch.arange(seq, device = dev)
-        positions = torch.tensor(past, device = dev).unsqueeze(1) + ar.unsqueeze(0)
+        positions = cs_dev.long().unsqueeze(1) + ar.unsqueeze(0)
         q, k, v, rel, sink, gate = attn.project(q_in, k_in, v_in, attn._tau(None, positions, dev), params, ring)
 
-        kc, vc = cache.get_layer(self.layer_idx, params["cache_seqlens"], block_table, instance = instance)
+        kc, vc = cache.get_layer(self.layer_idx, cs_dev, block_table, instance = instance)
         bt = block_table.to(kc.device).long()
         outs = []
         for i in range(bsz):
