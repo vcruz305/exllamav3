@@ -262,6 +262,7 @@ recurrent/hybrid families remain fail-closed in the manual PP loop.
 | **Ling 3.x**                                      | `BailingMoeV3ForCausalLM`                                                     |            |                       |
 | **Laguna 2.1**                                    | `LagunaForCausalLM`                                                           |            |                       |
 | **LFM 2.5**, **LFM2.5-VL**                        | `Lfm2ForCausalLM`<br>`Lfm2MoeForCausalLM`<br>`Lfm2VlForConditionalGeneration` |     ✓     |                       |
+| **LFM 3**, **LFM3-VL**                            | `Lfm3ForCausalLM`<br>`Lfm3VlForConditionalGeneration`                          |     ✓     |                       |
 | **Llama 1/2/3**,**3.1-Nemotron** etc.             | `LlamaForCausalLM`                                                            |            |                       |
 | **MiMo-RL**                                       | `MiMoForCausalLM`                                                             |            |                       |
 | **MiMo-V2.6-Flash**                               | `MiMoV2ForCausalLM`                                                           |     ✓     | no audio              |
