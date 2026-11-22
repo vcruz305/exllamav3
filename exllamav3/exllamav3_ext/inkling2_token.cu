@@ -16,6 +16,7 @@
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAEvent.h>
 
 #include "inkling2.cuh"
 #include "inkling2_token.cuh"
@@ -191,6 +192,12 @@ struct InkToken {
     at::Tensor emb, emb_norm, fin_q_t, fin_norm, ids;
     std::shared_ptr<BC_LinearEXL3> head;
     std::vector<InkBlock> blocks;
+    // device-side per-token state (graph-replayable): dI = [flat, (row0, L, nc) per block, token], dD = tau per block.
+    // Written by update() from pinned host slots; a slot is reused only after its copy event has completed.
+    int64_t slot_ = 0, NB = 0;
+    at::Tensor dI, dD, hI[4], hD[4];
+    at::cuda::CUDAEvent evs_[4];
+    int hs_ = 0;
 
     explicit InkToken(const py::dict& s)
     {
@@ -212,6 +219,41 @@ struct InkToken {
         for (auto item : get<py::list>(s, "blocks")) {
             blocks.push_back(parse_block(item.cast<py::dict>()));
         }
+        NB = (int64_t)blocks.size();
+        dI = at::zeros({1 + 3 * NB + 1}, emb.options().dtype(at::kLong));
+        dD = at::zeros({NB}, emb.options().dtype(at::kDouble));
+        for (int k = 0; k < 4; ++k) {
+            hI[k] = at::empty({1 + 3 * NB + 1}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+            hD[k] = at::empty({NB}, at::TensorOptions().dtype(at::kDouble).pinned_memory(true));
+        }
+    }
+
+    // Host side of one token: fills the next pinned slot and copies it to the device buffers (async, stream-ordered).
+    // Call before step_dev(); no kernel launches here, so it is outside any CUDA graph.
+    void update(int64_t token, int64_t pos, int64_t base_page, int64_t slot)
+    {
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        slot_ = slot;
+        const int64_t base = base_page * page, flat = base + pos;
+        const int k = hs_;
+        hs_ = (hs_ + 1) % 4;
+        if (evs_[k].isCreated()) evs_[k].synchronize();
+        int64_t* I = hI[k].data_ptr<int64_t>();
+        double* Dd = hD[k].data_ptr<double>();
+        I[0] = flat;
+        for (int64_t i = 0; i < NB; ++i) {
+            const InkBlock& b = blocks[i];
+            const int64_t lo = (b.W < 0) ? 0 : std::max<int64_t>(0, pos - (b.W - 1));
+            const int64_t row0 = base + lo, L = flat + 1 - row0;
+            I[1 + 3 * i] = row0;
+            I[2 + 3 * i] = L;
+            I[3 + 3 * i] = (L + INK_ACH_H - 1) / INK_ACH_H;
+            Dd[i] = b.log_scaling ? 1.0 + b.alpha * std::log(std::max(((double)(pos + 1)) / b.nfloor, 1.0)) : 1.0;
+        }
+        I[1 + 3 * NB] = token;
+        dI.copy_(hI[k], /*non_blocking=*/true);
+        dD.copy_(hD[k], /*non_blocking=*/true);
+        evs_[k].record(at::cuda::getCurrentCUDAStream());
     }
 
     at::Tensor step(int64_t token, int64_t pos, int64_t base_page, int64_t slot, bool record)
@@ -358,6 +400,145 @@ struct InkToken {
         if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
         return logits.view({1, 1, Vpad}).narrow(-1, 0, V);
     }
+
+    at::Tensor step_dev(bool record)
+    {
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        const int64_t Hc = H;
+
+        // Embedding: F.embedding(...).float(), then rms * norm weight
+        at::Tensor e = at::embedding(emb, dI.narrow(0, 1 + 3 * NB, 1)).to(at::kFloat);
+        at::Tensor        x = at::mul(at::rms_norm(e, {Hc}, c10::nullopt, eps_emb), emb_norm);   // (1, H) fp32
+
+        std::vector<at::Tensor> bs;                     // block states, (1, H) fp32 each
+        at::Tensor pre_x;
+        std::vector<at::Tensor> pre_bs;
+        at::Tensor prev_b, prev_o;
+
+        int64_t bi = -1;
+        for (auto& b : blocks) {
+            ++bi;
+            at::Tensor msgs;
+            bool has_msg = false;
+            if (b.in_loop) {
+                if (b.loop_start) {
+                    if (b.instance == 0) {
+                        pre_x = x;
+                        pre_bs = bs;
+                    } else {
+                        prev_b = bs.back();
+                        prev_o = x;
+                        x = pre_x;
+                        bs = pre_bs;
+                    }
+                }
+                if (b.instance > 0) {
+                    msgs = attn_res_torch(std::vector<at::Tensor>{prev_b, prev_o}, b.msg_t);   // (4, H)
+                    has_msg = true;
+                }
+            }
+
+            // Attention residual -> sublayer inputs
+            at::Tensor hs;
+            if (b.l0) {
+                hs = x;
+            } else {
+                std::vector<at::Tensor> srcs = bs;
+                srcs.push_back(x);
+                hs = ink_attn_res(srcs, b.q_attn_t, b.eps);                                     // (1, H): ext, as _forward_t1
+            }
+            at::Tensor q_in, k_in, v_in;
+            bool same = false;
+            if (!has_msg && !b.full) {
+                at::Tensor y = at::rms_norm(hs[0], {Hc}, b.qkv_norm[0], b.eps).view({1, Hc});
+                q_in = y;
+                k_in = y;
+                v_in = y;
+                same = true;
+            } else {
+                at::Tensor X = hs.size(0) == 3 ? hs : hs.expand({3, Hc});
+                if (has_msg) X = ink_gates(X, msgs.narrow(0, 0, 3), b.gd, b.gu, 0, 3, b.eps);
+                at::Tensor y = at::mul(at::rms_norm(X, {Hc}, c10::nullopt, b.eps), b.qkv_norm);   // (3, H)
+                q_in = y.narrow(0, 0, 1);
+                k_in = y.narrow(0, 1, 1);
+                v_in = y.narrow(0, 2, 1);
+            }
+
+            // project_t1: linears, then the query and K/V glue kernels
+            at::Tensor qh = q_in.to(at::kHalf).contiguous();
+            at::Tensor kh = same ? qh : k_in.to(at::kHalf).contiguous();
+            at::Tensor vh = same ? qh : v_in.to(at::kHalf).contiguous();
+            at::Tensor q_f, r_f, g_f, k_raw, v_raw;
+            if (b.mlin) {
+                mlin5(b, qh, kh, vh);
+                q_f = b.mlin_out[0].reshape(-1);
+                r_f = b.mlin_out[1].reshape(-1);
+                g_f = b.mlin_out[2].reshape(-1);
+                k_raw = b.mlin_out[3].reshape(-1);
+                v_raw = b.mlin_out[4].reshape(-1);
+            } else {
+                q_f = b.q->run_alloc(qh, b.Hq * b.D, true);
+                r_f = b.r->run_alloc(qh, b.Hq * b.R, true);
+                g_f = b.g->run_alloc(qh, b.Hq * b.D, true);
+                k_raw = b.k->run_alloc(kh, b.Hk * b.D, true);
+                v_raw = b.v->run_alloc(vh, b.Hk * b.D, true);
+            }
+            std::vector<at::Tensor> qg = ink_q_glue_dev(
+                q_f.reshape(-1), r_f.reshape(-1), g_f.reshape(-1), q_in.reshape(-1), b.q_scale, b.rel_scale,
+                b.rel_proj, b.sink_proj, b.qk_clip, b.rel_clip, dD.narrow(0, bi, 1));
+            at::Tensor rs = b.ring.select(0, slot_);                                  // (ch, ld)
+            ink_kv_glue_dev(k_raw, v_raw, rs.narrow(0, 0, 2 * b.kvc), k_in.reshape(-1), v_in.reshape(-1), b.kw, b.vw,
+                        b.kp, b.vp, b.kf, b.vf, dI.narrow(0, 0, 1), taps, record, b.qk_clip, b.eps);
+
+            // Attention over the cache rows of the window, output projection
+            
+            
+            
+            at::Tensor o = ink_attend_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, dI.narrow(0, 1 + 3 * bi, 3), b.sm_scale, b.Hk, b.E);
+            at::Tensor a = b.o->run_alloc(o.view({1, -1}), H, true);                   // (1, H) fp32
+
+            // Attention output short conv; a block boundary also appends the block state
+            at::Tensor residual;
+            at::Tensor ra = rs.narrow(0, 2 * b.kvc, H);
+            if (b.boundary) {
+                bs.push_back(x);
+                residual = ink_sconv(ra, a.reshape(-1), b.conv_attn, c10::nullopt, taps, record);
+            } else {
+                residual = ink_sconv(ra, a.reshape(-1), b.conv_attn, x.reshape(-1), taps, record);
+            }
+
+            // MLP input: attention residual, message gate, norm, fp16 rows
+            std::vector<at::Tensor> srcs2 = bs;
+            srcs2.push_back(residual.reshape(-1));
+            at::Tensor m = ink_attn_res(srcs2, b.q_mlp_t, b.eps);                       // (1, H): ext, as _forward_t1
+            if (has_msg) m = ink_gates(m, msgs.narrow(0, 3, 1), b.gd, b.gu, 3, 1, b.eps);
+            at::Tensor mn = at::rms_norm(m, {Hc}, b.norm_mlp, b.eps).to(at::kHalf).contiguous();   // (1, H)
+
+            // BlockSparseMLP at one row: router, then the expert kernels
+            routing_gemv_f32(mn.reshape(-1), b.gate_t, b.logits.view(-1));
+            routing_ds3_group(b.logits, c10::optional<at::Tensor>(b.bias_f32), b.sel, b.w, (float)b.rsf, 0,
+                              (int)b.n_group, (int)b.topk_group);
+            if (b.coop) {
+                b.coopmk->run(mn, b.sel, b.w, c10::nullopt, -1, -1, -1);
+            } else {
+                b.bc_moe->run_bszN(mn, b.sel, b.w);
+            }
+            at::Tensor mo = b.moe_out.narrow(0, 0, 1);                                  // (1, H) fp32
+
+            // MLP output short conv with the residual
+            at::Tensor rm = rs.narrow(0, 2 * b.kvc + H, H);
+            x = ink_sconv(rm, mo.reshape(-1), b.conv_mlp, residual.reshape(-1), taps, record).view({1, Hc});
+        }
+
+        // Final: attention residual over the block states, norm, head, softcap
+        std::vector<at::Tensor> fsrc = bs;
+        fsrc.push_back(x);
+        at::Tensor fx = attn_res_torch(fsrc, fin_q_t);                                 // (1, H): Inkling2Final's torch attn_res
+        at::Tensor xn = at::mul(at::rms_norm(fx, {Hc}, c10::nullopt, eps_fin), fin_norm).to(at::kHalf).contiguous();
+        at::Tensor logits = head->run_alloc(xn, Vpad, false);                           // LinearEXL3.forward at one row
+        if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
+        return logits.view({1, 1, Vpad}).narrow(-1, 0, V);
+    }
 };
 
 void ink_token_bind(py::module_& m)
@@ -365,5 +546,8 @@ void ink_token_bind(py::module_& m)
     py::class_<InkToken, std::shared_ptr<InkToken>>(m, "InkToken")
         .def(py::init<const py::dict&>())
         .def("step", &InkToken::step, py::arg("token"), py::arg("pos"), py::arg("base_page"), py::arg("slot"),
-             py::arg("record"));
+             py::arg("record"))
+        .def("update", &InkToken::update, py::arg("token"), py::arg("pos"), py::arg("base_page"),
+             py::arg("slot"))
+        .def("step_dev", &InkToken::step_dev, py::arg("record"));
 }

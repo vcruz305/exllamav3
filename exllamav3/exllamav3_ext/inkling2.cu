@@ -510,8 +510,9 @@ __global__ void __launch_bounds__(256) ink_q_glue_kernel(
     const float* __restrict__ q_in, const float* __restrict__ q_scale, const float* __restrict__ r_scale,
     const float* __restrict__ rel_proj, const float* __restrict__ sink_w,
     float* __restrict__ q_out, float* __restrict__ rel_out, float* __restrict__ sink_out,
-    float* __restrict__ gate_out, int H, int D, int R, int E, float qk_clip, float rel_clip, float tau)
+    float* __restrict__ gate_out, int H, int D, int R, int E, float qk_clip, float rel_clip, float tau_h, const double* __restrict__ tau_p)
 {
+    const float tau = tau_p ? (float)tau_p[0] : tau_h;
     __shared__ float red[32];
     __shared__ float rsm[INK_MAXG];
     const int h = blockIdx.x, tid = threadIdx.x;
@@ -574,7 +575,30 @@ std::vector<at::Tensor> ink_q_glue(at::Tensor q_f, at::Tensor r_f, at::Tensor g_
         q_f.data_ptr<float>(), r_f.data_ptr<float>(), g_f.data_ptr<float>(), q_in.data_ptr<float>(),
         q_scale.data_ptr<float>(), r_scale.data_ptr<float>(), rel_proj.data_ptr<float>(), sink_w.data_ptr<float>(),
         q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(), H, D, R, E,
-        (float)qk_clip, (float)rel_clip, (float)tau);
+        (float)qk_clip, (float)rel_clip, (float)tau, nullptr);
+    return {q, rel, sink, gate};
+}
+
+std::vector<at::Tensor> ink_q_glue_dev(at::Tensor q_f, at::Tensor r_f, at::Tensor g_f, at::Tensor q_in, at::Tensor q_scale,
+                                   at::Tensor r_scale, at::Tensor rel_proj, at::Tensor sink_w, double qk_clip,
+                                   double rel_clip, at::Tensor tau_dev)
+{
+    const int Hq = (int)sink_w.size(0), H = (int)sink_w.size(1), R = (int)rel_proj.size(0), E = (int)rel_proj.size(1);
+    const int D = (int)(q_f.numel() / Hq);
+    TORCH_CHECK(D * Hq == q_f.numel() && D <= 256 && R <= INK_MAXG && r_f.numel() == Hq * R, "ink_q_glue: shapes");
+    TORCH_CHECK(q_in.numel() == H && g_f.numel() == Hq * D && q_scale.numel() == Hq * D && r_scale.numel() == Hq * R,
+                "ink_q_glue: shapes");
+    for (const at::Tensor* t : {&q_f, &r_f, &g_f, &q_in, &q_scale, &r_scale, &rel_proj, &sink_w})
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous(), "ink_q_glue: fp32 contiguous inputs");
+    const at::cuda::OptionalCUDAGuard guard(q_f.device());
+    auto opt = q_f.options();
+    auto q = at::empty({Hq * D}, opt), rel = at::empty({Hq * E}, opt), sink = at::empty({Hq}, opt),
+         gate = at::empty({Hq * D}, opt);
+    ink_q_glue_kernel<<<Hq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q_f.data_ptr<float>(), r_f.data_ptr<float>(), g_f.data_ptr<float>(), q_in.data_ptr<float>(),
+        q_scale.data_ptr<float>(), r_scale.data_ptr<float>(), rel_proj.data_ptr<float>(), sink_w.data_ptr<float>(),
+        q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(), H, D, R, E,
+        (float)qk_clip, (float)rel_clip, 0.f, tau_dev.data_ptr<double>());
     return {q, rel, sink, gate};
 }
 
@@ -589,9 +613,10 @@ __global__ void __launch_bounds__(128) ink_kv_glue_kernel(
     const float* __restrict__ k_in, const float* __restrict__ v_in,
     const float* __restrict__ wk, const float* __restrict__ wv,
     const float* __restrict__ pk, const float* __restrict__ pv,
-    __half* __restrict__ kc, __half* __restrict__ vc, long long row, int C, int H, int D, int taps, int record,
+    __half* __restrict__ kc, __half* __restrict__ vc, long long row_h, const long long* __restrict__ row_p, int C, int H, int D, int taps, int record,
     float qk_clip, float eps)
 {
+    const long long row = row_p ? row_p[0] : row_h;
     __shared__ float red[32];
     __shared__ float dyn[INK_MAXK];
     const int h = blockIdx.x, which = blockIdx.y, d = threadIdx.x;
@@ -664,7 +689,30 @@ void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k
         k_raw.data_ptr<float>(), v_raw.data_ptr<float>(), st.data_ptr<float>(), st.stride(0),
         k_in.data_ptr<float>(), v_in.data_ptr<float>(), wk.data_ptr<float>(), wv.data_ptr<float>(), pkp, pvp,
         reinterpret_cast<__half*>(kf.data_ptr<at::Half>()), reinterpret_cast<__half*>(vf.data_ptr<at::Half>()),
-        row, C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
+        row, nullptr, C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
+}
+
+void ink_kv_glue_dev(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k_in, at::Tensor v_in, at::Tensor wk,
+                 at::Tensor wv, c10::optional<at::Tensor> pk, c10::optional<at::Tensor> pv, at::Tensor kf,
+                 at::Tensor vf, at::Tensor row_dev, int64_t taps, bool record, double qk_clip, double eps)
+{
+    const int Hk = (int)kf.size(1), D = (int)kf.size(2), C = Hk * D, H = (int)k_in.numel();
+    TORCH_CHECK(D == 128 && Hk * D == k_raw.numel() && v_raw.numel() == C, "ink_kv_glue: D must be 128, C = Hk * D");
+    TORCH_CHECK(st.dim() == 2 && st.size(0) == 2 * C && st.stride(1) == 1 && st.scalar_type() == at::kFloat,
+                "ink_kv_glue: st (2C, ld) fp32 view");
+    TORCH_CHECK(taps + 1 <= INK_MAXK && taps >= 1, "ink_kv_glue: taps");
+    TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf && kf.is_contiguous() && vf.is_contiguous(),
+                "ink_kv_glue: fp16 contiguous cache");
+    TORCH_CHECK(row_dev.numel() == 1 && row_dev.is_cuda(), "ink_kv_glue_dev: row must be a device scalar");
+    const at::cuda::OptionalCUDAGuard guard(st.device());
+    const float* pkp = pk.has_value() ? pk->data_ptr<float>() : nullptr;
+    const float* pvp = pv.has_value() ? pv->data_ptr<float>() : nullptr;
+    dim3 grid(Hk, 2);
+    ink_kv_glue_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        k_raw.data_ptr<float>(), v_raw.data_ptr<float>(), st.data_ptr<float>(), st.stride(0),
+        k_in.data_ptr<float>(), v_in.data_ptr<float>(), wk.data_ptr<float>(), wv.data_ptr<float>(), pkp, pvp,
+        reinterpret_cast<__half*>(kf.data_ptr<at::Half>()), reinterpret_cast<__half*>(vf.data_ptr<at::Half>()),
+        0LL, reinterpret_cast<const long long*>(row_dev.data_ptr<int64_t>()), C, H, D, (int)taps, record ? 1 : 0, (float)qk_clip, (float)eps);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -679,13 +727,15 @@ void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k
 //   comb: M = max(sink, m_c), den = exp(sink - M) + sum_c exp(m_c - M) l_c, o = sum_c exp(m_c - M) o_c / den * gate (fp16).
 #define INK_ACH 128        // keys per attend block (8 warps x 16 keys)
 #define INK_MAXNC 64       // key chunks per query: L <= 8192
+static_assert(INK_ACH == INK_ACH_H, "chunk size must match inkling2.cuh");
 #define INK_MAXGQ 4        // query heads per kv head
 
 __global__ void __launch_bounds__(256) ink_attend_part_kernel(
     const float* __restrict__ q, const float* __restrict__ rel, const __half* __restrict__ kf,
     const __half* __restrict__ vf, long long row0, int L, float sm_scale, int G, int Hk, int D, int E, int nc,
-    float* __restrict__ po, float* __restrict__ pml)
+    float* __restrict__ po, float* __restrict__ pml, const long long* __restrict__ par_p)
 {
+    if (par_p) { row0 = par_p[0]; L = (int)par_p[1]; }
     __shared__ float slog[INK_MAXGQ][INK_ACH];
     __shared__ float sm32[32];
     __shared__ float osm[16][INK_MAXGQ][128];
@@ -693,6 +743,7 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
     const long long KS = (long long)Hk * D;
     const int j0 = c * INK_ACH;
     const int n = min(INK_ACH, L - j0);
+    if (j0 >= L) return;                     // chunk beyond the window (device-sized grid)
 
     // step 1: warp = 16 keys, lane = 4 dims. Logits of the G query heads of this kv head.
     float qv[INK_MAXGQ][4];
@@ -814,26 +865,28 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
 
 __global__ void __launch_bounds__(128) ink_attend_comb_kernel(
     const float* __restrict__ sink, const float* __restrict__ gate, const float* __restrict__ po,
-    const float* __restrict__ pml, int nc, int D, __half* __restrict__ o_out)
+    const float* __restrict__ pml, int nstride, int nc, const long long* __restrict__ par_p, int D,
+    __half* __restrict__ o_out)
 {
+    const int ncn = par_p ? (int)par_p[2] : nc;
     __shared__ float w[INK_MAXNC];
     __shared__ float inv;
     const int hq = blockIdx.x, tid = threadIdx.x;
     if (tid == 0) {
         float M = sink[hq];
-        for (int c = 0; c < nc; ++c) M = fmaxf(M, pml[((long long)hq * nc + c) * 2]);
+        for (int c = 0; c < ncn; ++c) M = fmaxf(M, pml[((long long)hq * nstride + c) * 2]);
         float den = expf(sink[hq] - M);
-        for (int c = 0; c < nc; ++c) {
-            const float e = expf(pml[((long long)hq * nc + c) * 2] - M);
+        for (int c = 0; c < ncn; ++c) {
+            const float e = expf(pml[((long long)hq * nstride + c) * 2] - M);
             w[c] = e;
-            den += e * pml[((long long)hq * nc + c) * 2 + 1];
+            den += e * pml[((long long)hq * nstride + c) * 2 + 1];
         }
         inv = 1.f / den;
     }
     __syncthreads();
     if (tid < D) {
         float o = 0.f;
-        for (int c = 0; c < nc; ++c) o += w[c] * po[((long long)hq * nc + c) * D + tid];
+        for (int c = 0; c < ncn; ++c) o += w[c] * po[((long long)hq * nstride + c) * D + tid];
         o_out[hq * D + tid] = __float2half_rn(o * inv * gate[hq * D + tid]);
     }
 }
@@ -860,9 +913,33 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
     ink_attend_part_kernel<<<dim3(nc, (unsigned)Hk), 256, 0, stream>>>(
         q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
-        row0, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc, po.data_ptr<float>(), pml.data_ptr<float>());
+        row0, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc, po.data_ptr<float>(), pml.data_ptr<float>(), nullptr);
     ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
-        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), nc, D,
+        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), nc, nc, nullptr, D,
         reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
+    return o;
+}
+
+// Same as ink_attend with the window in a device tensor par = [row0, L, nc] (int64, nc = ceil(L / INK_ACH)); the
+// grid is fixed at INK_MAXNC chunks and idle chunks exit, so a captured CUDA graph replays at any position.
+at::Tensor ink_attend_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
+                          at::Tensor par, double sm_scale, int64_t Hk, int64_t E)
+{
+    const int Hq = (int)sink.numel(), D = (int)kf.size(2);
+    TORCH_CHECK(D == 128 && Hq % Hk == 0 && Hq <= 256 && Hq / Hk <= INK_MAXGQ, "ink_attend_dev: shape");
+    TORCH_CHECK(par.numel() == 3 && par.scalar_type() == at::kLong && par.is_cuda(), "ink_attend_dev: par");
+    const int G = Hq / (int)Hk;
+    auto po = at::empty({Hq, INK_MAXNC, D}, q.options());
+    auto pml = at::empty({Hq, INK_MAXNC, 2}, q.options());
+    auto o = at::empty({Hq * D}, q.options().dtype(at::kHalf));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    ink_attend_part_kernel<<<dim3(INK_MAXNC, (unsigned)Hk), 256, 0, stream>>>(
+        q.data_ptr<float>(), rel.data_ptr<float>(),
+        reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
+        0LL, 1, (float)sm_scale, G, (int)Hk, D, (int)E, INK_MAXNC, po.data_ptr<float>(), pml.data_ptr<float>(),
+        reinterpret_cast<const long long*>(par.data_ptr<int64_t>()));
+    ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
+        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), INK_MAXNC, INK_MAXNC,
+        reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
     return o;
 }
