@@ -1545,7 +1545,12 @@ class Job:
         all_unique_pages = 0
         for seq in self.sequences:
             unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom)
-            if self.generator.mtp_draft:
+            if getattr(self.generator.draft_model, "dense_context", False):
+                # dense drafter context: no page reuse at all (the drafter's taps for reused pages never exist),
+                # so the sequence needs every one of its pages
+                seq.max_cached_pages = 0
+                all_unique_pages += -(-len(seq.sequence_ids) // PAGE_SIZE)
+            elif self.generator.mtp_draft:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
                 omitted_pages = len(seq.page_hashes) - len(cached_hashes)
@@ -1697,6 +1702,11 @@ class Job:
                 # the post-final-norm carry state. Partial-page reuse must not consume that token.
                 if self.generator.mtp_draft and prefill_end == len(seq.sequence_ids) - 1:
                     best_match = min(best_match, prefill_ids.shape[-1] - 1)
+
+                # A drafter with dense (unpaged) context has no K/V for reused pages: its taps for the
+                # skipped prefix are never produced, so prefix reuse is off for it.
+                if getattr(self.generator.draft_model, "dense_context", False):
+                    best_match_page = None
 
                 if best_match_page and best_match > 1:
                     # The page may be another job's, with its chunk still in flight
