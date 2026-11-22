@@ -20,6 +20,7 @@ from ..modules.arch_specific.inkling2 import (
     Inkling2Block,
     Inkling2Final,
 )
+from .inkling2_mtp import Inkling2MTPModel
 
 """
 Inkling2Loop (thinkingmachines/Inkling-2-Mini), text decoder.
@@ -222,6 +223,10 @@ class Inkling2LoopConfig(Config):
         )
 
         tc = self.config_dict["text_config"]
+        # The MTP component (DSpark block drafter, mtp.safetensors next to the main weights)
+        self.mtp_config = self.config_dict.get("mtp_config")
+        if self.mtp_config and os.path.exists(os.path.join(directory, "mtp.safetensors")):
+            self.model_classes["mtp"] = Inkling2MTPModel
 
         def rd(key, default = no_default):
             if key in tc:
@@ -371,6 +376,8 @@ class Inkling2LoopModel(Model):
         ]
 
         self.logit_layer_idx = len(self.modules) - 1
+        # Visit count of the forward (block calls); the final normed state is tap number n_visits
+        self.n_visits = None
 
         self.caps.update({
             "supports_tp": False,
@@ -386,6 +393,9 @@ class Inkling2LoopModel(Model):
             c.layer_map = (
                 list(range(c.loop_start)) + core * c.num_passes + list(range(c.loop_end, c.num_hidden_layers))
             )
+        # Block calls per forward (default layer map: prelude + core x passes + coda); the final tap is visit n_visits
+        self.n_visits = c.loop_start + c.num_passes * (c.loop_end - c.loop_start) + (c.num_hidden_layers - c.loop_end)
+        self.modules[self.logit_layer_idx].final_visit = self.n_visits
 
     def _tok_pages(self, x: torch.Tensor, params: dict):
         """
@@ -393,7 +403,8 @@ class Inkling2LoopModel(Model):
         token path does not apply: one sequence, one token, fp16 paged cache. Any page order is accepted. Recorded
         conv history (params recurrent_history, speculative passes) is handled in the step by the record flag
         """
-        if self._tok_disabled or x.numel() != 1 or params.get("cache") is None:
+        # A drafter's tap request needs the per-layer states of every row, which only the Python path exports
+        if self._tok_disabled or x.numel() != 1 or params.get("cache") is None or params.get("export_state_layers"):
             return None
         rs = params.get("recurrent_states")
         if not rs or len(rs) != 1:
@@ -407,6 +418,20 @@ class Inkling2LoopModel(Model):
         row = bt.tolist()[0]
         used = pos // PAGE_SIZE + 1
         return row[:used] if used <= len(row) else None
+
+    def prefill_ls(self, x: torch.Tensor, params: dict):
+        """Layer-split prefill. With drafter taps requested, the final tap (the normed state past the last block)
+        is also computed for the prompt rows: the prefill stops before the head, which would otherwise produce it."""
+        exp = params.get("export_state_layers")
+        final = self.modules[self.logit_layer_idx]
+        if not (exp and final.final_visit in exp):
+            return super().prefill_ls(x, params)
+        for h in getattr(self.config, "moe_cpu_hosts", {}).values():
+            h.begin_pass()
+        x = self.run_section(x, params, 0, self.last_kv_end, True)
+        del params["prefill"]
+        final.hidden(x, params)
+        return None
 
     def forward_ls(self, x: torch.Tensor, params: dict):
         pages = self._tok_pages(x, params) if _TOKEN else None

@@ -212,6 +212,14 @@ class Inkling2Ring:
             st[:, :self.taps].copy_(full[-self.taps:].T)
 
 
+def _export_tap(params: dict, t: torch.Tensor):
+    """Append one DSpark drafter tap (fp16 copy of a (bsz, T, hidden) state) to params["export_states"]"""
+    s = params.get("export_states")
+    if s is None:
+        s = params["export_states"] = []
+    s.append(t.half())
+
+
 class Inkling2State:
     """Cross-block state of one forward call (see module docstring)"""
 
@@ -1049,6 +1057,10 @@ class Inkling2Block(Module):
             if instance > 0:
                 prev_block, prev_out = st.prev_pass
                 messages = attn_res([prev_block.to(dev)], prev_out.to(dev), self.msg_query_t)
+        # DSpark drafter taps: the partial block entering this visit (vLLM loop.py aux_hidden_state_layers)
+        exp = params.get("export_state_layers")
+        if exp and self.visit_index(instance) in exp:
+            _export_tap(params, x)
         st.block_states = [s if s.device == dev else s.to(dev) for s in st.block_states]
         ring = self._ring(params, instance)
         rows = self._t1_rows(params, ring, bsz, seq)
@@ -1078,6 +1090,16 @@ class Inkling2Block(Module):
         m = self._sconv(m, "mlp", _with_history(
             ring.exchange(2 * self.kv_channels + self.hidden_size, m), m, self.ksize - 1))
         return residual + m
+
+    def visit_index(self, instance: int) -> int:
+        """Index of this block call in the forward's visit sequence (prelude, core x passes, coda): the
+        numbering the drafter's target_layer_ids use"""
+        ncore = self.loop_end - self.loop_start
+        if self.in_loop:
+            return self.layer_idx + instance * ncore
+        if self.layer_idx >= self.loop_end:
+            return self.layer_idx + (self.num_passes - 1) * ncore
+        return self.layer_idx
 
     def attention(self, q_in, k_in, v_in, params: dict, instance: int, ring: Inkling2Ring) -> torch.Tensor:
         attn = self.attn
@@ -1194,6 +1216,7 @@ class Inkling2Final(Module):
         self.query = None
         self.query_t = None
         self.norm_weight = None
+        self.final_visit = None     # visit index past the last block (set by the model): tap 48
 
     @override
     def optimizer_targets(self):
@@ -1219,13 +1242,21 @@ class Inkling2Final(Module):
         return t
 
     @override
-    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def hidden(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        """Normed final state (the head's input). Also the DSpark drafter's last tap (visit n_visits)."""
         st = Inkling2State.get(params)
         n = x.shape[1]
         # The forward loop may have cropped x to the last tokens; the block states follow
         blocks = [s[:, -n:].to(self.device) for s in st.block_states]
         x = attn_res(blocks, x.float(), self.query_t)[..., 0, :]
         x = (_rms(x, self.eps) * self.norm_weight).to(ACT_DTYPE).contiguous()
+        exp = params.get("export_state_layers")
+        if exp and self.final_visit is not None and self.final_visit in exp:
+            _export_tap(params, x)
+        return x
+
+    def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        x = self.hidden(x, params)
         logits = self.head.forward(x, params, out_dtype)
         # Rows past the tokenizer's vocabulary are padding in the checkpoint
         return logits[..., :self.vocab_size]
