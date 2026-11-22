@@ -202,6 +202,8 @@ class DSV41Attention(DSV4Attention):
         super().__init__(config, key, layer_idx, "v41", compress_rate = compress_rate, qmap = qmap,
                          select_hq_bits = select_hq_bits, **kwargs)
         self.is_kv_source = is_kv_source
+        # The base constructor leaves a "v41" layer without a pool; only the kv sources own one (keyed by their layer)
+        self.kv_source = layer_idx if is_kv_source else None
         self.is_index_source = is_index_source
         self.owns_index_keys = is_kv_source and is_index_source
         self.kv_source_layer = kv_source_layer
