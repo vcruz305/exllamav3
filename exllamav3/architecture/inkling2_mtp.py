@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 
 import torch
@@ -126,6 +127,8 @@ class Inkling2MTPModel(Model):
         self.eps = m["rms_norm_eps"]
         self.theta = m["rope_theta"]
         self.block = m["block_size"]
+        # INKLING2_MTP_BLOCK: shorter draft block (anchor + block - 1 drafted tokens per round)
+        self.block = max(2, min(self.block, int(os.environ.get("INKLING2_MTP_BLOCK", self.block))))
         config.block_size = self.block      # the generator reads the draft block size from the draft config
         self.rank = m["markov_rank"]
         self.window = m["sliding_window_size"]
