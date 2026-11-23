@@ -44,6 +44,16 @@ static at::Tensor attn_res_torch(const std::vector<at::Tensor>& srcs, const at::
     return at::matmul(w.transpose(0, 1), stacked);                             // (nq, H)
 }
 
+// attn_res_torch over T rows: srcs (T, H) each -> (T, nq, H)
+static at::Tensor attn_res_torch_rows(const std::vector<at::Tensor>& srcs, const at::Tensor& qT)
+{
+    at::Tensor stacked = at::stack(srcs, 1);                                   // (T, S, H)
+    const int64_t Hd = stacked.size(-1);
+    stacked = at::rms_norm(stacked, {Hd}, c10::nullopt, 1e-6);
+    at::Tensor w = at::softmax(at::matmul(stacked, qT), 1);                    // (T, S, nq), over the sources
+    return at::matmul(w.transpose(1, 2), stacked).contiguous();                // (T, nq, H)
+}
+
 // debugging: block inputs of the token or row step (InkToken::dump_on)
 static std::vector<at::Tensor> g_dump;
 static bool g_dump_on = false;
@@ -864,11 +874,192 @@ struct InkToken {
         return logits.narrow(-1, 0, V).unsqueeze(0);                                       // (1, T, V)
     }
 
+    // Row-batched forward, row kernels: as step_rows2 with the per-row stages (attention residuals, message gates,
+    // query and K/V glue, attention, short convs, router projection) as one launch over the rows each. Each of those
+    // kernels runs the single-token arithmetic per row. INKLING2_ROWS_MASK bit 16: message / final mixes per row.
+    at::Tensor step_rows3(bool record)
+    {
+        const int64_t T = Tcur_, S = 2 + 3 * NB;
+        TORCH_CHECK(T >= 1 && T <= TMAX, "InkToken: 1..9 rows per forward");
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        const int64_t Hc = H;
+        auto row = [](const at::Tensor& t, int64_t r) { return t.narrow(0, r, 1); };
+        const char* dbg_env = std::getenv("INKLING2_ROWS_MASK");
+        const int64_t dbgm = dbg_env ? std::atoi(dbg_env) : 0;
+        auto lin = [&](const std::shared_ptr<BC_LinearEXL3>& L, const at::Tensor& inp, int64_t nout) -> at::Tensor {
+            if (!(dbgm & 1)) return L->run_alloc(inp, nout, true).view({T, -1});
+            std::vector<at::Tensor> v;
+            for (int64_t r = 0; r < T; ++r) v.push_back(L->run_alloc(row(inp, r), nout, true).view({1, -1}));
+            return at::cat(v, 0);
+        };
+        auto mix = [&](const std::vector<at::Tensor>& srcs, const at::Tensor& qT) -> at::Tensor {     // (T, nq, H)
+            if (!(dbgm & 16)) return attn_res_torch_rows(srcs, qT);
+            std::vector<at::Tensor> v;
+            for (int64_t r = 0; r < T; ++r) {
+                std::vector<at::Tensor> sr;
+                for (auto& t : srcs) sr.push_back(row(t, r));
+                v.push_back(attn_res_torch(sr, qT));
+            }
+            return at::stack(v, 0).contiguous();
+        };
+
+        at::Tensor tk = dI.view({TMAX, S}).narrow(0, 0, T).select(1, 1 + 3 * NB).contiguous();
+        at::Tensor e = at::embedding(emb, tk).to(at::kFloat);
+        at::Tensor x = at::mul(at::rms_norm(e, {Hc}, c10::nullopt, eps_emb), emb_norm).contiguous();   // (T, H) fp32
+
+        std::vector<at::Tensor> bs;                     // block states, (T, H) fp32 each
+        at::Tensor pre_x;
+        std::vector<at::Tensor> pre_bs;
+        at::Tensor prev_b, prev_o;
+
+        int64_t bi = -1;
+        for (auto& b : blocks) {
+            ++bi;
+            at::Tensor rs = b.ring.select(0, slot_);                                       // (ch, ld)
+            const int64_t kv2 = 2 * b.kvc;
+
+            at::Tensor msgs;                                                               // (T, 4, H)
+            bool has_msg = false;
+            if (b.in_loop) {
+                if (b.loop_start) {
+                    if (b.instance == 0) {
+                        pre_x = x;
+                        pre_bs = bs;
+                    } else {
+                        prev_b = bs.back();
+                        prev_o = x;
+                        x = pre_x;
+                        bs = pre_bs;
+                    }
+                }
+                if (b.instance > 0) {
+                    msgs = mix(std::vector<at::Tensor>{prev_b, prev_o}, b.msg_t);
+                    TORCH_CHECK(msgs.size(1) == 4, "InkToken: message mixes");
+                    has_msg = true;
+                }
+            }
+
+            if (g_dump_on) g_dump.push_back(x.detach().clone());
+            if (tapb_[bi] >= 0) tapbuf.select(0, tapb_[bi]).narrow(0, 0, T).copy_(x);
+
+            // attention residual -> sublayer inputs: (T, NQ, H), NQ = 3 on full blocks (q, k, v mixes), 1 otherwise
+            at::Tensor hs3;
+            if (b.l0) {
+                hs3 = x.view({T, 1, Hc});
+            } else {
+                std::vector<at::Tensor> srcs = bs;
+                srcs.push_back(x);
+                hs3 = ink_attn_res_rows(srcs, b.q_attn_t, b.eps);
+                TORCH_CHECK(hs3.size(1) == (b.full ? 3 : 1), "InkToken: attention residual NQ");
+            }
+            at::Tensor q_in, k_in, v_in;
+            bool same = false;
+            if (!has_msg && !b.full) {
+                at::Tensor y = at::rms_norm(hs3.view({T, Hc}), {Hc}, b.qkv_norm[0], b.eps).contiguous();
+                q_in = y;
+                k_in = y;
+                v_in = y;
+                same = true;
+            } else {
+                at::Tensor XX = (hs3.size(1) == 3 ? hs3 : hs3.expand({T, 3, Hc})).contiguous();
+                if (has_msg) XX = ink_gates_rows(XX, msgs, b.gd, b.gu, 0, 3, b.eps);
+                at::Tensor y = at::mul(at::rms_norm(XX, {Hc}, c10::nullopt, b.eps), b.qkv_norm);   // (T, 3, H)
+                q_in = y.select(1, 0).contiguous();
+                k_in = y.select(1, 1).contiguous();
+                v_in = y.select(1, 2).contiguous();
+            }
+
+            // projections, batched over the rows
+            at::Tensor qh = q_in.to(at::kHalf).contiguous();
+            at::Tensor kh = same ? qh : k_in.to(at::kHalf).contiguous();
+            at::Tensor vh = same ? qh : v_in.to(at::kHalf).contiguous();
+            at::Tensor q_f = lin(b.q, qh, b.Hq * b.D).contiguous();
+            at::Tensor r_f = lin(b.r, qh, b.Hq * b.R).contiguous();
+            at::Tensor g_f = lin(b.g, qh, b.Hq * b.D).contiguous();
+            at::Tensor k_raw = lin(b.k, kh, b.Hk * b.D).contiguous();
+            at::Tensor v_raw = lin(b.v, vh, b.Hk * b.D).contiguous();
+
+            // query glue, K/V glue (cache rows of all rows, then the K/V conv history), attention over the cache:
+            // row r attends its own window, which ends at its own position
+            std::vector<at::Tensor> qg = ink_q_glue_rows(q_f, r_f, g_f, q_in, b.q_scale, b.rel_scale, b.rel_proj,
+                                                         b.sink_proj, b.qk_clip, b.rel_clip,
+                                                         dD.narrow(0, bi, (T - 1) * NB + 1), NB);
+            at::Tensor rkv = rs.narrow(0, 0, kv2);
+            ink_kv_glue_rows(k_raw, v_raw, rkv, k_in, v_in, b.kw, b.vw, b.kp, b.vp, b.kf, b.vf,
+                             dI.narrow(0, 0, (T - 1) * S + 1), S, pt_, taps, b.qk_clip, b.eps);
+            ink_hist_rows(rkv, at::cat({k_raw, v_raw}, 1).contiguous(), taps, record);
+            at::Tensor o = ink_attend_rows_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_,
+                                               dI.narrow(0, 1 + 3 * bi, (T - 1) * S + 3), S, b.sm_scale, b.Hk, b.E);
+            at::Tensor a = lin(b.o, o, H).contiguous();                                    // (T, H) fp32
+
+            // attention output short conv; a block boundary also appends the block state
+            at::Tensor ra = rs.narrow(0, kv2, H);
+            at::Tensor rm = rs.narrow(0, kv2 + H, H);
+            at::Tensor RES;
+            if (b.boundary) {
+                bs.push_back(x);
+                RES = ink_sconv_rows(ra, a, b.conv_attn, c10::nullopt, taps, record);
+            } else {
+                RES = ink_sconv_rows(ra, a, b.conv_attn, x, taps, record);
+            }
+
+            // MLP input: attention residual over the block states, message gate, norm
+            std::vector<at::Tensor> srcs2 = bs;
+            srcs2.push_back(RES);
+            at::Tensor M = ink_attn_res_rows(srcs2, b.q_mlp_t, b.eps);                      // (T, 1, H)
+            TORCH_CHECK(M.size(1) == 1, "InkToken: attention residual NQ");
+            if (has_msg) M = ink_gates_rows(M, msgs, b.gd, b.gu, 3, 1, b.eps);
+            at::Tensor mn = at::rms_norm(M.view({T, Hc}), {Hc}, b.norm_mlp, b.eps).to(at::kHalf).contiguous();
+
+            // router projection and group selection over all rows; experts in chunks of 8 rows
+            const int64_t Ne = b.logits.numel(), K = b.sel.numel();
+            at::Tensor LG = at::empty({T, Ne}, b.logits.options());
+            routing_gemv_f32(mn, b.gate_t, LG);
+            at::Tensor SEL = at::empty({T, K}, b.sel.options());
+            at::Tensor WW = at::empty({T, K}, b.w.options());
+            if (dbgm & 4) {
+                for (int64_t r = 0; r < T; ++r)
+                    routing_ds3_group(row(LG, r), c10::optional<at::Tensor>(b.bias_f32), row(SEL, r), row(WW, r),
+                                      (float)b.rsf, 0, (int)b.n_group, (int)b.topk_group);
+            } else {
+                routing_ds3_group(LG, c10::optional<at::Tensor>(b.bias_f32), SEL, WW, (float)b.rsf, 0,
+                                  (int)b.n_group, (int)b.topk_group);
+            }
+            at::Tensor MO = at::empty({T, Hc}, x.options());
+            const int64_t CH = (dbgm & 2) ? 1 : 8;
+            for (int64_t c0 = 0; c0 < T; c0 += CH) {
+                const int64_t n = std::min<int64_t>(CH, T - c0);
+                at::Tensor xc = mn.narrow(0, c0, n), sc = SEL.narrow(0, c0, n), wc = WW.narrow(0, c0, n);
+                if (b.coop) b.coopmk->run(xc, sc, wc, c10::nullopt, -1, -1, -1);
+                else b.bc_moe->run_bszN(xc, sc, wc);
+                MO.narrow(0, c0, n).copy_(b.moe_out.narrow(0, 0, n));
+            }
+
+            // MLP output short conv with the residual
+            x = ink_sconv_rows(rm, MO, b.conv_mlp, RES, taps, record);
+        }
+
+        // Final: attention residual over the block states, norm, head (batched), softcap
+        std::vector<at::Tensor> fsrc = bs;
+        fsrc.push_back(x);
+        at::Tensor FX = mix(fsrc, fin_q_t);
+        TORCH_CHECK(FX.size(1) == 1, "InkToken: final mix");
+        at::Tensor xn = at::mul(at::rms_norm(FX.view({T, Hc}), {Hc}, c10::nullopt, eps_fin), fin_norm).to(at::kHalf).contiguous();
+        if (tapf_ >= 0) tapbuf.select(0, tapf_).narrow(0, 0, T).copy_(xn);
+        at::Tensor logits = head->run_alloc(xn, Vpad, false).view({T, -1});
+        if (final_cap != 0.0) softcap(logits, logits, (float)final_cap);
+        return logits.narrow(-1, 0, V).unsqueeze(0);                                       // (1, T, V)
+    }
+
     // All Tcur_ rows of the staged forward, one token after another (each row sees the state the previous rows
     // wrote). Returns (1, Tcur_, V).
     at::Tensor step_rows(bool record)
     {
-        if (batched_) return step_rows2(record);
+        if (batched_) {
+            // INKLING2_ROWS_MASK bit 8: the per-row stage loop (step_rows2) instead of the row kernels
+            const char* me = std::getenv("INKLING2_ROWS_MASK");
+            return ((me ? std::atoi(me) : 0) & 8) ? step_rows2(record) : step_rows3(record);
+        }
         TORCH_CHECK(!record, "InkToken: sequential rows do not record history (set_batched(true))");
         std::vector<at::Tensor> rows;
         for (int64_t r = 0; r < Tcur_; ++r) rows.push_back(step_row(r, record));

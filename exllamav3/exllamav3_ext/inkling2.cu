@@ -147,7 +147,8 @@ __global__ void __launch_bounds__(256) ink_attn_res_kernel(
 
 // partial[b][i] = sum over the block's channels of the NACC products (block b covers channels b * 512 .. + 512)
 __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_part_kernel(
-    InkSrcs srcs, int S, int NQ, int H4, const float* __restrict__ qT, float* __restrict__ partial)
+    InkSrcs srcs, int S, int NQ, int H4, const float* __restrict__ qT, float* __restrict__ partial, long long rst,
+    int nblk)
 {
     __shared__ float wsum[INK_ARBS / 32][INK_ACC];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -159,7 +160,7 @@ __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_part_kernel(
     float4 xv[INK_MAXS];
     #pragma unroll
     for (int j = 0; j < INK_MAXS; ++j)
-        xv[j] = j < S ? reinterpret_cast<const float4*>(srcs.p[j])[dd] : make_float4(0.f, 0.f, 0.f, 0.f);
+        xv[j] = j < S ? reinterpret_cast<const float4*>(srcs.p[j] + blockIdx.y * rst)[dd] : make_float4(0.f, 0.f, 0.f, 0.f);
     float qv[INK_MAXQ][4];
     #pragma unroll
     for (int q = 0; q < INK_MAXQ; ++q)
@@ -194,7 +195,7 @@ __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_part_kernel(
         float s = 0.f;
         #pragma unroll
         for (int w = 0; w < INK_ARBS / 32; ++w) s += wsum[w][tid];
-        partial[blockIdx.x * INK_ACC + tid] = s;
+        partial[((size_t)blockIdx.y * nblk + blockIdx.x) * INK_ACC + tid] = s;
     }
 }
 
@@ -202,7 +203,7 @@ __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_part_kernel(
 // writes its 128 channel groups: out[q][d] = sum_j w_jq rs_j x_j[d].
 __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_fin_kernel(
     InkSrcs srcs, int S, int NQ, int H, int H4, int nblk, const float* __restrict__ partial, float eps,
-    float* __restrict__ out)
+    float* __restrict__ out, long long rst)
 {
     __shared__ float red[INK_ACC];
     __shared__ float rs[INK_MAXS];
@@ -212,10 +213,10 @@ __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_fin_kernel(
     float4 xv[INK_MAXS];
     #pragma unroll
     for (int j = 0; j < INK_MAXS; ++j)
-        xv[j] = (j < S && d4 < H4) ? reinterpret_cast<const float4*>(srcs.p[j])[d4] : make_float4(0.f, 0.f, 0.f, 0.f);
+        xv[j] = (j < S && d4 < H4) ? reinterpret_cast<const float4*>(srcs.p[j] + blockIdx.y * rst)[d4] : make_float4(0.f, 0.f, 0.f, 0.f);
     if (tid < INK_ACC) {
         float s = 0.f;
-        for (int b = 0; b < nblk; ++b) s += partial[b * INK_ACC + tid];
+        for (int b = 0; b < nblk; ++b) s += partial[((size_t)blockIdx.y * nblk + b) * INK_ACC + tid];
         red[tid] = s;
     }
     __syncthreads();
@@ -247,7 +248,7 @@ __global__ void __launch_bounds__(INK_ARBS) ink_attn_res_fin_kernel(
                         o.x += cf * xv[j].x; o.y += cf * xv[j].y; o.z += cf * xv[j].z; o.w += cf * xv[j].w;
                     }
                 }
-                reinterpret_cast<float4*>(out + q * H)[d4] = o;
+                reinterpret_cast<float4*>(out + ((size_t)blockIdx.y * NQ + q) * H)[d4] = o;
             }
         }
     }
@@ -276,9 +277,9 @@ at::Tensor ink_attn_res(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
         const int nblk = (H4 + INK_ARBS - 1) / INK_ARBS;
         auto partial = at::empty({nblk, INK_ACC}, qT.options());
         ink_attn_res_part_kernel<<<nblk, INK_ARBS, 0, stream>>>(
-            a, S, NQ, H4, qT.data_ptr<float>(), partial.data_ptr<float>());
+            a, S, NQ, H4, qT.data_ptr<float>(), partial.data_ptr<float>(), 0LL, nblk);
         ink_attn_res_fin_kernel<<<nblk, INK_ARBS, 0, stream>>>(
-            a, S, NQ, H, H4, nblk, partial.data_ptr<float>(), (float)eps, out.data_ptr<float>());
+            a, S, NQ, H, H4, nblk, partial.data_ptr<float>(), (float)eps, out.data_ptr<float>(), 0LL);
     } else {
         ink_attn_res_kernel<<<1, 256, 0, stream>>>(
             a, S, NQ, H, qT.data_ptr<float>(), (float)eps, out.data_ptr<float>());
@@ -301,14 +302,15 @@ at::Tensor ink_attn_res(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
 
 __global__ void __launch_bounds__(256) ink_gate_down_kernel(
     const float* __restrict__ X, long long xs, const float* __restrict__ M, long long ms,
-    const float* __restrict__ gd, int first, int H, int R, int NSPL, float eps, float* __restrict__ part)
+    const float* __restrict__ gd, int first, int H, int R, int NSPL, float eps, float* __restrict__ part,
+    int Gm, long long xrs, long long mrs)
 {
     __shared__ float red[2][32];
     __shared__ float zs[INK_GRC];
     __shared__ float sw[8][INK_MAXG];
     const int c = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
-    const float* x = X + g * xs;
-    const float* m = M + g * ms;
+    const float* x = X + (g / Gm) * xrs + (g % Gm) * xs;
+    const float* m = M + (g / Gm) * mrs + (g % Gm) * ms;
     float sx = 0.f, sm = 0.f;
     if (H <= 9 * 256) {
         // loads first (one memory round trip), then the sums
@@ -337,7 +339,7 @@ __global__ void __launch_bounds__(256) ink_gate_down_kernel(
     // thread (r4, kk): float4 of ranks 4 r4 .. 4 r4 + 3 for rows kk, kk + per, ...
     const int R4 = R / 4, per = blockDim.x / R4;
     const int r4 = tid % R4, kk = tid / R4;
-    const float* W = gd + (size_t)(first + g) * 2 * H * R;
+    const float* W = gd + (size_t)(first + g % Gm) * 2 * H * R;
     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int kl = kk; kl < INK_GRC; kl += per) {
         const int k = k0 + kl;
@@ -371,7 +373,7 @@ __global__ void __launch_bounds__(256) ink_gate_down_kernel(
 __global__ void __launch_bounds__(256) ink_gate_out_kernel(
     const float* __restrict__ X, long long xs, const float* __restrict__ M, long long ms,
     const float* __restrict__ gu, const float* __restrict__ part, int first, int H, int R, int NSPL,
-    float* __restrict__ out)
+    float* __restrict__ out, int Gm, long long xrs, long long mrs)
 {
     __shared__ float pz[16][INK_MAXG];
     __shared__ float gv[INK_MAXG];
@@ -400,7 +402,7 @@ __global__ void __launch_bounds__(256) ink_gate_out_kernel(
     const int j = tid & (2 * INK_GHW - 1), rh = tid / (2 * INK_GHW);
     const int hh = a0 + (j & (INK_GHW - 1));
     const int n = (j < INK_GHW ? 0 : H) + (hh < H ? hh : 0);
-    const float* W2 = gu + (size_t)(first + g) * R * 2 * H;
+    const float* W2 = gu + (size_t)(first + g % Gm) * R * 2 * H;
     const int RH = R / 2;
     float s = 0.f;
     #pragma unroll 8
@@ -412,7 +414,7 @@ __global__ void __launch_bounds__(256) ink_gate_out_kernel(
     if (tid < INK_GHW) {
         const int h = a0 + tid;
         if (h < H) {
-            const float x = X[g * xs + h], m = M[g * ms + h];
+            const float x = X[(g / Gm) * xrs + (g % Gm) * xs + h], m = M[(g / Gm) * mrs + (g % Gm) * ms + h];
             out[g * H + h] = (1.f - tv[tid]) * x + tv[INK_GHW + tid] * m;
         }
     }
@@ -435,10 +437,10 @@ at::Tensor ink_gates(at::Tensor X, at::Tensor M, at::Tensor gd, at::Tensor gu, i
     auto stream = at::cuda::getCurrentCUDAStream();
     ink_gate_down_kernel<<<dim3(NSPL, (unsigned)G), 256, 0, stream>>>(
         X.data_ptr<float>(), X.stride(0), M.data_ptr<float>(), M.stride(0), gd.data_ptr<float>(),
-        (int)first, H, R, NSPL, (float)eps, part.data_ptr<float>());
+        (int)first, H, R, NSPL, (float)eps, part.data_ptr<float>(), (int)G, 0LL, 0LL);
     ink_gate_out_kernel<<<dim3((H + INK_GHW - 1) / INK_GHW, (unsigned)G), 256, 0, stream>>>(
         X.data_ptr<float>(), X.stride(0), M.data_ptr<float>(), M.stride(0), gu.data_ptr<float>(),
-        part.data_ptr<float>(), (int)first, H, R, NSPL, out.data_ptr<float>());
+        part.data_ptr<float>(), (int)first, H, R, NSPL, out.data_ptr<float>(), (int)G, 0LL, 0LL);
     return out;
 }
 
@@ -510,9 +512,13 @@ __global__ void __launch_bounds__(256) ink_q_glue_kernel(
     const float* __restrict__ q_in, const float* __restrict__ q_scale, const float* __restrict__ r_scale,
     const float* __restrict__ rel_proj, const float* __restrict__ sink_w,
     float* __restrict__ q_out, float* __restrict__ rel_out, float* __restrict__ sink_out,
-    float* __restrict__ gate_out, int H, int D, int R, int E, float qk_clip, float rel_clip, float tau_h, const double* __restrict__ tau_p)
+    float* __restrict__ gate_out, int H, int D, int R, int E, float qk_clip, float rel_clip, float tau_h, const double* __restrict__ tau_p,
+    long long tst)
 {
-    const float tau = tau_p ? (float)tau_p[0] : tau_h;
+    const long long rw = blockIdx.y, HQ = gridDim.x;
+    const float tau = tau_p ? (float)tau_p[rw * tst] : tau_h;
+    q_f += rw * HQ * D; r_f += rw * HQ * R; g_f += rw * HQ * D; q_in += rw * H;
+    q_out += rw * HQ * D; rel_out += rw * HQ * E; sink_out += rw * HQ; gate_out += rw * HQ * D;
     __shared__ float red[32];
     __shared__ float rsm[INK_MAXG];
     const int h = blockIdx.x, tid = threadIdx.x;
@@ -575,7 +581,7 @@ std::vector<at::Tensor> ink_q_glue(at::Tensor q_f, at::Tensor r_f, at::Tensor g_
         q_f.data_ptr<float>(), r_f.data_ptr<float>(), g_f.data_ptr<float>(), q_in.data_ptr<float>(),
         q_scale.data_ptr<float>(), r_scale.data_ptr<float>(), rel_proj.data_ptr<float>(), sink_w.data_ptr<float>(),
         q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(), H, D, R, E,
-        (float)qk_clip, (float)rel_clip, (float)tau, nullptr);
+        (float)qk_clip, (float)rel_clip, (float)tau, nullptr, 0LL);
     return {q, rel, sink, gate};
 }
 
@@ -598,7 +604,7 @@ std::vector<at::Tensor> ink_q_glue_dev(at::Tensor q_f, at::Tensor r_f, at::Tenso
         q_f.data_ptr<float>(), r_f.data_ptr<float>(), g_f.data_ptr<float>(), q_in.data_ptr<float>(),
         q_scale.data_ptr<float>(), r_scale.data_ptr<float>(), rel_proj.data_ptr<float>(), sink_w.data_ptr<float>(),
         q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(), H, D, R, E,
-        (float)qk_clip, (float)rel_clip, 0.f, tau_dev.data_ptr<double>());
+        (float)qk_clip, (float)rel_clip, 0.f, tau_dev.data_ptr<double>(), 0LL);
     return {q, rel, sink, gate};
 }
 
@@ -741,9 +747,14 @@ static_assert(INK_ACH == INK_ACH_H, "chunk size must match inkling2.cuh");
 __global__ void __launch_bounds__(256) ink_attend_part_kernel(
     const float* __restrict__ q, const float* __restrict__ rel, const __half* __restrict__ kf,
     const __half* __restrict__ vf, const int* __restrict__ pt, long long lo, int L, float sm_scale, int G, int Hk,
-    int D, int E, int nstride, float* __restrict__ po, float* __restrict__ pml, const long long* __restrict__ par_p)
+    int D, int E, int nstride, float* __restrict__ po, float* __restrict__ pml, const long long* __restrict__ par_p,
+    long long pst)
 {
-    if (par_p) { lo = par_p[0]; L = (int)par_p[1]; }
+    {
+        const long long rw = blockIdx.z, HQ = (long long)Hk * G;
+        if (par_p) { par_p += rw * pst; lo = par_p[0]; L = (int)par_p[1]; }
+        q += rw * HQ * D; rel += rw * HQ * E; po += rw * HQ * nstride * D; pml += rw * HQ * nstride * 2;
+    }
     __shared__ float slog[INK_MAXGQ][INK_ACH];
     __shared__ float sm32[32];
     __shared__ float osm[16][INK_MAXGQ][128];
@@ -884,9 +895,11 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
 __global__ void __launch_bounds__(128) ink_attend_comb_kernel(
     const float* __restrict__ sink, const float* __restrict__ gate, const float* __restrict__ po,
     const float* __restrict__ pml, int nstride, int nc, const long long* __restrict__ par_p, int D,
-    __half* __restrict__ o_out)
+    __half* __restrict__ o_out, long long pst)
 {
-    const int ncn = par_p ? (int)par_p[2] : nc;
+    const long long rw = blockIdx.y, HQ = gridDim.x;
+    const int ncn = par_p ? (int)par_p[rw * pst + 2] : nc;
+    sink += rw * HQ; gate += rw * HQ * D; po += rw * HQ * nstride * D; pml += rw * HQ * nstride * 2; o_out += rw * HQ * D;
     __shared__ float w[INK_NSTORE];
     __shared__ float inv;
     const int hq = blockIdx.x, tid = threadIdx.x;
@@ -941,10 +954,10 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
         q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
         pt.data_ptr<int>(), (long long)lo, (int)L, (float)sm_scale, G, (int)Hk, D, (int)E, nc,
-        po.data_ptr<float>(), pml.data_ptr<float>(), nullptr);
+        po.data_ptr<float>(), pml.data_ptr<float>(), nullptr, 0LL);
     ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
         sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), nc, nc, nullptr, D,
-        reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
+        reinterpret_cast<__half*>(o.data_ptr<at::Half>()), 0LL);
     return o;
 }
 
@@ -966,9 +979,314 @@ at::Tensor ink_attend_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Ten
         q.data_ptr<float>(), rel.data_ptr<float>(),
         reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
         pt.data_ptr<int>(), 0LL, 1, (float)sm_scale, G, (int)Hk, D, (int)E, INK_NSTORE,
-        po.data_ptr<float>(), pml.data_ptr<float>(), reinterpret_cast<const long long*>(par.data_ptr<int64_t>()));
+        po.data_ptr<float>(), pml.data_ptr<float>(), reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), 0LL);
     ink_attend_comb_kernel<<<Hq, 128, 0, stream>>>(
         sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), INK_NSTORE,
-        INK_NSTORE, reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()));
+        INK_NSTORE, reinterpret_cast<const long long*>(par.data_ptr<int64_t>()), D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()), 0LL);
+    return o;
+}
+
+
+// =====================================================================================================================
+// Row-batched variants (InkToken::step_rows2): T rows of one sequence (positions pos0 .. pos0 + T - 1) per launch, the
+// row is a grid dimension. Each row runs the arithmetic of the single-token kernel above (same operations in the same
+// order), so a row's result has the bits of a single-token step at that row.
+// =====================================================================================================================
+#define INK_MAXT 16        // rows per forward upper bound (history window buffers)
+
+// srcs: S tensors (T, H) fp32 contiguous -> (T, NQ, H)
+at::Tensor ink_attn_res_rows(std::vector<at::Tensor> srcs, at::Tensor qT, double eps)
+{
+    const int S = (int)srcs.size();
+    TORCH_CHECK(S >= 1 && S <= INK_MAXS, "ink_attn_res_rows: 1..16 sources");
+    TORCH_CHECK(qT.dim() == 2 && qT.size(1) >= 1 && qT.size(1) <= INK_MAXQ, "ink_attn_res_rows: qT (H, nq<=4)");
+    const int H = (int)qT.size(0), NQ = (int)qT.size(1);
+    const int64_t T = srcs[0].size(0);
+    const at::cuda::OptionalCUDAGuard guard(qT.device());
+    InkSrcs a;
+    bool aligned = true;
+    for (int j = 0; j < S; ++j) {
+        TORCH_CHECK(srcs[j].scalar_type() == at::kFloat && srcs[j].is_contiguous() && srcs[j].dim() == 2
+                    && srcs[j].size(0) == T && srcs[j].size(1) == H, "ink_attn_res_rows: sources (T, H) fp32 contiguous");
+        a.p[j] = srcs[j].data_ptr<float>();
+        aligned = aligned && (((uintptr_t)a.p[j]) % 16 == 0);
+    }
+    TORCH_CHECK(qT.scalar_type() == at::kFloat && qT.is_contiguous(), "ink_attn_res_rows: qT must be contiguous fp32");
+    TORCH_CHECK(H % 4 == 0 && aligned, "ink_attn_res_rows: H % 4 == 0 and 16-byte aligned sources");
+    auto out = at::empty({T, NQ, H}, qT.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int H4 = H / 4;
+    const int nblk = (H4 + INK_ARBS - 1) / INK_ARBS;
+    auto partial = at::empty({T, nblk, INK_ACC}, qT.options());
+    ink_attn_res_part_kernel<<<dim3(nblk, (unsigned)T), INK_ARBS, 0, stream>>>(
+        a, S, NQ, H4, qT.data_ptr<float>(), partial.data_ptr<float>(), (long long)H, nblk);
+    ink_attn_res_fin_kernel<<<dim3(nblk, (unsigned)T), INK_ARBS, 0, stream>>>(
+        a, S, NQ, H, H4, nblk, partial.data_ptr<float>(), (float)eps, out.data_ptr<float>(), (long long)H);
+    return out;
+}
+
+// X: (T, G, H) fp32 contiguous; msgs: (T, NM, H) fp32 contiguous, row (r, first + g) is the message of gate first + g
+// -> (T, G, H)
+at::Tensor ink_gates_rows(at::Tensor X, at::Tensor msgs, at::Tensor gd, at::Tensor gu, int64_t first, int64_t G, double eps)
+{
+    TORCH_CHECK(X.dim() == 3 && msgs.dim() == 3 && X.size(1) == G && msgs.size(0) == X.size(0)
+                && msgs.size(2) == X.size(2) && first >= 0 && first + G <= msgs.size(1), "ink_gates_rows: X (T, G, H), msgs (T, NM, H)");
+    const int64_t T = X.size(0), NM = msgs.size(1);
+    const int H = (int)X.size(2), R = (int)gd.size(2);
+    TORCH_CHECK(X.is_contiguous() && msgs.is_contiguous() && X.scalar_type() == at::kFloat && msgs.scalar_type() == at::kFloat,
+                "ink_gates_rows: fp32 contiguous rows");
+    TORCH_CHECK(R >= 4 && R <= INK_MAXG && R % 4 == 0 && (R & (R - 1)) == 0, "ink_gates_rows: rank a power of two in [4, 64]");
+    TORCH_CHECK(gd.size(1) == 2 * H && gu.size(1) == R && gu.size(2) == 2 * H && gd.is_contiguous() && gu.is_contiguous()
+                && gd.scalar_type() == at::kFloat && gu.scalar_type() == at::kFloat && first + G <= gd.size(0),
+                "ink_gates_rows: weights");
+    const at::cuda::OptionalCUDAGuard guard(X.device());
+    const int NSPL = (2 * H + INK_GRC - 1) / INK_GRC;
+    auto part = at::empty({T * G, NSPL, R}, X.options());
+    auto out = at::empty({T, G, H}, X.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const float* Mp = msgs.data_ptr<float>() + first * H;
+    ink_gate_down_kernel<<<dim3(NSPL, (unsigned)(T * G)), 256, 0, stream>>>(
+        X.data_ptr<float>(), (long long)H, Mp, (long long)H, gd.data_ptr<float>(),
+        (int)first, H, R, NSPL, (float)eps, part.data_ptr<float>(), (int)G, (long long)G * H, (long long)NM * H);
+    ink_gate_out_kernel<<<dim3((H + INK_GHW - 1) / INK_GHW, (unsigned)(T * G)), 256, 0, stream>>>(
+        X.data_ptr<float>(), (long long)H, Mp, (long long)H, gu.data_ptr<float>(),
+        part.data_ptr<float>(), (int)first, H, R, NSPL, out.data_ptr<float>(), (int)G, (long long)G * H, (long long)NM * H);
+    return out;
+}
+
+// Short conv of T rows over one channel group (C channels): row r sees the history after rows < r. x: (T, C) fp32,
+// resid: (T, C) fp32 or none -> (T, C). History after the rows as Inkling2Ring._store: the live taps advance by T
+// rows, or (record) the live taps stay and the tail takes the last columns of [history | rows].
+__global__ void ink_sconv_rows_kernel(float* __restrict__ st, long long ld, int C, const float* __restrict__ x,
+                                      const float* __restrict__ w, const float* __restrict__ resid,
+                                      float* __restrict__ out, int taps, int T, int record)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int K1 = taps + 1;
+    float* h = st + (long long)c * ld;
+    float buf[INK_MAXK + INK_MAXT];
+    for (int t = 0; t < taps; ++t) buf[t] = h[t];
+    for (int r = 0; r < T; ++r) buf[taps + r] = x[(long long)r * C + c];
+    for (int r = 0; r < T; ++r) {
+        float full[INK_MAXK];
+        for (int t = 0; t < K1; ++t) full[t] = buf[r + t];
+        float s = 0.f;
+        for (int t = 0; t < K1; ++t) s += full[t] * w[c * K1 + t];
+        out[(long long)r * C + c] = resid ? resid[(long long)r * C + c] + s : s;
+    }
+    if (!record) {
+        for (int t = 0; t < taps; ++t) h[t] = buf[T + t];
+    } else {
+        const int n = (int)min(ld, (long long)(taps + T));
+        for (int i = 0; i < n; ++i) h[ld - n + i] = buf[taps + T - n + i];
+    }
+}
+
+at::Tensor ink_sconv_rows(at::Tensor st, at::Tensor x, at::Tensor w, c10::optional<at::Tensor> resid, int64_t taps, bool record)
+{
+    const int C = (int)st.size(0);
+    TORCH_CHECK(st.dim() == 2 && st.stride(1) == 1 && st.scalar_type() == at::kFloat, "ink_sconv_rows: st (C, ld) fp32 view");
+    TORCH_CHECK(taps >= 1 && taps + 1 <= INK_MAXK, "ink_sconv_rows: taps");
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == C && x.is_contiguous() && x.scalar_type() == at::kFloat && x.size(0) <= INK_MAXT
+                && w.numel() == C * (taps + 1) && w.is_contiguous() && w.scalar_type() == at::kFloat,
+                "ink_sconv_rows: x (T, C) fp32, w (C, taps+1) fp32");
+    const int T = (int)x.size(0);
+    const at::cuda::OptionalCUDAGuard guard(st.device());
+    auto out = at::empty({T, C}, st.options());
+    const float* rp = nullptr;
+    if (resid.has_value()) {
+        TORCH_CHECK(resid->numel() == (int64_t)T * C && resid->is_contiguous() && resid->scalar_type() == at::kFloat,
+                    "ink_sconv_rows: resid (T, C) fp32");
+        rp = resid->data_ptr<float>();
+    }
+    const int threads = 128, blocks = (C + threads - 1) / threads;
+    ink_sconv_rows_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        st.data_ptr<float>(), st.stride(0), C, x.data_ptr<float>(), w.data_ptr<float>(), rp, out.data_ptr<float>(),
+        (int)taps, T, record ? 1 : 0);
+    return out;
+}
+
+// History of one channel group after T rows with the conv inputs x (T, C) (see ink_sconv_rows); no outputs.
+__global__ void ink_hist_rows_kernel(float* __restrict__ st, long long ld, int C, const float* __restrict__ x, int taps,
+                                     int T, int record)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float* h = st + (long long)c * ld;
+    float buf[INK_MAXK + INK_MAXT];
+    for (int t = 0; t < taps; ++t) buf[t] = h[t];
+    for (int r = 0; r < T; ++r) buf[taps + r] = x[(long long)r * C + c];
+    if (!record) {
+        for (int t = 0; t < taps; ++t) h[t] = buf[T + t];
+    } else {
+        const int n = (int)min(ld, (long long)(taps + T));
+        for (int i = 0; i < n; ++i) h[ld - n + i] = buf[taps + T - n + i];
+    }
+}
+
+void ink_hist_rows(at::Tensor st, at::Tensor x, int64_t taps, bool record)
+{
+    const int C = (int)st.size(0);
+    TORCH_CHECK(st.dim() == 2 && st.stride(1) == 1 && st.scalar_type() == at::kFloat, "ink_hist_rows: st (C, ld) fp32 view");
+    TORCH_CHECK(taps >= 1 && taps + 1 <= INK_MAXK && x.dim() == 2 && x.size(1) == C && x.size(0) <= INK_MAXT
+                && x.is_contiguous() && x.scalar_type() == at::kFloat, "ink_hist_rows: x (T, C) fp32");
+    const at::cuda::OptionalCUDAGuard guard(st.device());
+    const int threads = 128, blocks = (C + threads - 1) / threads;
+    ink_hist_rows_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        st.data_ptr<float>(), st.stride(0), C, x.data_ptr<float>(), (int)taps, (int)x.size(0), record ? 1 : 0);
+}
+
+// Query glue of T rows: q_f (T, Hq D), r_f (T, Hq R), g_f (T, Hq D), q_in (T, H); tau of row r at tau_dev[r * tst]
+// -> {q (T, Hq D), rel (T, Hq E), sink (T, Hq), gate (T, Hq D)}
+std::vector<at::Tensor> ink_q_glue_rows(at::Tensor q_f, at::Tensor r_f, at::Tensor g_f, at::Tensor q_in, at::Tensor q_scale,
+                                        at::Tensor r_scale, at::Tensor rel_proj, at::Tensor sink_w, double qk_clip,
+                                        double rel_clip, at::Tensor tau_dev, int64_t tst)
+{
+    const int Hq = (int)sink_w.size(0), H = (int)sink_w.size(1), R = (int)rel_proj.size(0), E = (int)rel_proj.size(1);
+    TORCH_CHECK(q_f.dim() == 2 && r_f.dim() == 2 && g_f.dim() == 2 && q_in.dim() == 2, "ink_q_glue_rows: (T, n) inputs");
+    const int64_t T = q_f.size(0);
+    const int D = (int)(q_f.size(1) / Hq);
+    TORCH_CHECK(D * Hq == q_f.size(1) && D <= 256 && R <= INK_MAXG && r_f.size(1) == Hq * R && r_f.size(0) == T
+                && g_f.size(0) == T && g_f.size(1) == Hq * D && q_in.size(0) == T && q_in.size(1) == H
+                && q_scale.numel() == Hq * D && r_scale.numel() == Hq * R, "ink_q_glue_rows: shapes");
+    for (const at::Tensor* t : {&q_f, &r_f, &g_f, &q_in, &q_scale, &r_scale, &rel_proj, &sink_w})
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous(), "ink_q_glue_rows: fp32 contiguous inputs");
+    TORCH_CHECK(tau_dev.is_cuda() && tau_dev.scalar_type() == at::kDouble, "ink_q_glue_rows: tau");
+    const at::cuda::OptionalCUDAGuard guard(q_f.device());
+    auto opt = q_f.options();
+    auto q = at::empty({T, Hq * D}, opt), rel = at::empty({T, Hq * E}, opt), sink = at::empty({T, Hq}, opt),
+         gate = at::empty({T, Hq * D}, opt);
+    ink_q_glue_kernel<<<dim3(Hq, (unsigned)T), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q_f.data_ptr<float>(), r_f.data_ptr<float>(), g_f.data_ptr<float>(), q_in.data_ptr<float>(),
+        q_scale.data_ptr<float>(), r_scale.data_ptr<float>(), rel_proj.data_ptr<float>(), sink_w.data_ptr<float>(),
+        q.data_ptr<float>(), rel.data_ptr<float>(), sink.data_ptr<float>(), gate.data_ptr<float>(), H, D, R, E,
+        (float)qk_clip, (float)rel_clip, 0.f, tau_dev.data_ptr<double>(), (long long)tst);
+    return {q, rel, sink, gate};
+}
+
+// K / V glue of T rows, grid (kv head, K or V, row). Row r convolves over the history after rows < r, read from the
+// unmodified live history and the raw rows before it: window = columns r .. r + taps of [history | raw rows]. The
+// history itself is not written here (ink_hist_rows after this kernel). Cache row of row r: position pos_p[r * pst].
+__global__ void __launch_bounds__(128) ink_kv_glue_rows_kernel(
+    const float* __restrict__ k_raw, const float* __restrict__ v_raw, const float* __restrict__ st, long long ld,
+    const float* __restrict__ k_in, const float* __restrict__ v_in,
+    const float* __restrict__ wk, const float* __restrict__ wv,
+    const float* __restrict__ pk, const float* __restrict__ pv,
+    __half* __restrict__ kc, __half* __restrict__ vc, const long long* __restrict__ pos_p, long long pst,
+    const int* __restrict__ pt, int C, int H, int D, int taps, float qk_clip, float eps)
+{
+    const int rw = blockIdx.z;
+    const long long pos = pos_p[rw * pst];
+    const long long row = (long long)pt[pos / INK_PAGE] * INK_PAGE + pos % INK_PAGE;
+    __shared__ float red[32];
+    __shared__ float dyn[INK_MAXK];
+    const int h = blockIdx.x, which = blockIdx.y, d = threadIdx.x;
+    const int c = h * D + d;
+    const int K1 = taps + 1;
+    const float* raw = which ? v_raw : k_raw;
+    const float* in = (which ? v_in : k_in) + (long long)rw * H;
+    const float* w = which ? wv : wk;
+    const float* proj = which ? pv : pk;
+    const float* base = st + (long long)(which * C + c) * ld;
+
+    if (proj) {
+        float a[INK_MAXK];
+        #pragma unroll
+        for (int t = 0; t < INK_MAXK; ++t) a[t] = 0.f;
+        #pragma unroll 6
+        for (int i = d; i < H; i += blockDim.x) {
+            const float x = in[i];
+            #pragma unroll
+            for (int t = 0; t < INK_MAXK; ++t)
+                if (t < K1) a[t] += proj[(long long)(h * K1 + t) * H + i] * x;
+        }
+        #pragma unroll
+        for (int t = 0; t < INK_MAXK; ++t)
+            if (t < K1) {
+                const float s = ink_block_sum(a[t], red);
+                if (d == 0) dyn[t] = s;
+            }
+        __syncthreads();
+    }
+    float full[INK_MAXK];
+    for (int t = 0; t < taps; ++t) {
+        const int i = rw + t;
+        full[t] = i < taps ? base[i] : raw[(long long)(i - taps) * C + c];
+    }
+    full[taps] = raw[(long long)rw * C + c];
+    float y = 0.f;
+    for (int t = 0; t < K1; ++t) y += full[t] * (w[c * K1 + t] + (proj ? dyn[t] : 0.f));
+
+    const float ss = ink_block_sum(y * y, red);
+    if (which == 0) {
+        y *= fminf((1.f / (sqrtf(ss) + 1e-6f)) * qk_clip, 1.f);
+        kc[row * C + c] = __float2half_rn(y);
+    } else {
+        y *= rsqrtf(ss / (float)D + eps);
+        vc[row * C + c] = __float2half_rn(y);
+    }
+}
+
+void ink_kv_glue_rows(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k_in, at::Tensor v_in, at::Tensor wk,
+                      at::Tensor wv, c10::optional<at::Tensor> pk, c10::optional<at::Tensor> pv, at::Tensor kf,
+                      at::Tensor vf, at::Tensor pos_dev, int64_t pst, at::Tensor pt, int64_t taps, double qk_clip, double eps)
+{
+    const int Hk = (int)kf.size(1), D = (int)kf.size(2), C = Hk * D;
+    TORCH_CHECK(k_raw.dim() == 2 && v_raw.dim() == 2 && k_in.dim() == 2 && v_in.dim() == 2, "ink_kv_glue_rows: (T, n) inputs");
+    const int64_t T = k_raw.size(0);
+    const int H = (int)k_in.size(1);
+    TORCH_CHECK(D == 128 && k_raw.size(1) == C && v_raw.size(0) == T && v_raw.size(1) == C && k_in.size(0) == T
+                && v_in.size(0) == T && v_in.size(1) == H && T <= INK_MAXT, "ink_kv_glue_rows: D must be 128, C = Hk * D");
+    for (const at::Tensor* t : {&k_raw, &v_raw, &k_in, &v_in, &wk, &wv})
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous(), "ink_kv_glue_rows: fp32 contiguous inputs");
+    TORCH_CHECK(st.dim() == 2 && st.size(0) == 2 * C && st.stride(1) == 1 && st.scalar_type() == at::kFloat,
+                "ink_kv_glue_rows: st (2C, ld) fp32 view");
+    TORCH_CHECK(taps + 1 <= INK_MAXK && taps >= 1, "ink_kv_glue_rows: taps");
+    TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf && kf.is_contiguous() && vf.is_contiguous(),
+                "ink_kv_glue_rows: fp16 contiguous cache");
+    TORCH_CHECK(pos_dev.is_cuda() && pos_dev.scalar_type() == at::kLong, "ink_kv_glue_rows: pos must be device int64");
+    TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_kv_glue_rows: pt is a device int32 table");
+    const at::cuda::OptionalCUDAGuard guard(st.device());
+    const float* pkp = pk.has_value() ? pk->data_ptr<float>() : nullptr;
+    const float* pvp = pv.has_value() ? pv->data_ptr<float>() : nullptr;
+    ink_kv_glue_rows_kernel<<<dim3(Hk, 2, (unsigned)T), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        k_raw.data_ptr<float>(), v_raw.data_ptr<float>(), st.data_ptr<float>(), st.stride(0),
+        k_in.data_ptr<float>(), v_in.data_ptr<float>(), wk.data_ptr<float>(), wv.data_ptr<float>(), pkp, pvp,
+        reinterpret_cast<__half*>(kf.data_ptr<at::Half>()), reinterpret_cast<__half*>(vf.data_ptr<at::Half>()),
+        reinterpret_cast<const long long*>(pos_dev.data_ptr<int64_t>()), (long long)pst, pt.data_ptr<int>(),
+        C, H, D, (int)taps, (float)qk_clip, (float)eps);
+}
+
+// Attention of T rows: q (T, Hq D), rel (T, Hq E), sink (T, Hq), gate (T, Hq D); window of row r at par[r * pst ..]
+// = [lo, L, nc] -> (T, Hq D) fp16
+at::Tensor ink_attend_rows_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
+                               at::Tensor pt, at::Tensor par, int64_t pst, double sm_scale, int64_t Hk, int64_t E)
+{
+    TORCH_CHECK(q.dim() == 2 && rel.dim() == 2 && sink.dim() == 2 && gate.dim() == 2, "ink_attend_rows_dev: (T, n) inputs");
+    const int64_t T = q.size(0);
+    const int Hq = (int)sink.size(1), D = (int)kf.size(2);
+    TORCH_CHECK(D == 128 && Hq % Hk == 0 && Hq <= 256 && Hq / Hk <= INK_MAXGQ, "ink_attend_rows_dev: heads");
+    TORCH_CHECK(q.size(1) == Hq * D && gate.size(1) == Hq * D && rel.size(1) == Hq * E && rel.size(0) == T
+                && sink.size(0) == T && gate.size(0) == T, "ink_attend_rows_dev: shapes");
+    for (const at::Tensor* t : {&q, &rel, &sink, &gate})
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->is_contiguous(), "ink_attend_rows_dev: fp32 contiguous inputs");
+    TORCH_CHECK(kf.scalar_type() == at::kHalf && vf.scalar_type() == at::kHalf, "ink_attend_rows_dev: fp16 cache");
+    TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_attend_rows_dev: pt");
+    TORCH_CHECK(par.scalar_type() == at::kLong && par.is_cuda(), "ink_attend_rows_dev: par");
+    const int G = Hq / (int)Hk;
+    auto po = at::empty({T, Hq, INK_NSTORE, D}, q.options());
+    auto pml = at::empty({T, Hq, INK_NSTORE, 2}, q.options());
+    auto o = at::empty({T, Hq * D}, q.options().dtype(at::kHalf));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const long long* pp = reinterpret_cast<const long long*>(par.data_ptr<int64_t>());
+    ink_attend_part_kernel<<<dim3(INK_GRID, (unsigned)Hk, (unsigned)T), 256, 0, stream>>>(
+        q.data_ptr<float>(), rel.data_ptr<float>(),
+        reinterpret_cast<const __half*>(kf.data_ptr<at::Half>()), reinterpret_cast<const __half*>(vf.data_ptr<at::Half>()),
+        pt.data_ptr<int>(), 0LL, 1, (float)sm_scale, G, (int)Hk, D, (int)E, INK_NSTORE,
+        po.data_ptr<float>(), pml.data_ptr<float>(), pp, (long long)pst);
+    ink_attend_comb_kernel<<<dim3(Hq, (unsigned)T), 128, 0, stream>>>(
+        sink.data_ptr<float>(), gate.data_ptr<float>(), po.data_ptr<float>(), pml.data_ptr<float>(), INK_NSTORE,
+        INK_NSTORE, pp, D, reinterpret_cast<__half*>(o.data_ptr<at::Half>()), (long long)pst);
     return o;
 }
