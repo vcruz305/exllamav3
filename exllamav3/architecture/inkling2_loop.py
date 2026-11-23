@@ -85,12 +85,12 @@ def _exl3_bc(lin, name: str):
 # Whole-token decode (exllamav3_ext/inkling2_token.cu): one extension call per token instead of the Python block
 # loop. INKLING2_TOKEN=0 keeps the Python single-token path (Inkling2Block._forward_t1) for A/B checks.
 _TOKEN = os.environ.get("INKLING2_TOKEN", "1") != "0"
-# Multi-row token forwards (T = 2..9, no recurrent history). Off by default: the sequential rows are slower than the
-# general path beyond two rows until the batched kernels exist (see PROGRESS.md).
-_TOKEN_T = os.environ.get("INKLING2_TOKEN_T", "0") == "1"
+# Multi-row token forwards (T = 2..9): the verify pass of a draft round. INKLING2_TOKEN_T=0 sends them through the
+# general path.
+_TOKEN_T = os.environ.get("INKLING2_TOKEN_T", "1") != "0"
 # Batched multi-row forward (InkToken::step_rows2, the rows share the linears, head and experts; records the rewind
 # history). INKLING2_TOKEN_BATCH=0 keeps the sequential rows (no record support)
-_TOKEN_BATCH = os.environ.get("INKLING2_TOKEN_BATCH", "0") != "0"
+_TOKEN_BATCH = os.environ.get("INKLING2_TOKEN_BATCH", "1") != "0"
 # exl3_mlin for the q, r, g, k, v projections of the token step (rounding-level change vs the per-linear BC path)
 _MLIN_TOK = os.environ.get("INKLING2_TOK_MLIN", "1") != "0"
 # CUDA-graph replay of the token step (per record flag); INKLING2_GRAPH=0 runs the same step eagerly

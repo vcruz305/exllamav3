@@ -136,11 +136,12 @@ class Inkling2MTPModel(Model):
         self.eps = m["rms_norm_eps"]
         self.theta = m["rope_theta"]
         self.block = m["block_size"]
-        # INKLING2_MTP_BLOCK: shorter draft block (anchor + block - 1 drafted tokens per round)
-        self.block = max(2, min(self.block, int(os.environ.get("INKLING2_MTP_BLOCK", self.block))))
+        # INKLING2_MTP_BLOCK: draft block (anchor + block - 1 drafted tokens per round), up to the trained block.
+        # 5 is the default: longer blocks gain on predictable text and lose a little elsewhere.
+        self.block = max(2, min(self.block, int(os.environ.get("INKLING2_MTP_BLOCK", "5"))))
         # INKLING2_MTP_CONF: verify only the leading drafts whose joint drafter probability is at least this
         # (0: verify the whole block). A verify row costs a fraction of a token, so low-confidence tails lose.
-        self.conf_thr = float(os.environ.get("INKLING2_MTP_CONF", "0"))
+        self.conf_thr = float(os.environ.get("INKLING2_MTP_CONF", "0.3"))
         # INKLING2_MTP_COST=first,next[,fixed]: verify the number of leading drafts that maximises expected tokens
         # per unit time, from the joint drafter probabilities. Costs are fractions of a one-token step: the first
         # extra verify row, each later row, and the fixed cost of a round. Replaces the plain threshold.
