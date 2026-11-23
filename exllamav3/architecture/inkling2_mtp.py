@@ -257,9 +257,16 @@ class Inkling2MTPModel(Model):
         for i in range(self.n_layers):
             for name in ("_ctx_k", "_ctx_v"):
                 buf = getattr(self, name)
-                nb = torch.zeros((new_cap, self.kv_heads, self.head_dim), dtype = torch.half, device = self.dev)
-                if buf[i] is not None:
-                    nb[: self._cap] = buf[i][: self._cap]
+                # A global layer reads its whole context every round: kept (heads, n, dim) so the fp16 buffer
+                # goes into the score and value products as it is
+                if self.layers[i].local:
+                    nb = torch.zeros((new_cap, self.kv_heads, self.head_dim), dtype = torch.half, device = self.dev)
+                    if buf[i] is not None:
+                        nb[: self._cap] = buf[i][: self._cap]
+                else:
+                    nb = torch.zeros((self.kv_heads, new_cap, self.head_dim), dtype = torch.half, device = self.dev)
+                    if buf[i] is not None:
+                        nb[:, : self._cap] = buf[i][:, : self._cap]
                 buf[i] = nb
         self._cap = new_cap
         self._fg, self._ug = None, {}       # the graphs hold the old buffers
@@ -301,8 +308,12 @@ class Inkling2MTPModel(Model):
             k = layer.k_proj_ctx.forward(m, {}).float().view(n, self.kv_heads, self.head_dim)
             v = layer.v_proj_ctx.forward(m, {}).view(n, self.kv_heads, self.head_dim)
             k = _rope_apply(_rms(k, layer.k_norm_ctx.t, self.eps), cs)
-            self._ctx_k[i][start : start + n] = k.half()
-            self._ctx_v[i][start : start + n] = v.half()
+            if layer.local:
+                self._ctx_k[i][start : start + n] = k.half()
+                self._ctx_v[i][start : start + n] = v.half()
+            else:
+                self._ctx_k[i][:, start : start + n] = k.half().transpose(0, 1)
+                self._ctx_v[i][:, start : start + n] = v.half().transpose(0, 1)
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, params: dict, **kwargs) -> torch.Tensor:
@@ -363,7 +374,7 @@ class Inkling2MTPModel(Model):
                 Vc = self._ctx_v[i].index_select(0, idx).float()
                 x = self._layer_core(layer, x, cs, Kc, Vc, bias_l)
             else:
-                x = self._layer_core(layer, x, cs, self._ctx_k[i].float(), self._ctx_v[i].float(), bias_g)
+                x = self._layer_core(layer, x, cs, self._ctx_k[i], self._ctx_v[i], bias_g, True)
         return _rms(x, self.norm.t, self.eps).half().unsqueeze(0)
 
     def _fwd_graph(self):
@@ -386,8 +397,12 @@ class Inkling2MTPModel(Model):
             k = layer.k_proj_ctx.forward(m, {}).float().view(T, self.kv_heads, self.head_dim)
             v = layer.v_proj_ctx.forward(m, {}).view(T, self.kv_heads, self.head_dim)
             k = _rope_apply(_rms(k, layer.k_norm_ctx.t, self.eps), cs)
-            self._ctx_k[i].index_copy_(0, pos, k.half())
-            self._ctx_v[i].index_copy_(0, pos, v.half())
+            if layer.local:
+                self._ctx_k[i].index_copy_(0, pos, k.half())
+                self._ctx_v[i].index_copy_(0, pos, v.half())
+            else:
+                self._ctx_k[i].index_copy_(1, pos, k.half().transpose(0, 1))
+                self._ctx_v[i].index_copy_(1, pos, v.half().transpose(0, 1))
         return self._mix(taps, self.n_layers, self.markov_dflare.t)
 
     def _write_graph(self, T: int):
@@ -401,10 +416,14 @@ class Inkling2MTPModel(Model):
         return e
 
     def _layer(self, i, layer, x, cs, L):
-        lo = max(0, L - self.window) if layer.local else 0
+        if not layer.local:
+            return self._layer_core(layer, x, cs, self._ctx_k[i][:, :L], self._ctx_v[i][:, :L], None, True)
+        lo = max(0, L - self.window)
         return self._layer_core(layer, x, cs, self._ctx_k[i][lo:L].float(), self._ctx_v[i][lo:L].float(), None)
 
-    def _layer_core(self, layer, x, cs, Kc, Vc, bias):
+    def _layer_core(self, layer, x, cs, Kc, Vc, bias, heads_first = False):
+        """Kc, Vc: the context keys and values, (n, kv_heads, dim) fp32, or (kv_heads, n, dim) fp16 with
+        heads_first (scores and values against the context are then taken in fp16, the block's own in fp32)."""
         T = x.shape[0]
         h = _rms(x, layer.input_norm.t, self.eps).half()
         q = layer.q_proj.forward(h, {}).float().view(T, self.heads, self.head_dim)
@@ -412,15 +431,27 @@ class Inkling2MTPModel(Model):
         v = layer.v_proj.forward(h, {}).float().view(T, self.kv_heads, self.head_dim)
         q = _rope_apply(_rms(q, layer.q_norm.t, self.eps), cs)
         k = _rope_apply(_rms(k, layer.k_norm.t, self.eps), cs)
-        K = torch.cat([Kc, k], dim = 0)     # (n, Hk, D)
-        V = torch.cat([Vc, v], dim = 0)
         group = self.heads // self.kv_heads
         qg = q.view(T, self.kv_heads, group, self.head_dim)
-        scores = torch.einsum("tkgd,nkd->tkgn", qg, K) * (self.head_dim ** -0.5)
-        if bias is not None:
-            scores = scores + bias
-        p = torch.softmax(scores, dim = -1)
-        o = torch.einsum("tkgn,nkd->tkgd", p, V).reshape(T, self.heads * self.head_dim)
+        if heads_first:
+            N = Kc.shape[1]
+            Q = qg.permute(1, 0, 2, 3).reshape(self.kv_heads, T * group, self.head_dim)
+            scores = torch.cat([torch.matmul(Q.half(), Kc.transpose(1, 2)).float(),
+                                torch.matmul(Q, k.permute(1, 2, 0))], dim = -1) * (self.head_dim ** -0.5)
+            if bias is not None:
+                scores = scores + bias
+            p = torch.softmax(scores, dim = -1)
+            o = torch.matmul(p[..., :N].half(), Vc).float() + torch.matmul(p[..., N:], v.permute(1, 0, 2))
+            o = o.view(self.kv_heads, T, group, self.head_dim).permute(1, 0, 2, 3)
+            o = o.reshape(T, self.heads * self.head_dim)
+        else:
+            K = torch.cat([Kc, k], dim = 0)     # (n, Hk, D)
+            V = torch.cat([Vc, v], dim = 0)
+            scores = torch.einsum("tkgd,nkd->tkgn", qg, K) * (self.head_dim ** -0.5)
+            if bias is not None:
+                scores = scores + bias
+            p = torch.softmax(scores, dim = -1)
+            o = torch.einsum("tkgn,nkd->tkgd", p, V).reshape(T, self.heads * self.head_dim)
         x = x + layer.o_proj.forward(o.half(), {}).float()
         h2 = _rms(x, layer.post_norm.t, self.eps).half()
         g = layer.gate_proj.forward(h2, {}).float()
@@ -509,20 +540,28 @@ class Inkling2MTPModel(Model):
         return torch.cat(out), None
 
     def _markov_graph(self):
-        """The Markov walk captured once as a CUDA graph (fixed shapes): one replay instead of ~150 launches."""
+        """Head, drive and Markov walk captured once as a CUDA graph (fixed shapes): one replay instead of
+        ~150 launches."""
         if self._mg is not None:
             return self._mg
-        B, Vp = self.block - 1, self._fold_w.shape[0]
-        self._mg_in = (torch.zeros(B, Vp, dtype = torch.float, device = self.dev),
-                       torch.zeros(B, 3 * self.rank, dtype = torch.float, device = self.dev),
+        B = self.block - 1
+        self._mg_in = (torch.zeros(B, self._rnn_w_hid.shape[1], dtype = torch.float, device = self.dev),
+                       torch.zeros_like(self._f_rnn),
                        torch.zeros(1, dtype = torch.long, device = self.dev))
         for _ in range(2):
-            self._markov_core(*self._mg_in)
+            self._head_markov(*self._mg_in)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            self._mg_out = self._markov_core(*self._mg_in)
+            self._mg_out = self._head_markov(*self._mg_in)
         self._mg = g
         return g
+
+    def _head_markov(self, h: torch.Tensor, f_rnn: torch.Tensor, anchor: torch.Tensor):
+        """h (block-1, H) fp32 drafter output rows, f_rnn the target-state feature, anchor (1,) long."""
+        base = self.lm.head.inner.forward(h.half(), {}, torch.float).float()    # raw lm_head (no softcap)
+        ctx = (self._rnn_b[None, :] + h @ self._rnn_w_hid.t()
+               + (f_rnn @ self._rnn_w_frnn.t())[None, :])                       # (block-1, 3r)
+        return self._markov_core(base, ctx, anchor)
 
     @torch.inference_mode()
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
@@ -530,19 +569,15 @@ class Inkling2MTPModel(Model):
         self._prepare()
         assert self._f_rnn is not None, "MTP drafter: no target context yet"
         anchor = params["mtp_anchor"]
-        h = state[0, 1:].float()                                                # (block-1, H)
-        base = self.lm.head.inner.forward(h.half(), {}, torch.float).float()    # raw lm_head (no softcap)
-        ctx = (self._rnn_b[None, :] + h @ self._rnn_w_hid.t()
-               + (self._f_rnn @ self._rnn_w_frnn.t())[None, :])                 # (block-1, 3r)
         if _MTP_GRAPH:
             g = self._markov_graph()
-            self._mg_in[0].copy_(base)
-            self._mg_in[1].copy_(ctx)
+            self._mg_in[0].copy_(state[0, 1:])
+            self._mg_in[1].copy_(self._f_rnn)
             self._mg_in[2].copy_(anchor)
             g.replay()
             drafts, nconf = self._mg_out[0].clone(), self._mg_out[1]
         else:
-            drafts, nconf = self._markov_core(base, ctx, anchor)
+            drafts, nconf = self._head_markov(state[0, 1:].float(), self._f_rnn, anchor)
         if nconf is not None:
             params["draft_confidence_len"] = int(nconf)
         return torch.cat([anchor, drafts]).view(1, self.block)
