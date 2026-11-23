@@ -144,6 +144,9 @@ class Inkling2MTPModel(Model):
         # INKLING2_MTP_COST=first,next[,fixed]: verify the number of leading drafts that maximises expected tokens
         # per unit time, from the joint drafter probabilities. Costs are fractions of a one-token step: the first
         # extra verify row, each later row, and the fixed cost of a round. Replaces the plain threshold.
+        # INKLING2_MTP_TOPK: the Markov walk scores only the top-k tokens of the block's own head logits per row
+        # (0: the whole vocabulary, a (vocab, rank) product per drafted token)
+        self.topk = int(os.environ.get("INKLING2_MTP_TOPK", "256"))
         cost = os.environ.get("INKLING2_MTP_COST", "")
         self.cost = [float(x) for x in cost.split(",")] if cost else None
         if self.cost is not None:
@@ -468,6 +471,11 @@ class Inkling2MTPModel(Model):
         out = []
         confs = []
         sc = self.softcap
+        want_conf = self.conf_thr > 0.0 or self.cost is not None
+        if self.topk > 0:
+            # shortlist per row from the head logits (they do not depend on the walk), Markov term on it only
+            val, idx = torch.topk(base[:, :V] + fold_b, min(self.topk, V), dim = -1)      # (B, k)
+            wc = fold_w[idx]                                                              # (B, k, r)
         for s in range(self.block - 1):
             emb = self._markov_tab[prev].reshape(-1)                          # (r,)
             raw = ctx[s] + self._rnn_w_s @ state_r + self._rnn_w_e @ emb
@@ -475,12 +483,17 @@ class Inkling2MTPModel(Model):
             cand = torch.tanh(raw[r : 2 * r])
             latent = torch.tanh(raw[2 * r :])
             state_r = gate * state_r + (1.0 - gate) * cand
-            logits = base[s, :V] + fold_w @ latent + fold_b
-            d = torch.argmax(logits).reshape(1)
+            if self.topk > 0:
+                logits = val[s] + wc[s] @ latent
+                di = torch.argmax(logits).reshape(1)
+                d = idx[s][di]
+            else:
+                logits = base[s, :V] + fold_w @ latent + fold_b
+                d = di = torch.argmax(logits).reshape(1)
             out.append(d)
-            if self.conf_thr > 0.0 or self.cost is not None:
+            if want_conf:
                 capped = sc * torch.tanh(logits / sc) if sc else logits
-                confs.append(torch.softmax(capped, 0)[d])
+                confs.append(torch.softmax(capped, 0)[di])
             prev = d
         if confs and self.cost is not None:
             # expected tokens with j drafts verified: 1 + sum of the first j joint probabilities
