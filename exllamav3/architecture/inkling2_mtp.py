@@ -136,6 +136,9 @@ class Inkling2MTPModel(Model):
         self.block = m["block_size"]
         # INKLING2_MTP_BLOCK: shorter draft block (anchor + block - 1 drafted tokens per round)
         self.block = max(2, min(self.block, int(os.environ.get("INKLING2_MTP_BLOCK", self.block))))
+        # INKLING2_MTP_CONF: verify only the leading drafts whose joint drafter probability is at least this
+        # (0: verify the whole block). A verify row costs a fraction of a token, so low-confidence tails lose.
+        self.conf_thr = float(os.environ.get("INKLING2_MTP_CONF", "0"))
         config.block_size = self.block      # the generator reads the draft block size from the draft config
         self.rank = m["markov_rank"]
         self.window = m["sliding_window_size"]
@@ -343,6 +346,8 @@ class Inkling2MTPModel(Model):
         state_r = torch.zeros(r, dtype = torch.float, device = self.dev)
         prev = anchor
         out = []
+        confs = []
+        sc = self.softcap
         for s in range(self.block - 1):
             emb = self._markov_tab[prev].reshape(-1)                          # (r,)
             raw = ctx[s] + self._rnn_w_s @ state_r + self._rnn_w_e @ emb
@@ -353,8 +358,13 @@ class Inkling2MTPModel(Model):
             logits = base[s, :V] + fold_w @ latent + fold_b
             d = torch.argmax(logits).reshape(1)
             out.append(d)
+            if self.conf_thr > 0.0:
+                capped = sc * torch.tanh(logits / sc) if sc else logits
+                confs.append(torch.softmax(capped, 0)[d])
             prev = d
-        return torch.cat(out)
+        if confs:       # leading drafts whose joint probability clears the threshold
+            return torch.cat(out), (torch.cumprod(torch.cat(confs), 0) >= self.conf_thr).sum()
+        return torch.cat(out), None
 
     def _markov_graph(self):
         """The Markov walk captured once as a CUDA graph (fixed shapes): one replay instead of ~150 launches."""
@@ -392,9 +402,11 @@ class Inkling2MTPModel(Model):
             self._mg_in[1].copy_(ctx)
             self._mg_in[2].copy_(anchor)
             g.replay()
-            drafts = self._mg_out.clone()
+            drafts, nconf = self._mg_out[0].clone(), self._mg_out[1]
         else:
-            drafts = self._markov_core(base, ctx, anchor)
+            drafts, nconf = self._markov_core(base, ctx, anchor)
+        if nconf is not None:
+            params["draft_confidence_len"] = int(nconf)
         return torch.cat([anchor, drafts]).view(1, self.block)
 
 
