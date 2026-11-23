@@ -148,6 +148,11 @@ class Inkling2MTPModel(Model):
         # INKLING2_MTP_TOPK: the Markov walk scores only the top-k tokens of the block's own head logits per row
         # (0: the whole vocabulary, a (vocab, rank) product per drafted token)
         self.topk = int(os.environ.get("INKLING2_MTP_TOPK", "256"))
+        # Sampled drafts: when the generator passes params["mtp_temp"] > 0 (the job samples at that temperature),
+        # the walk samples each draft from the drafter's own distribution over the shortlist and returns that
+        # distribution in params["draft_spec"], so verification can accept with min(1, p / q) and resample the
+        # remainder instead of requiring the target's sample to equal a greedy draft. INKLING2_MTP_SPEC=0: off
+        self.spec_sampling = os.environ.get("INKLING2_MTP_SPEC", "1") != "0" and self.topk > 0
         cost = os.environ.get("INKLING2_MTP_COST", "")
         self.cost = [float(x) for x in cost.split(",")] if cost else None
         if self.cost is not None:
@@ -499,7 +504,7 @@ class Inkling2MTPModel(Model):
         self._f_rnn = self._mix(last, self.n_layers, self.markov_dflare.t)[0]
         self._ctx_len = start + n
 
-    def _markov_core(self, base: torch.Tensor, ctx: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+    def _markov_core(self, base: torch.Tensor, ctx: torch.Tensor, anchor: torch.Tensor, noise = None, inv_t = None):
         """Greedy Markov walk over the block. base (block-1, Vpad) raw head logits, ctx (block-1, 3r) the per-row
         drive from the target state, anchor (1,) long. Returns (block-1,) long draft ids.
         The argmax runs on the raw logits: the soft cap is strictly monotone, so the chosen id is unchanged
@@ -510,6 +515,7 @@ class Inkling2MTPModel(Model):
         prev = anchor
         out = []
         confs = []
+        qs = []
         sc = self.softcap
         want_conf = self.conf_thr > 0.0 or self.cost is not None
         if self.topk > 0:
@@ -525,7 +531,14 @@ class Inkling2MTPModel(Model):
             state_r = gate * state_r + (1.0 - gate) * cand
             if self.topk > 0:
                 logits = val[s] + wc[s] @ latent
-                di = torch.argmax(logits).reshape(1)
+                if noise is not None:
+                    # Gumbel-max sample from softmax(capped * inv_t). Noise and temperature are inputs, so a
+                    # captured graph draws fresh values every replay; zero noise is the greedy draft
+                    lp = torch.log_softmax((sc * torch.tanh(logits / sc) if sc else logits) * inv_t, 0)
+                    di = torch.argmax(lp + noise[s]).reshape(1)
+                    qs.append(lp.exp())
+                else:
+                    di = torch.argmax(logits).reshape(1)
                 d = idx[s][di]
             else:
                 logits = base[s, :V] + fold_w @ latent + fold_b
@@ -535,6 +548,7 @@ class Inkling2MTPModel(Model):
                 capped = sc * torch.tanh(logits / sc) if sc else logits
                 confs.append(torch.softmax(capped, 0)[di])
             prev = d
+        spec = (idx, torch.stack(qs)) if qs else None       # shortlist ids and their probabilities, (block-1, k)
         if confs and self.cost is not None:
             # expected tokens with j drafts verified: 1 + sum of the first j joint probabilities
             joint = torch.cumprod(torch.cat(confs), 0)
@@ -543,10 +557,10 @@ class Inkling2MTPModel(Model):
             first, nxt, fixed = self.cost
             j = torch.arange(self.block, dtype = torch.float, device = self.dev)
             time = 1.0 + fixed + first * (j >= 1).float() + nxt * torch.clamp(j - 1, min = 0)
-            return torch.cat(out), torch.argmax(gain / time)
+            return torch.cat(out), torch.argmax(gain / time), spec
         if confs:       # leading drafts whose joint probability clears the threshold
-            return torch.cat(out), (torch.cumprod(torch.cat(confs), 0) >= self.conf_thr).sum()
-        return torch.cat(out), None
+            return torch.cat(out), (torch.cumprod(torch.cat(confs), 0) >= self.conf_thr).sum(), spec
+        return torch.cat(out), None, spec
 
     def _markov_graph(self):
         """Head, drive and Markov walk captured once as a CUDA graph (fixed shapes): one replay instead of
@@ -557,6 +571,9 @@ class Inkling2MTPModel(Model):
         self._mg_in = (torch.zeros(B, self._rnn_w_hid.shape[1], dtype = torch.float, device = self.dev),
                        torch.zeros_like(self._f_rnn),
                        torch.zeros(1, dtype = torch.long, device = self.dev))
+        if self.spec_sampling:
+            self._mg_in += (torch.zeros(B, min(self.topk, self.vocab_size), dtype = torch.float, device = self.dev),
+                            torch.ones(1, dtype = torch.float, device = self.dev))
         for _ in range(2):
             self._head_markov(*self._mg_in)
         g = torch.cuda.CUDAGraph()
@@ -565,12 +582,12 @@ class Inkling2MTPModel(Model):
         self._mg = g
         return g
 
-    def _head_markov(self, h: torch.Tensor, f_rnn: torch.Tensor, anchor: torch.Tensor):
+    def _head_markov(self, h: torch.Tensor, f_rnn: torch.Tensor, anchor: torch.Tensor, noise = None, inv_t = None):
         """h (block-1, H) fp32 drafter output rows, f_rnn the target-state feature, anchor (1,) long."""
         base = self.lm.head.inner.forward(h.half(), {}, torch.float).float()    # raw lm_head (no softcap)
         ctx = (self._rnn_b[None, :] + h @ self._rnn_w_hid.t()
                + (f_rnn @ self._rnn_w_frnn.t())[None, :])                       # (block-1, 3r)
-        return self._markov_core(base, ctx, anchor)
+        return self._markov_core(base, ctx, anchor, noise, inv_t)
 
     @torch.inference_mode()
     def sample_from_state(self, state: torch.Tensor, params: dict) -> torch.Tensor:
@@ -578,15 +595,33 @@ class Inkling2MTPModel(Model):
         self._prepare()
         assert self._f_rnn is not None, "MTP drafter: no target context yet"
         anchor = params["mtp_anchor"]
+        noise = inv_t = None
+        temp = float(params.get("mtp_temp") or 0.0) if self.spec_sampling else 0.0
+        if self.spec_sampling:
+            k = min(self.topk, self.vocab_size)
+            if temp > 0.0:
+                u = torch.rand(self.block - 1, k, dtype = torch.float, device = self.dev)
+                noise = -torch.log(-torch.log(u.clamp_(1e-10, 1.0 - 1e-7)))
+                inv_t = torch.full((1,), 1.0 / temp, dtype = torch.float, device = self.dev)
+            else:
+                if getattr(self, "_zero_noise", None) is None:
+                    self._zero_noise = torch.zeros(self.block - 1, k, dtype = torch.float, device = self.dev)
+                    self._one = torch.ones(1, dtype = torch.float, device = self.dev)
+                noise, inv_t = self._zero_noise, self._one
         if _MTP_GRAPH:
             g = self._markov_graph()
             self._mg_in[0].copy_(state[0, 1:])
             self._mg_in[1].copy_(self._f_rnn)
             self._mg_in[2].copy_(anchor)
+            if noise is not None:
+                self._mg_in[3].copy_(noise)
+                self._mg_in[4].copy_(inv_t)
             g.replay()
-            drafts, nconf = self._mg_out[0].clone(), self._mg_out[1]
+            drafts, nconf, spec = self._mg_out[0].clone(), self._mg_out[1], self._mg_out[2]
         else:
-            drafts, nconf = self._head_markov(state[0, 1:].float(), self._f_rnn, anchor)
+            drafts, nconf, spec = self._head_markov(state[0, 1:].float(), self._f_rnn, anchor, noise, inv_t)
+        if temp > 0.0 and spec is not None:
+            params["draft_spec"] = spec     # read by the verification of this round, before the next replay
         if nconf is not None:
             params["draft_confidence_len"] = int(nconf)
         return torch.cat([anchor, drafts]).view(1, self.block)

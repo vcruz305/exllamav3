@@ -1459,6 +1459,55 @@ class Generator:
 
 
     # TODO: Refactor, share code with other draft fns
+    @staticmethod
+    def _spec_temperature(job):
+        """Sampling temperature if the job samples from the plain tempered distribution with nothing that makes
+        its positions depend on each other (the case speculative sampling is implemented for), else None."""
+        steps = getattr(job.sampler, "steps", None)
+        if not steps or len(steps) != 1 or not getattr(job.sampler, "fused_only", False):
+            return None
+        st = steps[0]
+        if getattr(st, "mode", None) != 1 or st.inv_temp <= 0:          # SS_Fused.MODE_SAMPLE
+            return None
+        if (
+            len(job.sequences) != 1 or job.checkpoint is not None or job.forced_ids is not None
+            or job.new_tokens < job.min_new_tokens or job.filters or job.token_budget is not None
+            or job.return_probs or job.return_top_tokens > 0 or job.device_logit_mask is not None
+        ):
+            return None
+        return 1.0 / st.inv_temp
+
+    def _spec_verify(self, job, job_logits, draft_row, spec, temp, out_row):
+        """Speculative sampling over one job's verified window. job_logits (1, W, V): target logits at the anchor
+        and after each of the W - 1 drafts. Draft i is kept with probability min(1, p_i(d_i) / q_i(d_i)); the
+        first one that is not kept is replaced by a sample from max(p_i - q_i, 0), which can never be d_i, so the
+        acceptance walk stops there by itself. The last row is a plain sample. The result is distributed exactly
+        as serial sampling from p. Writes W token ids to out_row (pinned) without a sync."""
+        dev = job_logits.device
+        W = job_logits.shape[1]
+        n = W - 1
+        V = min(job_logits.shape[-1], self.tokenizer.actual_vocab_size)
+        idx, qf = spec[0][:n], spec[1][:n]
+        gen = self._spec_gen.get(dev) if hasattr(self, "_spec_gen") else None
+        if gen is None:
+            if not hasattr(self, "_spec_gen"): self._spec_gen = {}
+            gen = self._spec_gen[dev] = torch.Generator(device = dev)
+        gen.manual_seed(job.rng.randint(0, (1 << 32) - 1))
+        p = torch.softmax(job_logits[0, :, :V].float() * (1.0 / temp), dim = -1)          # (W, V)
+        d = draft_row[:n].to(dev, non_blocking = True)
+        p_d = p[:n].gather(1, d[:, None])[:, 0]
+        q_d = (qf * (idx == d[:, None])).sum(dim = 1)
+        keep = torch.rand(n, device = dev, generator = gen) * q_d < p_d
+        res = p.clone()
+        res[:n].scatter_add_(1, idx, -qf)
+        res.clamp_(min = 0.0)
+        empty = res.sum(dim = 1, keepdim = True) <= 0.0
+        res = torch.where(empty, p, res)
+        u = torch.rand(res.shape, device = dev, generator = gen).clamp_(1e-10, 1.0 - 1e-7)
+        alt = torch.argmax(torch.log(res) - torch.log(-torch.log(u)), dim = -1)       # Gumbel-max, (W,)
+        alt[:n] = torch.where(keep, d, alt[:n])
+        out_row[:W].copy_(alt, non_blocking = True)
+
     def iterate_draftmodel_dflash_gen(self, results: list, window: int):
 
         self._draft_conf_round = None
@@ -1533,7 +1582,13 @@ class Generator:
         )
         if self.draft_model.caps.get("dflash_sample_from_anchor", False):
             params["dspark_rows"] = window
+        self._draft_spec = None
+        if batch_size == 1 and getattr(self.draft_model, "spec_sampling", False):
+            temp = self._spec_temperature(next(job for job in self.active_jobs if job.is_prefill_done()))
+            if temp:
+                params["mtp_temp"] = temp
         new_ids = self.draft_model.sample_from_state(out_state, params)
+        self._draft_spec = params.get("draft_spec")
 
         # Draft models with a confidence head cap the usable draft length per round;
         # 0 means no draft position cleared the threshold, so skip drafting entirely
@@ -2134,7 +2189,13 @@ class Generator:
                 job_logits = batch_logits[a:b, :, :]
                 rng_state = job.rng.getstate()
                 staged = []
-                for i in range(W):
+                spec = getattr(self, "_draft_spec", None)
+                spec_temp = self._spec_temperature(job) if spec is not None and draft_tokens is not None else None
+                if spec_temp and job_logits.is_cuda and 2 <= W <= spec[0].shape[0] + 1 and r == 0:
+                    self._spec_verify(job, job_logits, draft_tokens[0], spec, spec_temp, pinned_w[r])
+                    staged = [((pinned_w[r:r + 1, i:i + 1], None, None, None), False) for i in range(W)]
+                    any_cuda = True
+                for i in range(W if not staged else 0):
                     sampled = job.receive_logits(job_logits[:, i:i + 1, :])
                     is_cuda = sampled[0].is_cuda and sampled[0].numel() == 1
                     if is_cuda:
