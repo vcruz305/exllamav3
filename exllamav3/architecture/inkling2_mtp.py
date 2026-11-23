@@ -15,6 +15,8 @@ from ..modules.arch_specific.inkling2 import _side
 
 # INKLING2_MTP_GRAPH=0 runs the Markov walk eagerly (A/B check of the captured graph)
 _MTP_GRAPH = os.environ.get("INKLING2_MTP_GRAPH", "1") != "0"
+# INKLING2_MTP_FGRAPH=0 runs the block forward and the context write eagerly (A/B check of their graphs)
+_MTP_FGRAPH = os.environ.get("INKLING2_MTP_FGRAPH", "1") != "0"
 
 # Inkling2 MTP component: the DSpark block drafter stored in mtp.safetensors.
 # Semantics follow the vLLM reference (ref nvidia/dspark.py, ops/dspark.py, speculator.py):
@@ -187,6 +189,8 @@ class Inkling2MTPModel(Model):
         self._ctx_len = 0
         self._f_rnn = None
         self._mg = None          # CUDA graph of the Markov walk (sample_from_state), built in _prepare's wake
+        self._fg = None          # CUDA graph of the block forward, for the current context capacity
+        self._ug = {}            # CUDA graphs of the context write, by row count
         self.dev = None
         self.dense_context = True   # unpaged context: the generator must not reuse prefix pages (job.py)
 
@@ -245,6 +249,7 @@ class Inkling2MTPModel(Model):
                     nb[: self._cap] = buf[i][: self._cap]
                 buf[i] = nb
         self._cap = new_cap
+        self._fg, self._ug = None, {}       # the graphs hold the old buffers
 
     def _inv_freq(self):
         return self._inv
@@ -283,6 +288,12 @@ class Inkling2MTPModel(Model):
         anchor = input_ids.reshape(-1)[:1].to(self.dev).long()
         params["mtp_anchor"] = anchor
         self._ensure_cap(L + self.block)
+        if _MTP_FGRAPH:
+            g = self._fwd_graph()
+            self._fg_anchor.copy_(anchor)
+            self._fg_L.fill_(L)
+            g.replay()
+            return self._fg_out
 
         emb = self.embed.embedding[anchor].float()
         x0 = _rms(emb, self.embed.norm_weight, self.embed.eps)          # (1, H)
@@ -293,7 +304,85 @@ class Inkling2MTPModel(Model):
         h = _rms(x, self.norm.t, self.eps)
         return h.half().unsqueeze(0)
 
+    def _capture(self, fn):
+        """Warm fn on a side stream, then capture it as a CUDA graph. Returns (graph, fn's captured result)."""
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                fn()
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = fn()
+        return g, out
+
+    def _fwd_core(self, anchor: torch.Tensor, Lt: torch.Tensor) -> torch.Tensor:
+        """The block forward at fixed shapes: every position-dependent quantity derives from the device scalar Lt.
+        Local layers gather their window by index, the global layer reads the whole context buffer; keys at or
+        past the context length get a -inf score, which leaves the same softmax as the sliced eager forward."""
+        W, B, cap = self.window, self.block, self._cap
+        ar_w = torch.arange(W, device = self.dev)
+        ar_c = torch.arange(cap, device = self.dev)
+        lo = torch.clamp(Lt - W, min = 0)
+        idx = torch.clamp(lo + ar_w, max = cap - 1)
+        zero_b = torch.zeros(B, dtype = torch.float, device = self.dev)
+        ninf = torch.full((1,), float("-inf"), dtype = torch.float, device = self.dev)
+        zero = torch.zeros(1, dtype = torch.float, device = self.dev)
+        bias_l = torch.cat([torch.where(ar_w < Lt - lo, zero, ninf), zero_b])
+        bias_g = torch.cat([torch.where(ar_c < Lt, zero, ninf), zero_b])
+        emb = self.embed.embedding[anchor].float()
+        x0 = _rms(emb, self.embed.norm_weight, self.embed.eps)
+        x = torch.cat([x0, self._mask_f], dim = 0)
+        cs = _rope_cs(Lt + torch.arange(B, device = self.dev), self._inv)
+        for i, layer in enumerate(self.layers):
+            if layer.local:
+                Kc = self._ctx_k[i].index_select(0, idx).float()
+                Vc = self._ctx_v[i].index_select(0, idx).float()
+                x = self._layer_core(layer, x, cs, Kc, Vc, bias_l)
+            else:
+                x = self._layer_core(layer, x, cs, self._ctx_k[i].float(), self._ctx_v[i].float(), bias_g)
+        return _rms(x, self.norm.t, self.eps).half().unsqueeze(0)
+
+    def _fwd_graph(self):
+        if self._fg is not None:
+            return self._fg
+        self._fg_anchor = torch.zeros(1, dtype = torch.long, device = self.dev)
+        self._fg_L = torch.zeros(1, dtype = torch.long, device = self.dev)
+        self._fg, self._fg_out = self._capture(lambda: self._fwd_core(self._fg_anchor, self._fg_L))
+        return self._fg
+
+    def _write_core(self, taps: torch.Tensor, start: torch.Tensor) -> torch.Tensor:
+        """Context K/V for rows [start, start + T) from taps (4, T, H) fp32, start a device scalar; returns the
+        Markov mix of every row (T, H). Rows past the accepted count land beyond the context length, where
+        nothing reads them before the next write."""
+        T = taps.shape[1]
+        pos = start + torch.arange(T, device = self.dev)
+        cs = _rope_cs(pos, self._inv)
+        for i, layer in enumerate(self.layers):
+            m = self._mix(taps, i, layer.dflare_norm.t).half()
+            k = layer.k_proj_ctx.forward(m, {}).float().view(T, self.kv_heads, self.head_dim)
+            v = layer.v_proj_ctx.forward(m, {}).view(T, self.kv_heads, self.head_dim)
+            k = _rope_apply(_rms(k, layer.k_norm_ctx.t, self.eps), cs)
+            self._ctx_k[i].index_copy_(0, pos, k.half())
+            self._ctx_v[i].index_copy_(0, pos, v.half())
+        return self._mix(taps, self.n_layers, self.markov_dflare.t)
+
+    def _write_graph(self, T: int):
+        e = self._ug.get(T)
+        if e is None:
+            taps = torch.zeros((len(self.taps), T, self.hidden), dtype = torch.float, device = self.dev)
+            start = torch.zeros(1, dtype = torch.long, device = self.dev)
+            start.fill_(self._cap - T)      # warm-up and capture write scratch rows at the end of the buffer
+            g, mix = self._capture(lambda: self._write_core(taps, start))
+            e = self._ug[T] = (g, taps, start, mix)
+        return e
+
     def _layer(self, i, layer, x, cs, L):
+        lo = max(0, L - self.window) if layer.local else 0
+        return self._layer_core(layer, x, cs, self._ctx_k[i][lo:L].float(), self._ctx_v[i][lo:L].float(), None)
+
+    def _layer_core(self, layer, x, cs, Kc, Vc, bias):
         T = x.shape[0]
         h = _rms(x, layer.input_norm.t, self.eps).half()
         q = layer.q_proj.forward(h, {}).float().view(T, self.heads, self.head_dim)
@@ -301,12 +390,13 @@ class Inkling2MTPModel(Model):
         v = layer.v_proj.forward(h, {}).float().view(T, self.kv_heads, self.head_dim)
         q = _rope_apply(_rms(q, layer.q_norm.t, self.eps), cs)
         k = _rope_apply(_rms(k, layer.k_norm.t, self.eps), cs)
-        lo = max(0, L - self.window) if layer.local else 0
-        K = torch.cat([self._ctx_k[i][lo:L].float(), k], dim = 0)     # (n, Hk, D)
-        V = torch.cat([self._ctx_v[i][lo:L].float(), v], dim = 0)
+        K = torch.cat([Kc, k], dim = 0)     # (n, Hk, D)
+        V = torch.cat([Vc, v], dim = 0)
         group = self.heads // self.kv_heads
         qg = q.view(T, self.kv_heads, group, self.head_dim)
         scores = torch.einsum("tkgd,nkd->tkgn", qg, K) * (self.head_dim ** -0.5)
+        if bias is not None:
+            scores = scores + bias
         p = torch.softmax(scores, dim = -1)
         o = torch.einsum("tkgn,nkd->tkgd", p, V).reshape(T, self.heads * self.head_dim)
         x = x + layer.o_proj.forward(o.half(), {}).float()
@@ -330,6 +420,17 @@ class Inkling2MTPModel(Model):
         if start < self._ctx_len:
             self._ctx_len = start
         assert start == self._ctx_len, f"MTP drafter: taps at {start}, context ends at {self._ctx_len}"
+        if _MTP_FGRAPH and T <= self.block + 1:
+            # Scratch rows of the capture sit at the end of the buffer, so keep T rows spare past the write
+            self._ensure_cap(start + 2 * T)
+            g, g_taps, g_start, g_mix = self._write_graph(T)
+            for j, t in enumerate(taps):
+                g_taps[j].copy_(t[0])
+            g_start.fill_(start)
+            g.replay()
+            self._f_rnn = g_mix[n - 1].clone()
+            self._ctx_len = start + n
+            return
         stacked = torch.stack([t[0, :n].float() for t in taps], dim = 0)  # (4, n, H)
         self._write_ctx(stacked, start)
         last = stacked[:, n - 1 : n]
