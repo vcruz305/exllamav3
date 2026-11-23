@@ -68,8 +68,13 @@ class ShortConvState:
 
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            for l in self.cache.get_all_recurrent_layers().values():
-                l.rewind(self.slot, self.last_history, num_tokens)
+            layers = list(self.cache.get_all_recurrent_layers().values())
+            ra = getattr(type(layers[0]), "rewind_all", None) if layers else None
+            if ra is not None and all(type(l) is type(layers[0]) for l in layers):
+                ra(layers, self.slot, self.last_history, num_tokens)
+            else:
+                for l in layers:
+                    l.rewind(self.slot, self.last_history, num_tokens)
         else:
             self.cache.model.tp_dispatch_all(mp_cache_short_conv_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens

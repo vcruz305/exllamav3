@@ -1137,6 +1137,36 @@ void ink_hist_rows(at::Tensor st, at::Tensor x, int64_t taps, bool record)
         st.data_ptr<float>(), st.stride(0), C, x.data_ptr<float>(), (int)taps, (int)x.size(0), record ? 1 : 0);
 }
 
+// Rewind of recorded conv histories: state (B, C, ld) of every layer, slot `slot`: the taps before the last
+// num_tokens recorded columns become the current taps (columns 0..taps-1)
+__global__ void ink_rewind_kernel(float* __restrict__ st, long long ld, int C, int taps, int nt)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float* h = st + (long long)c * ld;
+    float buf[INK_MAXK];
+    const long long p = ld - nt - taps;
+    for (int t = 0; t < taps; ++t) buf[t] = h[p + t];
+    for (int t = 0; t < taps; ++t) h[t] = buf[t];
+}
+
+void ink_rewind_all(std::vector<at::Tensor> states, int64_t slot, int64_t taps, int64_t num_tokens)
+{
+    if (states.empty()) return;
+    const at::cuda::OptionalCUDAGuard guard(states[0].device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    for (const at::Tensor& st : states) {
+        TORCH_CHECK(st.dim() == 3 && st.is_contiguous() && st.scalar_type() == at::kFloat && st.is_cuda()
+                    && slot >= 0 && slot < st.size(0), "ink_rewind_all: state (B, C, ld) fp32");
+        const int64_t ld = st.size(2);
+        TORCH_CHECK(taps >= 1 && taps < INK_MAXK && num_tokens >= 0 && ld - num_tokens - taps >= 0, "ink_rewind_all: range");
+        const int C = (int)st.size(1);
+        const int threads = 128, blocks = (C + threads - 1) / threads;
+        ink_rewind_kernel<<<blocks, threads, 0, stream>>>(st.data_ptr<float>() + slot * st.stride(0), ld, C, (int)taps,
+                                                           (int)num_tokens);
+    }
+}
+
 // Query glue of T rows: q_f (T, Hq D), r_f (T, Hq R), g_f (T, Hq D), q_in (T, H); tau of row r at tau_dev[r * tst]
 // -> {q (T, Hq D), rel (T, Hq E), sink (T, Hq), gate (T, Hq D)}
 std::vector<at::Tensor> ink_q_glue_rows(at::Tensor q_f, at::Tensor r_f, at::Tensor g_f, at::Tensor q_in, at::Tensor q_scale,

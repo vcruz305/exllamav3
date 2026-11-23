@@ -195,7 +195,7 @@ def _build_token(model, params: dict):
 
 def _mlin_fields(a, dev):
     """exl3_mlin spec of q, r, g, k, v (the one-launch projection path of the token step), or the disabled spec"""
-    off = dict(mlin = False, mlin_t = [], mlin_su = [], mlin_sv = [], mlin_out = [],
+    off = dict(mlin = False, mlin_t = [], mlin_su = [], mlin_sv = [], mlin_out = [], mlin_xh = [], mlin_rout = [],
                mlin_cnt = torch.zeros(1, dtype = torch.int32, device = dev))
     if not _MLIN_TOK:
         return off
@@ -214,8 +214,10 @@ def _mlin_fields(a, dev):
         return off
     outs = [torch.empty((1, l.out_features), dtype = torch.float, device = dev) for l in lins]
     cnt = torch.zeros(sum(l.out_features // 128 for l in lins), dtype = torch.int32, device = dev)
+    xh = [torch.empty((16, l.in_features), dtype = torch.half, device = dev) for l in lins]
+    rout = [torch.empty((16, l.out_features), dtype = torch.float, device = dev) for l in lins]
     return dict(mlin = True, mlin_t = [l.inner.trellis for l in lins], mlin_su = [l.inner.suh for l in lins],
-                mlin_sv = [l.inner.svh for l in lins], mlin_out = outs, mlin_cnt = cnt)
+                mlin_sv = [l.inner.svh for l in lins], mlin_out = outs, mlin_cnt = cnt, mlin_xh = xh, mlin_rout = rout)
 
 
 class Inkling2LoopConfig(Config):

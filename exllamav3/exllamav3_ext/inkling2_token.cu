@@ -74,6 +74,7 @@ struct InkBlock {
     // exl3_mlin for q, r, g, k, v (one launch): trellis / suh / svh per linear, fp32 outs, counters
     bool mlin = false;
     std::vector<at::Tensor> mlin_t, mlin_su, mlin_sv, mlin_out;
+    std::vector<at::Tensor> mlin_xh, mlin_rout;                 // rows launch: (rows_max, k) fp16, (rows_max, n) fp32
     at::Tensor mlin_cnt;
     at::Tensor moe_out, gate_t, logits, bias_f32, sel, w;
     double rsf = 1.0;
@@ -106,6 +107,43 @@ static void mlin5(InkBlock& b, const at::Tensor& qh, const at::Tensor& kh, const
     }
     bt.total_blocks = blocks;
     exl3_mlin_launch(bt, at::cuda::getCurrentCUDAStream().stream());
+}
+
+static void mlin5_rows(InkBlock& b, const at::Tensor& qh, const at::Tensor& kh, const at::Tensor& vh, int64_t T)
+{
+    ExlMLinBatch bt{};
+    bt.count = 5;
+    bt.K = (int)(b.mlin_t[0].size(2) / 16);
+    bt.cb = 2;                                                  // mul1
+    bt.rows = (int)T;
+    const at::Tensor* ins[5] = {&qh, &qh, &qh, &kh, &vh};
+    int* cnt = reinterpret_cast<int*>(b.mlin_cnt.data_ptr());
+    int blocks = 0, ctr = 0, rot = 0;
+    for (int i = 0; i < 5; ++i) {
+        const at::Tensor& t = b.mlin_t[i];
+        ExlMLinSpec& s = bt.s[i];
+        s.trellis = reinterpret_cast<const uint16_t*>(t.data_ptr());
+        s.suh = reinterpret_cast<const half*>(b.mlin_su[i].data_ptr());
+        s.svh = reinterpret_cast<const half*>(b.mlin_sv[i].data_ptr());
+        s.k = (int)t.size(0) * 16;
+        s.n = (int)t.size(1) * 16;
+        TORCH_CHECK(ins[i]->dim() == 2 && ins[i]->size(0) == T && ins[i]->size(1) == s.k && ins[i]->is_contiguous()
+                    && ins[i]->scalar_type() == at::kHalf, "InkToken: mlin rows input");
+        TORCH_CHECK(b.mlin_xh[i].size(0) >= T && b.mlin_xh[i].size(1) == s.k && b.mlin_rout[i].size(0) >= T
+                    && b.mlin_rout[i].size(1) == s.n, "InkToken: mlin rows scratch");
+        s.in = reinterpret_cast<const half*>(ins[i]->data_ptr());
+        s.xh = reinterpret_cast<half*>(b.mlin_xh[i].data_ptr());
+        s.out = reinterpret_cast<float*>(b.mlin_rout[i].data_ptr());
+        s.counters = cnt + ctr;
+        s.blk_begin = blocks;
+        s.rot_begin = rot;
+        blocks += s.n / 32;
+        ctr += s.n / 128;
+        rot += (int)T * (s.k / 128);
+    }
+    bt.total_blocks = blocks;
+    bt.rot_items = rot;
+    exl3_mlin_rows_launch(bt, at::cuda::getCurrentCUDAStream().stream());
 }
 
 
@@ -183,6 +221,8 @@ InkBlock parse_block(const py::dict& d)
         b.mlin_sv = get<std::vector<at::Tensor>>(d, "mlin_sv");
         b.mlin_out = get<std::vector<at::Tensor>>(d, "mlin_out");
         b.mlin_cnt = get<at::Tensor>(d, "mlin_cnt");
+        b.mlin_xh = get<std::vector<at::Tensor>>(d, "mlin_xh");
+        b.mlin_rout = get<std::vector<at::Tensor>>(d, "mlin_rout");
     }
     if (b.coop) {
         b.coopmk = get<std::shared_ptr<CoopMK>>(d, "coopmk");
@@ -973,11 +1013,22 @@ struct InkToken {
             at::Tensor qh = q_in.to(at::kHalf).contiguous();
             at::Tensor kh = same ? qh : k_in.to(at::kHalf).contiguous();
             at::Tensor vh = same ? qh : v_in.to(at::kHalf).contiguous();
-            at::Tensor q_f = lin(b.q, qh, b.Hq * b.D).contiguous();
-            at::Tensor r_f = lin(b.r, qh, b.Hq * b.R).contiguous();
-            at::Tensor g_f = lin(b.g, qh, b.Hq * b.D).contiguous();
-            at::Tensor k_raw = lin(b.k, kh, b.Hk * b.D).contiguous();
-            at::Tensor v_raw = lin(b.v, vh, b.Hk * b.D).contiguous();
+            at::Tensor q_f, r_f, g_f, k_raw, v_raw;
+            if (b.mlin && !b.mlin_xh.empty() && !(dbgm & (1 | 32))) {
+                // INKLING2_ROWS_MASK bit 32 off: one weight pass for all five projections and all rows
+                mlin5_rows(b, qh, kh, vh, T);
+                q_f = b.mlin_rout[0].narrow(0, 0, T);
+                r_f = b.mlin_rout[1].narrow(0, 0, T);
+                g_f = b.mlin_rout[2].narrow(0, 0, T);
+                k_raw = b.mlin_rout[3].narrow(0, 0, T);
+                v_raw = b.mlin_rout[4].narrow(0, 0, T);
+            } else {
+                q_f = lin(b.q, qh, b.Hq * b.D).contiguous();
+                r_f = lin(b.r, qh, b.Hq * b.R).contiguous();
+                g_f = lin(b.g, qh, b.Hq * b.D).contiguous();
+                k_raw = lin(b.k, kh, b.Hk * b.D).contiguous();
+                v_raw = lin(b.v, vh, b.Hk * b.D).contiguous();
+            }
 
             // query glue, K/V glue (cache rows of all rows, then the K/V conv history), attention over the cache:
             // row r attends its own window, which ends at its own position
@@ -1069,6 +1120,7 @@ struct InkToken {
 
 void ink_token_bind(py::module_& m)
 {
+    m.def("ink_rewind_all", &ink_rewind_all, py::arg("states"), py::arg("slot"), py::arg("taps"), py::arg("num_tokens"));
     py::class_<InkToken, std::shared_ptr<InkToken>>(m, "InkToken")
         .def(py::init<const py::dict&>())
         .def("set_table", &InkToken::set_table, py::arg("pages"))

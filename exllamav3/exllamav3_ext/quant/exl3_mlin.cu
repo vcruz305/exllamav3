@@ -164,7 +164,193 @@ void launch_cb(const ExlMLinBatch& b, cudaStream_t stream)
     }
 }
 
+// Input transform of the rows launch: one warp per (linear, row, 128-input chunk)
+__global__ void __launch_bounds__(THREADS) mlin_rot_kernel(const ExlMLinBatch batch)
+{
+    const int warp = threadIdx.x >> 5;
+    const int item = blockIdx.x * WARPS + warp;
+    int li = 0;
+    while (li + 1 < batch.count && item >= batch.s[li + 1].rot_begin) ++li;
+    const ExlMLinSpec& s = batch.s[li];
+    const int ch = s.k >> 7;
+    const int loc = item - s.rot_begin;
+    if (loc >= batch.rows * ch) return;
+    const int r = loc / ch, c = loc % ch;
+    had_hf_r_128_inner<true, false>(s.in + (size_t) r * s.k + c * 128, s.xh + (size_t) r * s.k + c * 128,
+                                    s.suh + c * 128, 0.088388347648f);
+}
+
+// One block: 32 output columns of one linear, all k, all rows (row g of the tile = input row g)
+template <int K, int CB>
+__global__ void __launch_bounds__(THREADS) mlin_rows_kernel(const ExlMLinBatch batch)
+{
+    __shared__ __align__(16) uint4 ring[WARPS][STAGES][4 * K];
+    __shared__ float red[WARPS][8][32];
+    __shared__ __align__(16) float sh_out[WARPS][128];
+    __shared__ int last_flag;
+
+    const int b = blockIdx.x;
+    int li = 0;
+    while (li + 1 < batch.count && b >= batch.s[li + 1].blk_begin) ++li;
+    const ExlMLinSpec& s = batch.s[li];
+    const int T = batch.rows;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;                        // tile rows g and g + 8
+    const int q = lane & 3;
+    const int cb_blk = b - s.blk_begin;
+    const int n16 = s.n >> 4;
+    const int ni0 = cb_blk * 2;
+    const int per_warp = (s.k >> 4) / WARPS;
+    const int ks0 = warp * per_warp;
+    constexpr int TILE_U16 = 16 * K;
+    constexpr int CHUNKS = 4 * K;
+
+    auto issue = [&] (int s_idx, int stage)
+    {
+        if (s_idx < per_warp)
+        {
+            const uint16_t* src = s.trellis + ((size_t) (ks0 + s_idx) * n16 + ni0) * TILE_U16;
+            for (int c = lane; c < CHUNKS; c += 32)
+                cp_async(&ring[warp][stage][c], src + c * 8);
+        }
+        cp_async_fence();
+    };
+
+    #pragma unroll
+    for (int st = 0; st < STAGES - 1; ++st) issue(st, st);
+
+    const bool r0 = g < T, r1 = g + 8 < T;
+    const half* x0 = s.xh + (size_t) (r0 ? g : 0) * s.k + 2 * q;
+    const half* x1 = s.xh + (size_t) (r1 ? g + 8 : 0) * s.k + 2 * q;
+
+    FragC acc[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) acc[j][e] = 0.f;
+
+    for (int i = 0; i < per_warp; ++i)
+    {
+        cp_async_wait<STAGES - 2>();
+        __syncwarp();
+        issue(i + STAGES - 1, (i + STAGES - 1) % STAGES);
+        const int stage = i % STAGES;
+        const int ks = ks0 + i;
+
+        FragA a;
+        a[0] = __half2half2(__ushort_as_half(0));
+        a[1] = a[0];
+        a[2] = a[0];
+        a[3] = a[0];
+        if (r0)
+        {
+            a[0] = *reinterpret_cast<const half2*>(x0 + ks * 16);
+            a[2] = *reinterpret_cast<const half2*>(x0 + ks * 16 + 8);
+        }
+        if (r1)
+        {
+            a[1] = *reinterpret_cast<const half2*>(x1 + ks * 16);
+            a[3] = *reinterpret_cast<const half2*>(x1 + ks * 16 + 8);
+        }
+
+        #pragma unroll
+        for (int t = 0; t < 2; ++t)
+        {
+            FragB f0, f1;
+            dq_dispatch<K, CB, false>(reinterpret_cast<const uint32_t*>(&ring[warp][stage][t * 2 * K]), lane << 3, f0, f1);
+            ptx_mma_m16n8k16(a, f0, acc[2 * t]);
+            ptx_mma_m16n8k16(a, f1, acc[2 * t + 1]);
+        }
+    }
+    cp_async_wait<0>();
+
+    // acc[j][e]: row g (e < 2) or g + 8 (e >= 2), column 8 j + 2 q + (e & 1). Rows 0..7, then 8..15
+    for (int h = 0; h < 2; ++h)
+    {
+        if (h * 8 >= T) break;
+        __syncthreads();
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+        {
+            red[warp][g][8 * j + 2 * q]     = acc[j][2 * h];
+            red[warp][g][8 * j + 2 * q + 1] = acc[j][2 * h + 1];
+        }
+        __syncthreads();
+        const int rr = h * 8 + warp;
+        if (rr < T)
+        {
+            float v = 0.f;
+            #pragma unroll
+            for (int w = 0; w < WARPS; ++w) v += red[w][warp][lane];
+            s.out[(size_t) rr * s.n + cb_blk * 32 + lane] = v;     // raw sums; output Hadamard below
+        }
+    }
+
+    const int chunk = cb_blk >> 2;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        const int old = atomicAdd(&s.counters[chunk], 1);
+        last_flag = (old == 3);
+    }
+    __syncthreads();
+    if (last_flag)
+    {
+        __threadfence();
+        for (int r = warp; r < T; r += WARPS)
+        {
+            float* o = s.out + (size_t) r * s.n + chunk * 128;
+            float4 v = __ldcg(reinterpret_cast<const float4*>(o) + lane);
+            reinterpret_cast<float4*>(sh_out[warp])[lane] = v;
+            __syncwarp();
+            had_ff_r_128_inner<false, true>(sh_out[warp], o, s.svh + chunk * 128, 0.088388347648f);
+            __syncwarp();
+        }
+        if (threadIdx.x == 0) s.counters[chunk] = 0;
+    }
+}
+
+template <int K, int CB>
+void launch_rows_k(const ExlMLinBatch& b, cudaStream_t stream)
+{
+    mlin_rot_kernel<<<(b.rot_items + WARPS - 1) / WARPS, THREADS, 0, stream>>>(b);
+    mlin_rows_kernel<K, CB><<<b.total_blocks, THREADS, 0, stream>>>(b);
+}
+
+template <int CB>
+void launch_rows_cb(const ExlMLinBatch& b, cudaStream_t stream)
+{
+    switch (b.K)
+    {
+        case 1: launch_rows_k<1, CB>(b, stream); break;
+        case 2: launch_rows_k<2, CB>(b, stream); break;
+        case 3: launch_rows_k<3, CB>(b, stream); break;
+        case 4: launch_rows_k<4, CB>(b, stream); break;
+        case 5: launch_rows_k<5, CB>(b, stream); break;
+        case 6: launch_rows_k<6, CB>(b, stream); break;
+        case 7: launch_rows_k<7, CB>(b, stream); break;
+        case 8: launch_rows_k<8, CB>(b, stream); break;
+        default: TORCH_CHECK(false, "exl3_mlin: K must be 1..8");
+    }
+}
+
 } // namespace exl3_mlin_ns
+
+void exl3_mlin_rows_launch(const ExlMLinBatch& b, cudaStream_t stream)
+{
+    TORCH_CHECK(b.rows >= 1 && b.rows <= EXL3_MLIN_MAX_ROWS, "exl3_mlin: 1..16 rows");
+    switch (b.cb)
+    {
+        case 0: exl3_mlin_ns::launch_rows_cb<0>(b, stream); break;
+        case 1: exl3_mlin_ns::launch_rows_cb<1>(b, stream); break;
+        case 2: exl3_mlin_ns::launch_rows_cb<2>(b, stream); break;
+        default: TORCH_CHECK(false, "exl3_mlin: bad codebook");
+    }
+    cuda_check(cudaPeekAtLastError());
+}
 
 void exl3_mlin_launch(const ExlMLinBatch& b, cudaStream_t stream)
 {

@@ -28,6 +28,7 @@
 
 #define EXL3_MLIN_MAX 6
 #define EXL3_MLIN_MAX_K 4096
+#define EXL3_MLIN_MAX_ROWS 16
 
 struct ExlMLinSpec
 {
@@ -40,6 +41,8 @@ struct ExlMLinSpec
     int k;
     int n;
     int blk_begin;              // first block of this linear: sum of n_j / 32 over earlier linears
+    half* xh;                   // rows launch: (rows, k) transformed input scratch; in is (rows, k), out (rows, n)
+    int rot_begin;              // rows launch: first input-transform item of this linear (items: rows * k / 128)
 };
 
 struct ExlMLinBatch
@@ -49,9 +52,16 @@ struct ExlMLinBatch
     int total_blocks;           // sum of n_i / 32
     int K;                      // bitrate (integer 1..8)
     int cb;                     // codebook: 0 = 3inst, 1 = mcg, 2 = mul1
+    int rows;                   // rows launch: input rows per linear (1..EXL3_MLIN_MAX_ROWS)
+    int rot_items;              // rows launch: sum of rows * k_i / 128
 };
 
 void exl3_mlin_launch(const ExlMLinBatch& b, cudaStream_t stream);
+
+// Same linears over b.rows input rows each (in (rows, k), out (rows, n), both contiguous): the weights are decoded
+// once and multiplied with all rows (the 16 rows of the MMA tile). Two launches: the input transform of every row
+// into s.xh, then the product with its output transform. Per row the arithmetic is that of exl3_mlin_launch.
+void exl3_mlin_rows_launch(const ExlMLinBatch& b, cudaStream_t stream);
 
 int exl3_mlin_tensors
 (

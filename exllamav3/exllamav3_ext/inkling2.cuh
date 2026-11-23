@@ -42,6 +42,7 @@ at::Tensor ink_gates_rows(at::Tensor X, at::Tensor msgs, at::Tensor gd, at::Tens
 at::Tensor ink_sconv_rows(at::Tensor st, at::Tensor x, at::Tensor w, c10::optional<at::Tensor> resid, int64_t taps,
                           bool record);
 void ink_hist_rows(at::Tensor st, at::Tensor x, int64_t taps, bool record);
+void ink_rewind_all(std::vector<at::Tensor> states, int64_t slot, int64_t taps, int64_t num_tokens);
 std::vector<at::Tensor> ink_q_glue_rows(at::Tensor q_f, at::Tensor r_f, at::Tensor g_f, at::Tensor q_in, at::Tensor q_scale,
                                         at::Tensor r_scale, at::Tensor rel_proj, at::Tensor sink_w, double qk_clip,
                                         double rel_clip, at::Tensor tau_dev, int64_t tst);

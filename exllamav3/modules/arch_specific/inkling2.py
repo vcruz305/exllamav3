@@ -163,6 +163,19 @@ class Inkling2ConvLayerState:
             p = self.conv_state.shape[-1] - num_tokens
             self.conv_state[slot, :, :self.taps].copy_(self.conv_state[slot, :, p - self.taps : p].clone())
 
+    @staticmethod
+    def rewind_all(layers, slot: int, last_history: int, num_tokens: int):
+        """rewind() of every layer of one cache in one extension call (one small kernel per layer)."""
+        l0 = layers[0]
+        if (last_history <= 0 or l0.device is None or torch.device(l0.device).type != "cuda"
+                or any(l.taps != l0.taps or l.device != l0.device or not l.conv_state.is_contiguous() for l in layers)):
+            for l in layers:
+                l.rewind(slot, last_history, num_tokens)
+            return
+        assert 0 <= num_tokens <= last_history and l0.max_history > 0, \
+            f"inkling2 conv rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        ext.ink_rewind_all([l.conv_state for l in layers], slot, l0.taps, num_tokens)
+
     def stash(self, slot, position: int = 0):
         return host_copy(self.conv_state[slot, :, :self.taps])
 
