@@ -305,13 +305,9 @@ class Inkling2MTPModel(Model):
         return h.half().unsqueeze(0)
 
     def _capture(self, fn):
-        """Warm fn on a side stream, then capture it as a CUDA graph. Returns (graph, fn's captured result)."""
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(2):
-                fn()
-        torch.cuda.current_stream().wait_stream(side)
+        """Warm fn, then capture it as a CUDA graph. Returns (graph, fn's captured result)."""
+        for _ in range(2):      # on the current stream: a side stream per capture stalls the WSL driver after a few
+            fn()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             out = fn()
@@ -475,12 +471,8 @@ class Inkling2MTPModel(Model):
         self._mg_in = (torch.zeros(B, Vp, dtype = torch.float, device = self.dev),
                        torch.zeros(B, 3 * self.rank, dtype = torch.float, device = self.dev),
                        torch.zeros(1, dtype = torch.long, device = self.dev))
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(2):
-                self._markov_core(*self._mg_in)
-        torch.cuda.current_stream().wait_stream(side)
+        for _ in range(2):
+            self._markov_core(*self._mg_in)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             self._mg_out = self._markov_core(*self._mg_in)
