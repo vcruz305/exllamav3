@@ -141,6 +141,14 @@ class Inkling2MTPModel(Model):
         # INKLING2_MTP_CONF: verify only the leading drafts whose joint drafter probability is at least this
         # (0: verify the whole block). A verify row costs a fraction of a token, so low-confidence tails lose.
         self.conf_thr = float(os.environ.get("INKLING2_MTP_CONF", "0"))
+        # INKLING2_MTP_COST=first,next[,fixed]: verify the number of leading drafts that maximises expected tokens
+        # per unit time, from the joint drafter probabilities. Costs are fractions of a one-token step: the first
+        # extra verify row, each later row, and the fixed cost of a round. Replaces the plain threshold.
+        cost = os.environ.get("INKLING2_MTP_COST", "")
+        self.cost = [float(x) for x in cost.split(",")] if cost else None
+        if self.cost is not None:
+            assert len(self.cost) in (2, 3), "INKLING2_MTP_COST=first,next[,fixed]"
+            self.cost = (self.cost + [0.0])[:3]
         config.block_size = self.block      # the generator reads the draft block size from the draft config
         self.rank = m["markov_rank"]
         self.window = m["sliding_window_size"]
@@ -192,7 +200,9 @@ class Inkling2MTPModel(Model):
         self._fg = None          # CUDA graph of the block forward, for the current context capacity
         self._ug = {}            # CUDA graphs of the context write, by row count
         self.dev = None
-        self.dense_context = True   # unpaged context: the generator must not reuse prefix pages (job.py)
+        self.dense_context = True   # unpaged context, by position: prefix pages are reusable only as far as
+                                    # context_match() says this buffer already holds the same tokens (job.py)
+        self.ctx_seq = None         # the sequence (SeqTensor of ids) the context was written for
 
     # ---- lifecycle ------------------------------------------------------------------------------------------
 
@@ -250,6 +260,19 @@ class Inkling2MTPModel(Model):
                 buf[i] = nb
         self._cap = new_cap
         self._fg, self._ug = None, {}       # the graphs hold the old buffers
+
+    def context_match(self, ids) -> int:
+        """Leading tokens of the sequence `ids` (SeqTensor) whose context K/V this drafter already holds."""
+        s = self.ctx_seq
+        if s is None or self._ctx_len <= 0:
+            return 0
+        n = min(len(s), len(ids), self._ctx_len)
+        if n <= 0:
+            return 0
+        if s is ids:
+            return n
+        ne = (s.torch_slice(0, n).reshape(-1).cpu() != ids.torch_slice(0, n).reshape(-1).cpu()).nonzero()
+        return n if ne.numel() == 0 else int(ne[0])
 
     def _inv_freq(self):
         return self._inv
@@ -455,10 +478,19 @@ class Inkling2MTPModel(Model):
             logits = base[s, :V] + fold_w @ latent + fold_b
             d = torch.argmax(logits).reshape(1)
             out.append(d)
-            if self.conf_thr > 0.0:
+            if self.conf_thr > 0.0 or self.cost is not None:
                 capped = sc * torch.tanh(logits / sc) if sc else logits
                 confs.append(torch.softmax(capped, 0)[d])
             prev = d
+        if confs and self.cost is not None:
+            # expected tokens with j drafts verified: 1 + sum of the first j joint probabilities
+            joint = torch.cumprod(torch.cat(confs), 0)
+            zero = torch.zeros(1, dtype = torch.float, device = self.dev)
+            gain = 1.0 + torch.cat([zero, torch.cumsum(joint, 0)])
+            first, nxt, fixed = self.cost
+            j = torch.arange(self.block, dtype = torch.float, device = self.dev)
+            time = 1.0 + fixed + first * (j >= 1).float() + nxt * torch.clamp(j - 1, min = 0)
+            return torch.cat(out), torch.argmax(gain / time)
         if confs:       # leading drafts whose joint probability clears the threshold
             return torch.cat(out), (torch.cumprod(torch.cat(confs), 0) >= self.conf_thr).sum()
         return torch.cat(out), None

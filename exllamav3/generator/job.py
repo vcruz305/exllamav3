@@ -1546,10 +1546,16 @@ class Job:
         for seq in self.sequences:
             unique_hashes, unique_pages = seq.prepare(self.prefix_token is not None, self.max_rq_tokens + self.rq_headroom)
             if getattr(self.generator.draft_model, "dense_context", False):
-                # dense drafter context: no page reuse at all (the drafter's taps for reused pages never exist),
-                # so the sequence needs every one of its pages
-                seq.max_cached_pages = 0
-                all_unique_pages += -(-len(seq.sequence_ids) // PAGE_SIZE)
+                # dense drafter context (by position, last sequence only): pages are reusable as far as the
+                # drafter still holds the context of the same tokens, less one real token at the end of the
+                # prompt for its carry state. Its taps for any other reused page would never exist.
+                dm = self.generator.draft_model
+                held = dm.context_match(seq.sequence_ids) if hasattr(dm, "context_match") else 0
+                seq.max_cached_pages = max(0, min(held, len(seq.sequence_ids) - 2) // PAGE_SIZE)
+                cached_hashes = seq.page_hashes[:seq.max_cached_pages]
+                omitted_pages = len(seq.page_hashes) - len(cached_hashes)
+                all_unique_hashes.update(cached_hashes)
+                all_unique_pages += unique_pages + omitted_pages
             elif self.generator.mtp_draft:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
@@ -1686,7 +1692,8 @@ class Job:
             # since the recurrent checkpoint will always be on a page boundary
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
-            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
+            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None \
+                    and not getattr(self.generator.draft_model, "dense_context", False):
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
@@ -1904,6 +1911,8 @@ class Job:
         the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
         """
         if self.generator.dflash_draft:
+            if getattr(self.generator.draft_model, "dense_context", False):
+                self.generator.draft_model.ctx_seq = seq.sequence_ids
             self.generator.draft_model.update_kv_from_target(
                 target_hidden = params.get("export_states"),
                 cache = self.generator.draft_cache,
