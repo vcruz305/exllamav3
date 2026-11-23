@@ -187,6 +187,7 @@ class Inkling2MTPModel(Model):
             "attach_target": True,
             "default_draft_size": self.block - 1,
             "supports_tp": False,
+            "autosplit_load_fwd": False,
         })
         # Taps the target must export (4 taps: visit 5, 23, 41 partials and the final state at visit 48)
         self.draft_verifier_params = {"export_state_layers": set(self.taps)}
@@ -209,6 +210,13 @@ class Inkling2MTPModel(Model):
         self.ctx_seq = None         # the sequence (SeqTensor of ids) the context was written for
 
     # ---- lifecycle ------------------------------------------------------------------------------------------
+
+
+    def prepare_layer_map(self):
+        # config.layer_map is the main model's loop (the config may be shared with it); the drafter runs its own
+        # modules once, in order
+        self.fwd_modules = [(m, 0, idx) for idx, m in enumerate(self.modules)]
+        self.last_kv_module_idx_instance = (self.last_kv_module_idx, 0)
 
     def attach_to(self, target):
         self.attached_model = weakref.ref(target)
