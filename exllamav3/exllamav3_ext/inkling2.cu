@@ -759,6 +759,9 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
     __shared__ float sm32[32];
     __shared__ float osm[16][INK_MAXGQ][128];
     __shared__ long long srow[INK_ACH];                        // cache row of each key of the chunk
+    // Running (max, sum) of this block's chunks per query head, and the weights that merge a chunk into the slot
+    __shared__ float sM[INK_MAXGQ], sl[INK_MAXGQ], sa[INK_MAXGQ], sb[INK_MAXGQ];
+    const int slot = blockIdx.x;
     const int hk = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const long long KS = (long long)Hk * D;
     const int nc = (L + INK_ACH - 1) / INK_ACH;
@@ -833,8 +836,15 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
             if (tid < n) slog[gi][tid] = e;
             if (tid == 0) {
                 const int hq = hk * G + gi;
-                pml[((long long)hq * nstride + c) * 2] = m;
-                pml[((long long)hq * nstride + c) * 2 + 1] = s;
+                float Mn = m, ln = s, wa = 0.f, wb = 1.f;
+                if (c != slot) {                               // a later chunk of the block: rescale to the new max
+                    Mn = fmaxf(sM[gi], m);
+                    wa = expf(sM[gi] - Mn); wb = expf(m - Mn);
+                    ln = sl[gi] * wa + s * wb;
+                }
+                sM[gi] = Mn; sl[gi] = ln; sa[gi] = wa; sb[gi] = wb;
+                pml[((long long)hq * nstride + slot) * 2] = Mn;
+                pml[((long long)hq * nstride + slot) * 2 + 1] = ln;
             }
         }
         __syncthreads();
@@ -886,7 +896,8 @@ __global__ void __launch_bounds__(256) ink_attend_part_kernel(
             float s = 0.f;
             #pragma unroll
             for (int g2 = 0; g2 < 16; ++g2) s += osm[g2][gi][dd];
-            po[((long long)hq * nstride + c) * D + dd] = s;
+            float* dst = po + ((long long)hq * nstride + slot) * D + dd;
+            *dst = (c == slot) ? s : *dst * sa[gi] + s * sb[gi];
         }
         __syncthreads();                                             // shared buffers free for the next chunk
     }
@@ -898,7 +909,7 @@ __global__ void __launch_bounds__(128) ink_attend_comb_kernel(
     __half* __restrict__ o_out, long long pst)
 {
     const long long rw = blockIdx.y, HQ = gridDim.x;
-    const int ncn = par_p ? (int)par_p[rw * pst + 2] : nc;
+    const int ncn = min(par_p ? (int)par_p[rw * pst + 2] : nc, INK_GRID);    // slots in use: one per block
     sink += rw * HQ; gate += rw * HQ * D; po += rw * HQ * nstride * D; pml += rw * HQ * nstride * 2; o_out += rw * HQ * D;
     __shared__ float w[INK_NSTORE];
     __shared__ float inv;
@@ -940,7 +951,7 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
                       at::Tensor pt, int64_t lo, int64_t L, double sm_scale, int64_t Hk, int64_t E)
 {
     ink_attend_check(q, rel, sink, gate, kf, vf, pt, Hk, E);
-    TORCH_CHECK(L >= 1 && L <= (int64_t)INK_NSTORE * INK_ACH && lo >= 0, "ink_attend: key range");
+    TORCH_CHECK(L >= 1 && lo >= 0, "ink_attend: key range");
     TORCH_CHECK((lo + L - 1) / INK_PAGE < pt.numel(), "ink_attend: keys outside the page table");
     const int Hq = (int)sink.numel(), D = (int)kf.size(2);
     const at::cuda::OptionalCUDAGuard guard(q.device());
@@ -962,8 +973,8 @@ at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor 
 }
 
 // Same as ink_attend with the window in a device tensor par = [lo, L, nc] (int64, nc = ceil(L / INK_ACH)); the grid
-// is fixed (INK_GRID x kv heads) and the split buffers hold INK_NSTORE chunks, so a captured CUDA graph replays at
-// any position up to INK_NSTORE * INK_ACH keys.
+// is fixed (INK_GRID x kv heads) and the split buffers hold one slot per block, so a captured CUDA graph replays at
+// any position.
 at::Tensor ink_attend_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
                           at::Tensor pt, at::Tensor par, double sm_scale, int64_t Hk, int64_t E)
 {

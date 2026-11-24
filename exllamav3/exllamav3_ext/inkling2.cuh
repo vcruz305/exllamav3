@@ -18,7 +18,7 @@ std::vector<at::Tensor> ink_q_glue(at::Tensor q_f, at::Tensor r_f, at::Tensor g_
 constexpr int INK_PAGE = 256;    // must equal PAGE_SIZE (exllamav3/constants.py)
 constexpr int INK_ACH_H = 128;   // keys per attention chunk; must equal INK_ACH in inkling2.cu
 constexpr int INK_GRID = 64;     // attention blocks per kv head (grid-stride over the chunks)
-constexpr int INK_NSTORE = 256;  // chunk slots of the device-side split: at most 32768 keys
+constexpr int INK_NSTORE = INK_GRID;   // slots of the split: one per block, which merges its chunks as it goes
 void ink_kv_glue(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tensor k_in, at::Tensor v_in, at::Tensor wk,
                  at::Tensor wv, c10::optional<at::Tensor> pk, c10::optional<at::Tensor> pv, at::Tensor kf,
                  at::Tensor vf, int64_t pos, at::Tensor pt, int64_t taps, bool record, double qk_clip, double eps);
