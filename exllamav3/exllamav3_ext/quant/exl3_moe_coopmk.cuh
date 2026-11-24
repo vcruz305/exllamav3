@@ -27,10 +27,16 @@ enum CoopMKVariant
     COOPMK_V_STG = 2,       // K 1, 5..8 (shared-memory staged widths)
     COOPMK_V_ALLMB2 = 3,    // K 1..8, __launch_bounds__(512, 2): at most 64 registers
     COOPMK_V_REGMB2 = 4,    // K 2..4, at most 64 registers
-    COOPMK_V_COUNT = 5
+    COOPMK_V_ALLH = 5,      // K 1..8 and 1.5 / 2.5 / 3.5, one launch per stage
+    COOPMK_V_STGH = 6,      // the staged widths plus the half-integer rates
+    COOPMK_V_ALLHMB2 = 7,   // as ALLH, at most 64 registers
+    COOPMK_V_COUNT = 8
 };
 
-#define COOPMK_VARIANTS(X) X(all) X(reg) X(stg) X(allmb2) X(regmb2)
+// Bitrate codes of the K tables: K for integer rates, COOPMK_HALF_BASE + bits for bits + 0.5
+#define COOPMK_HALF_BASE 8
+
+#define COOPMK_VARIANTS(X) X(all) X(reg) X(stg) X(allmb2) X(regmb2) X(allh) X(stgh) X(allhmb2)
 #define COOPMK_DECL(V) \
     CoopMKKernel coopmk_kernel_a_##V(int Hi, bool wide); \
     CoopMKKernel coopmk_kernel_b_##V(bool wide);
@@ -50,7 +56,7 @@ class CoopMK
 {
 public:
     MoeCoopParams p;
-    at::Tensor k_tab;                       // int32 [3 * n_local]: gate, up, down bitrates (device)
+    at::Tensor k_tab;                       // int32 [3 * n_local]: gate, up, down bitrate codes (device)
     std::vector<at::Tensor> keep;           // tables and scratch kept alive for the raw pointers
     uint32_t kset_a;                        // bitrates present in the gate/up stage (bit K)
     uint32_t kset_b;                        // bitrates present in the down stage

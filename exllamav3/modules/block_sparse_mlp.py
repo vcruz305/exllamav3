@@ -146,6 +146,17 @@ class ExpertsCFG:
     out_bszn: torch.Tensor | None = None   # (MAX_BSZN, H) fp32 routed sum of the bsz<=MAX_BSZN path
 
 
+def _coopmk_code(K):
+    """Bitrate code of the CoopMK K tables: K for integer rates 1..8, 8 + bits for the half-integer
+    rates 1.5 / 2.5 / 3.5 (COOPMK_HALF_BASE); None for anything else."""
+    f = float(K)
+    if f == int(f) and 1 <= int(f) <= 8:
+        return int(f)
+    if f in (1.5, 2.5, 3.5):
+        return 8 + int(f)
+    return None
+
+
 def _mixedk_k2(K):
     """Serialize EXL3 bitrate in half-bit units for the mixed-K CUDA switch."""
     if K not in (1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8):
@@ -979,7 +990,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return
         if not _coop_mixedk_enabled(self.device, self.activation_fn):
             return
-        # Gated silu/gelu, mul1 codebook, integer bitrates 1..8, no biases (mixedk_unified already
+        # Gated silu/gelu, mul1 codebook, bitrates 1..8 or 1.5 / 2.5 / 3.5, no biases (mixedk_unified already
         # requires the last), whole expert range on this device
         if not self.gated or self.activation_fn not in ("silu", "gelu", "silu_softcap"):
             return
@@ -988,7 +999,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.num_local_experts != self.num_experts or self.cpu_split_first is not None:
             return
         ks = [l.inner.K for l in self.gates + self.ups + self.downs]
-        if any(float(k) != int(k) or not 1 <= int(k) <= 8 for k in ks):
+        if any(_coopmk_code(k) is None for k in ks):
             return
         H = self.expert_size
         Hi = self.ups[0].in_features
@@ -1006,7 +1017,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         ctr = buf((slots * (I // 128) + MAX_BSZN * (Ho // 128) + 2 + (slots + 1) + slots,), torch.int, "coopmk_ctr")
         ctr.zero_()
         out = buf((MAX_BSZN, H), torch.float, "coopmk_out")
-        k_tab = lambda ls: torch.tensor([int(l.inner.K) for l in ls], dtype = torch.int32)
+        k_tab = lambda ls: torch.tensor([_coopmk_code(l.inner.K) for l in ls], dtype = torch.int32)
         self.coopmk = m.CoopMK(
             Hi,
             self.mixedk_ptrs_gate_trellis, self.mixedk_ptrs_gate_suh, self.mixedk_ptrs_gate_svh,

@@ -30,6 +30,13 @@ using namespace exl3_moe_coop_ns;
 constexpr uint32_t KM_ALL = 0x1FEu;                                   // K 1..8
 constexpr uint32_t KM_REG = (1u << 2) | (1u << 3) | (1u << 4);         // K 2, 3, 4
 constexpr uint32_t KM_STG = KM_ALL & ~KM_REG;                          // K 1, 5, 6, 7, 8
+// Half-integer rates 1.5 / 2.5 / 3.5 (mul1 codebook only, always staged) are table codes 9 / 10 / 11
+// (COOPMK_HALF_BASE + bits), so the integer codes and the integer-only instances are unchanged
+constexpr int KH_BASE = 8;
+constexpr int KB_MAX = KH_BASE + 3;
+constexpr uint32_t KM_HALF = (1u << (KH_BASE + 1)) | (1u << (KH_BASE + 2)) | (1u << (KH_BASE + 3));
+constexpr uint32_t KM_ALLH = KM_ALL | KM_HALF;
+constexpr uint32_t KM_STGH = KM_STG | KM_HALF;
 
 // Dynamic shared memory: the staging area is always reserved (any mask may contain a staged K)
 __host__ __device__ constexpr int smem_a_bytes_mk(int Hi) { return Hi * 2 + smem_red_bytes() + WK * STAGE_WORDS * 4; }
@@ -62,6 +69,12 @@ __device__ __forceinline__ void gemv_tile_rk
                 gemv_tile<K, cb, WIDE, false>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, \
                                               k_begin, k_end, ntiles, group, sh_red, sh_stage); \
             break;
+    #define COOPMK_CASE_H(B) \
+        case KH_BASE + B: \
+            if constexpr (cb == 2 && ((KMASK >> (KH_BASE + B)) & 1u) != 0u) \
+                gemv_tile<B, cb, WIDE, true>(B32, A2, a_stride2, rows, nrows, C, c_stride, c_f32, \
+                                             k_begin, k_end, ntiles, group, sh_red, sh_stage); \
+            break;
     switch (kb)
     {
         COOPMK_CASE(1)
@@ -72,14 +85,18 @@ __device__ __forceinline__ void gemv_tile_rk
         COOPMK_CASE(6)
         COOPMK_CASE(7)
         COOPMK_CASE(8)
+        COOPMK_CASE_H(1)
+        COOPMK_CASE_H(2)
+        COOPMK_CASE_H(3)
         default: break;
     }
     #undef COOPMK_CASE
+    #undef COOPMK_CASE_H
 }
 
 __device__ __forceinline__ bool in_mask(uint32_t mask, int kb)
 {
-    return kb >= 1 && kb <= 8 && ((mask >> kb) & 1u);
+    return kb >= 1 && kb <= KB_MAX && ((mask >> kb) & 1u);
 }
 
 // ---------------------------------------------------------------------------------------------

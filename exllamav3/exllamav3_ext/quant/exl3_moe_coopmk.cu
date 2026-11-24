@@ -24,15 +24,18 @@ typedef CoopMKKernel (*fp_kernel_b)(bool);
 
 const fp_kernel_a kernels_a[COOPMK_V_COUNT] =
 {
-    coopmk_kernel_a_all, coopmk_kernel_a_reg, coopmk_kernel_a_stg, coopmk_kernel_a_allmb2, coopmk_kernel_a_regmb2
+    coopmk_kernel_a_all, coopmk_kernel_a_reg, coopmk_kernel_a_stg, coopmk_kernel_a_allmb2, coopmk_kernel_a_regmb2,
+    coopmk_kernel_a_allh, coopmk_kernel_a_stgh, coopmk_kernel_a_allhmb2
 };
 const fp_kernel_b kernels_b[COOPMK_V_COUNT] =
 {
-    coopmk_kernel_b_all, coopmk_kernel_b_reg, coopmk_kernel_b_stg, coopmk_kernel_b_allmb2, coopmk_kernel_b_regmb2
+    coopmk_kernel_b_all, coopmk_kernel_b_reg, coopmk_kernel_b_stg, coopmk_kernel_b_allmb2, coopmk_kernel_b_regmb2,
+    coopmk_kernel_b_allh, coopmk_kernel_b_stgh, coopmk_kernel_b_allhmb2
 };
 const uint32_t variant_mask[COOPMK_V_COUNT] =
 {
-    exl3_coopmk_ns::KM_ALL, exl3_coopmk_ns::KM_REG, exl3_coopmk_ns::KM_STG, exl3_coopmk_ns::KM_ALL, exl3_coopmk_ns::KM_REG
+    exl3_coopmk_ns::KM_ALL, exl3_coopmk_ns::KM_REG, exl3_coopmk_ns::KM_STG, exl3_coopmk_ns::KM_ALL, exl3_coopmk_ns::KM_REG,
+    exl3_coopmk_ns::KM_ALLH, exl3_coopmk_ns::KM_STGH, exl3_coopmk_ns::KM_ALLH
 };
 
 int env_int(const char* name, int def)
@@ -94,7 +97,7 @@ uint32_t kset_of(const at::Tensor& k)
     uint32_t s = 0;
     for (int64_t i = 0; i < kc.numel(); ++i)
     {
-        TORCH_CHECK(d[i] >= 1 && d[i] <= 8, "coopmk: bitrate ", d[i], " outside the integer range 1..8");
+        TORCH_CHECK(d[i] >= 1 && d[i] <= exl3_coopmk_ns::KB_MAX, "coopmk: bitrate code ", d[i], " outside 1..8 (integer) / 9..11 (1.5, 2.5, 3.5)");
         s |= 1u << d[i];
     }
     return s;
@@ -236,20 +239,24 @@ std::vector<int> CoopMK::stage_variants(int stage, int plan_override) const
     const int pl = plan_override > 0 ? plan_override : plan;
     const uint32_t ks = stage == 0 ? kset_a : kset_b;
     const bool has_reg = (ks & exl3_coopmk_ns::KM_REG) != 0;
-    const bool has_stg = (ks & exl3_coopmk_ns::KM_STG) != 0;
+    // Half-integer rates are staged: a layer that has any swaps the all-K / staged instance for its
+    // half-capable twin, so integer-only layers launch exactly the kernels they always did
+    const bool has_half = (ks & exl3_coopmk_ns::KM_HALF) != 0;
+    const bool has_stg = (ks & exl3_coopmk_ns::KM_STG) != 0 || has_half;
+    const int v_stg = has_half ? COOPMK_V_STGH : COOPMK_V_STG;
     std::vector<int> v;
     switch (pl)
     {
-        case 1: v.push_back(COOPMK_V_ALL); break;
-        case 3: v.push_back(COOPMK_V_ALLMB2); break;
+        case 1: v.push_back(has_half ? COOPMK_V_ALLH : COOPMK_V_ALL); break;
+        case 3: v.push_back(has_half ? COOPMK_V_ALLHMB2 : COOPMK_V_ALLMB2); break;
         case 4:
             if (has_reg) v.push_back(COOPMK_V_REGMB2);
-            if (has_stg) v.push_back(COOPMK_V_STG);
+            if (has_stg) v.push_back(v_stg);
             break;
         default:
-            if (has_reg && has_stg) { v.push_back(COOPMK_V_REG); v.push_back(COOPMK_V_STG); }
+            if (has_reg && has_stg) { v.push_back(COOPMK_V_REG); v.push_back(v_stg); }
             else if (has_reg) v.push_back(COOPMK_V_REG);
-            else v.push_back(COOPMK_V_STG);
+            else v.push_back(v_stg);
             break;
     }
     return v;
