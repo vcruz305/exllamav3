@@ -947,6 +947,64 @@ static void ink_attend_check(const at::Tensor& q, const at::Tensor& rel, const a
     TORCH_CHECK(pt.scalar_type() == at::kInt && pt.is_cuda() && pt.is_contiguous(), "ink_attend: pt is a device int32 table");
 }
 
+// One block per row. Each thread walks its share of the row keeping a running (max, sum of exp relative to it); the
+// 256 pairs and the sink are merged, then the row is read once more and written normalised. Masked logits are -inf.
+__global__ void __launch_bounds__(256) ink_softmax_sink_kernel(
+    const float* __restrict__ lg, const float* __restrict__ sink, __half* __restrict__ out, long long Tk, float scale)
+{
+    const float NINF = -INFINITY;
+    const float* l = lg + (long long)blockIdx.x * Tk;
+    __half* o = out + (long long)blockIdx.x * Tk;
+    __shared__ float sm[256], ss[256];
+    const int t = threadIdx.x;
+    float m = NINF, s = 0.f;
+    for (long long i = t; i < Tk; i += 256)
+    {
+        const float x = l[i];
+        if (x > m) { s = (m > NINF ? s * expf(m - x) : 0.f) + 1.f; m = x; }
+        else if (x > NINF) s += expf(x - m);
+    }
+    sm[t] = m; ss[t] = s;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1)
+    {
+        if (t < w)
+        {
+            const float m1 = sm[t], m2 = sm[t + w], mx = fmaxf(m1, m2);
+            if (mx > NINF)
+                ss[t] = (m1 > NINF ? ss[t] * expf(m1 - mx) : 0.f) + (m2 > NINF ? ss[t + w] * expf(m2 - mx) : 0.f);
+            sm[t] = mx;
+        }
+        __syncthreads();
+    }
+    if (t == 0)
+    {
+        const float m1 = sm[0], sk = sink[blockIdx.x], mx = fmaxf(m1, sk);
+        const float den = (m1 > NINF ? ss[0] * expf(m1 - mx) : 0.f) + expf(sk - mx);
+        sm[0] = mx; ss[0] = scale / den;
+    }
+    __syncthreads();
+    const float mx = sm[0], k = ss[0];
+    for (long long i = t; i < Tk; i += 256)
+        o[i] = __float2half(expf(l[i] - mx) * k);
+}
+
+void ink_softmax_sink(at::Tensor logits, at::Tensor sink, at::Tensor out, double scale)
+{
+    TORCH_CHECK(logits.is_cuda() && logits.scalar_type() == at::kFloat && logits.is_contiguous() && logits.dim() >= 1,
+                "ink_softmax_sink: logits");
+    const int64_t Tk = logits.size(-1), rows = Tk ? logits.numel() / Tk : 0;
+    TORCH_CHECK(sink.is_cuda() && sink.scalar_type() == at::kFloat && sink.is_contiguous() && sink.numel() == rows,
+                "ink_softmax_sink: sink");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf && out.is_contiguous() && out.numel() == logits.numel(),
+                "ink_softmax_sink: out");
+    if (!rows) return;
+    const at::cuda::OptionalCUDAGuard guard(logits.device());
+    ink_softmax_sink_kernel<<<(unsigned)rows, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        logits.data_ptr<float>(), sink.data_ptr<float>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        (long long)Tk, (float)scale);
+}
+
 at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
                       at::Tensor pt, int64_t lo, int64_t L, double sm_scale, int64_t Hk, int64_t E)
 {

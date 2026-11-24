@@ -615,9 +615,58 @@ class Inkling2Attention(Module):
         Tk_max = Tk if W is None else min(Tk, W + self.q_chunk)
         step = max(16, min(self.q_chunk, (1 << 26) // max(1, Hq * Tk_max * bsz)))
         out = []
+        # Global layers: every chunk of queries reads the same keys, so they are converted once, and only the
+        # newest keys (within rel_extent of the chunk, or after it) need a bias or a mask
+        dense = W is None and Tq > 1
+        if dense:
+            hi_all = min(Tk, q0 + Tq - k0)
+            kt = k_all[:, :hi_all].float().permute(0, 2, 3, 1).contiguous()
+            qs = q * self.sm_scale
+            # Cached values stay half: the probabilities are written as half too (times a power of two that keeps
+            # small ones normal and the output in range) and the value product runs on half tensor cores. The key
+            # product is fp32 on TF32 cores, exact for the fp16 keys
+            fused = v_all.dtype == torch.half and q.dtype == torch.float32
+            if fused:
+                vt = v_all[:, :hi_all].transpose(1, 2).contiguous()
+                lo_v, hi_v = vt.aminmax()
+                p_scale = 2.0 ** max(0, min(12, math.floor(math.log2(30000.0 / max(1e-3, float(max(-lo_v, hi_v)))))))
+            else:
+                vt = v_all[:, :hi_all].float().transpose(1, 2).contiguous()
+            tf32 = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
         for a in range(0, Tq, step):
             b = min(a + step, Tq)
             n = b - a
+            if dense and n > 1:
+                qc = qs[:, a:b].reshape(bsz, n, Hk, G, D).permute(0, 2, 3, 1, 4).reshape(bsz, Hk, G * n, D)
+                logits = torch.matmul(qc, kt).view(bsz, Hq, n, hi_all)
+                c0 = max(0, min(hi_all, q0 + a - (E - 1) - k0))
+                dist = torch.arange(q0 + a, q0 + b, device = q.device)[:, None] \
+                    - torch.arange(k0 + c0, k0 + hi_all, device = q.device)[None, :]
+                tail = logits[..., c0:]
+                bias = rel[:, a:b].transpose(1, 2).gather(-1, dist.clamp(0, E - 1).expand(bsz, Hq, n, hi_all - c0))
+                tail += bias.masked_fill_(~((dist >= 0) & (dist < E)), 0.0)
+                tail.masked_fill_(dist < 0, float("-inf"))
+                del bias, tail
+                if fused:
+                    p = torch.empty(logits.shape, dtype = torch.half, device = logits.device)
+                    ext.ink_softmax_sink(logits, sink[:, a:b].transpose(1, 2).float().contiguous(), p, p_scale)
+                    del logits
+                    o = torch.matmul(p.view(bsz, Hk, G * n, hi_all), vt).float().view(bsz, Hk, G, n, D)
+                    del p
+                    o *= 1.0 / p_scale
+                    out.append(o.permute(0, 3, 1, 2, 4).reshape(bsz, n, Hq * D))
+                    continue
+                # softmax with the sink as one more logit, normalised on the small output instead of the block
+                sk = sink[:, a:b].transpose(1, 2).unsqueeze(-1)
+                m = torch.maximum(logits.amax(dim = -1, keepdim = True), sk)
+                logits.sub_(m).exp_()
+                den = logits.sum(dim = -1, keepdim = True) + (sk - m).exp()
+                o = torch.matmul(logits.view(bsz, Hk, G * n, hi_all), vt).view(bsz, Hk, G, n, D)
+                del logits
+                o = o / den.view(bsz, Hk, G, n, 1)
+                out.append(o.permute(0, 3, 1, 2, 4).reshape(bsz, n, Hq * D))
+                continue
             # Keys this chunk can see: up to its last query, and for sliding layers from its first window on
             hi = min(Tk, q0 + b - k0)
             lo = 0 if W is None else max(0, q0 + a - (W - 1) - k0)
@@ -661,6 +710,8 @@ class Inkling2Attention(Module):
                 out.append(o.reshape(bsz, n, Hq * D))                         # same element order as the permute below
             else:
                 out.append(o.permute(0, 3, 1, 2, 4).reshape(bsz, n, Hq * D))
+        if dense:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
         return torch.cat(out, dim = 1) if len(out) > 1 else out[0]
 
     def finish(self, o: torch.Tensor, gate: torch.Tensor, params: dict) -> torch.Tensor:
@@ -1162,8 +1213,13 @@ class Inkling2Block(Module):
             p0, p1 = lo // PAGE_SIZE, (end - 1) // PAGE_SIZE + 1
             a, b = lo - p0 * PAGE_SIZE, end - p0 * PAGE_SIZE
             pages = bt[i, p0:p1]
-            k_all = kc[pages].view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
-            v_all = vc[pages].view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
+            first = int(pages[0])
+            if int(pages[-1]) - first == p1 - p0 - 1 and bool((pages[1:] - pages[:-1] == 1).all()):
+                kp, vp = kc[first : first + p1 - p0], vc[first : first + p1 - p0]       # consecutive pages: no copy
+            else:
+                kp, vp = kc[pages], vc[pages]
+            k_all = kp.view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
+            v_all = vp.view(-1, attn.num_kv_heads, attn.head_dim)[a:b].unsqueeze(0).to(dev)
             outs.append(attn.attend(q[i:i+1], rel[i:i+1], sink[i:i+1], k_all, v_all, past[i], lo))
         cache.update_layer(self.layer_idx, params["cache_seqlens"], block_table, kc, vc, seq, instance)
         o = torch.cat(outs, dim = 0) if bsz > 1 else outs[0]

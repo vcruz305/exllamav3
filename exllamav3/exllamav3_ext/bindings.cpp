@@ -130,6 +130,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ink_sconv", &ink_sconv, "Inkling2 single-token short conv with ring update");
     m.def("ink_q_glue", &ink_q_glue, "Inkling2 single-token query glue");
     m.def("ink_kv_glue", &ink_kv_glue, "Inkling2 single-token K/V glue and cache write");
+    m.def("ink_softmax_sink", &ink_softmax_sink, "Inkling2 prefill: row softmax with a sink logit, half output");
     m.def("ink_attend", &ink_attend, "Inkling2 single-token attention over cache rows");
     ink_token_bind(m);
     m.def("sparse_head_argmax", &sparse_head_argmax, "sparse_head_argmax");

@@ -33,6 +33,9 @@ void ink_kv_glue_dev(at::Tensor k_raw, at::Tensor v_raw, at::Tensor st, at::Tens
 // Attention over logical keys [lo, lo + L) of the sequence (the query is the last of them); par = [lo, L, nc] device
 at::Tensor ink_attend_dev(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
                           at::Tensor pt, at::Tensor par, double sm_scale, int64_t Hk, int64_t E);
+// Row softmax of a block of prefill logits with one extra (sink) logit per row; probabilities are written as
+// half, multiplied by scale
+void ink_softmax_sink(at::Tensor logits, at::Tensor sink, at::Tensor out, double scale);
 at::Tensor ink_attend(at::Tensor q, at::Tensor rel, at::Tensor sink, at::Tensor gate, at::Tensor kf, at::Tensor vf,
                       at::Tensor pt, int64_t lo, int64_t L, double sm_scale, int64_t Hk, int64_t E);
 
