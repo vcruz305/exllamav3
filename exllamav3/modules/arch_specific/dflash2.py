@@ -369,6 +369,55 @@ class DFlash2Selector(Module):
         return self._walk(hidden, gate, unary, cands, anchor_ids, return_confidence, cuda)
 
 
+    def walk_scored(
+        self,
+        hidden: torch.Tensor,        # [1, rows, H]
+        logits: torch.Tensor,        # [1, rows, V_pad] head logits, uncapped
+        anchor_ids: torch.Tensor,    # [1]
+        vocab_size: int,
+        softcap: float = 0.0,
+        temperature: float = 0.0,
+    ):
+        """One sequence's walk with the selector's own distribution over each row's candidates: scores are the
+        head logit plus the predecessor correction, capped after the correction. temperature 0: the greedy path.
+        temperature > 0: each token is sampled from softmax(scores / temperature) and those probabilities are
+        returned, so a verifier can accept with min(1, p / q).
+        Returns ids [1, rows + 1] = [anchor, path...], conf [rows] (probability of each chosen token at
+        temperature 1) and (cands [rows, k], q [rows, k]) or None."""
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})[0].float()
+        rows = logits.shape[1]
+        if ext.HAS_DFLASH2 and logits.is_cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
+            unary = torch.empty((1, rows, self.top_k), dtype = torch.float, device = hidden.device)
+            cands = torch.empty((1, rows, self.top_k), dtype = torch.long, device = hidden.device)
+            ext.dflash2_topk(logits, vocab_size, 1.0, 0.0, unary, cands)
+        else:
+            unary, cands = torch.topk(logits[..., :vocab_size].float(), self.top_k, dim = -1, sorted = False)
+        unary, cands = unary[0], cands[0]
+        succ = F.embedding(cands, self.succ_codebook).float()               # (rows, k, r)
+        noise = None
+        if temperature > 0.0:
+            u = torch.rand(rows, self.top_k, dtype = torch.float, device = hidden.device)
+            noise = -torch.log(-torch.log(u.clamp_(1e-10, 1.0 - 1e-7)))
+        pred = anchor_ids.long().to(hidden.device).view(1)
+        path, conf, qs = [pred], [], []
+        for i in range(rows):
+            a = self.pred_codebook[pred[0]].float() * gate[i]
+            s = unary[i] + succ[i] @ a
+            if softcap > 0.0:
+                s = torch.tanh(s / softcap) * softcap
+            if noise is not None:
+                lq = torch.log_softmax(s / temperature, 0)
+                di = torch.argmax(lq + noise[i]).view(1)
+                qs.append(lq.exp())
+            else:
+                di = torch.argmax(s).view(1)
+            conf.append(torch.softmax(s, 0)[di])
+            pred = cands[i][di]
+            path.append(pred)
+        spec = (cands, torch.stack(qs)) if qs else None
+        return torch.cat(path).view(1, rows + 1), torch.cat(conf), spec
+
+
     def walk_candidates(
         self,
         hidden: torch.Tensor,

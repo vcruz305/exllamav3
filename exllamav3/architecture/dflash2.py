@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import weakref
 
@@ -245,6 +246,13 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
+        # Inkling 2 target, one sequence: the walk runs on the selector's candidate distribution.
+        # INKLING2_DFLASH_CONF: verify only the leading drafts whose joint selector probability is at least this
+        # (0: the whole block). INKLING2_DFLASH_SPEC=0: greedy drafts only (a sampling job then accepts a draft
+        # only when its own sample equals it) instead of sampled drafts with their probabilities.
+        self.scored_walk = hasattr(target.modules[target.logit_layer_idx], "draft_logits")
+        self.conf_thr = float(os.environ.get("INKLING2_DFLASH_CONF", "0.3"))
+        self.spec_sampling = self.scored_walk and os.environ.get("INKLING2_DFLASH_SPEC", "1") != "0"
         # A target with a padded head (Inkling 2) stores the padded width in the drafter's config
         target_vocab = getattr(target.config, "padded_vocab_size", None) or target.config.vocab_size
         if target_vocab != self.config.vocab_size:
@@ -336,6 +344,17 @@ class DFlash2Model(Model):
             # greedy walk where the uncapped logits put it: the head runs without its cap in that mode.
             capped = self.config.selector_softcap_mode != "after_correction"
             logits = draft_logits(lm.prepare_for_device(state.half(), params), params, softcap = capped)
+            if state.shape[0] == 1 and not capped and not export_conf and getattr(self, "scored_walk", False):
+                temp = float(params.get("mtp_temp") or 0.0) if self.spec_sampling else 0.0
+                out, conf, spec = self.selector.walk_scored(
+                    to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
+                    target.config.vocab_size, self.config.final_logit_softcapping, temp,
+                )
+                if spec is not None:
+                    params["draft_spec"] = spec
+                if self.conf_thr > 0.0:
+                    params["draft_confidence_len"] = int((torch.cumprod(conf, 0) >= self.conf_thr).sum())
+                return out
             out, confidence = self.selector.walk_block(
                 to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
                 return_confidence = export_conf,
