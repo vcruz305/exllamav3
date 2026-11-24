@@ -44,7 +44,10 @@ class HostPool:
                 self.reused += 1
                 return lst.pop()
             self.allocated += 1
-        return torch.empty(shape, dtype = dtype)
+        # Touch the pages now: a device-to-host copy into never-touched pageable memory faults
+        # inside the driver's copy path, ~80x slower than the same copy into resident pages
+        # (measured on unified memory: 0.25 s vs 3 ms for one 63-layer GDN checkpoint)
+        return torch.empty(shape, dtype = dtype).fill_(0)
 
     def give(self, obj):
         """Return every tensor inside a stashed structure (dict / list / tuple of tensors) to the pool"""
