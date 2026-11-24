@@ -975,8 +975,13 @@ class GatedDeltaNet(Module):
             _bc_gdn_enable and device != torch.device("cpu") and self.kda and
             self.qkv_proj is not None and self.qkv_proj.quant_type == "exl3" and
             self.o_proj is not None and self.o_proj.quant_type == "exl3" and
-            all(p is not None and p.quant_type == "fp16" for p in
-                (self.b_proj, self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj)) and
+            self.b_proj is not None and self.b_proj.quant_type == "fp16" and
+            (
+                all(p is not None and p.quant_type == "exl3" for p in (self.f_proj, self.g_proj))
+                if self.kda_direct else
+                all(p is not None and p.quant_type == "fp16" for p in
+                    (self.f_a_proj, self.f_b_proj, self.g_a_proj, self.g_b_proj))
+            ) and
             self.conv1d_weight_flat is not None and
             self.conv1d_weight_flat.dtype == torch.bfloat16 and
             (self.conv1d_bias is None or self.conv1d_bias.dtype == torch.bfloat16) and
@@ -995,10 +1000,12 @@ class GatedDeltaNet(Module):
             nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
             hs = self.hidden_size
             self.kda_b_t = torch.empty((nv, hs), dtype = torch.half, device = device)
-            self.kda_fa_t = torch.empty((hk, hs), dtype = torch.half, device = device)
-            self.kda_fb_t = torch.empty((nv * hk, hk), dtype = torch.half, device = device)
-            self.kda_ga_t = torch.empty((hv, hs), dtype = torch.half, device = device)
-            self.kda_gb_t = torch.empty((nv * hv, hv), dtype = torch.half, device = device)
+            # Direct gates (full EXL3 f/g projections) leave the low-rank weights unused
+            lr = 0 if self.kda_direct else 1
+            self.kda_fa_t = torch.empty((hk * lr, hs), dtype = torch.half, device = device)
+            self.kda_fb_t = torch.empty((nv * hk * lr, hk), dtype = torch.half, device = device)
+            self.kda_ga_t = torch.empty((hv * lr, hs), dtype = torch.half, device = device)
+            self.kda_gb_t = torch.empty((nv * hv * lr, hv), dtype = torch.half, device = device)
             self.ba_weight_filled = False
 
             self.bc = ext.BC_GatedDeltaNetSplit(
@@ -1021,6 +1028,8 @@ class GatedDeltaNet(Module):
                 self.norm.bc,
                 self.beta_scale
             )
+            if self.kda_direct:
+                self.bc.set_direct_gates(self.f_proj.inner.bc, self.g_proj.inner.bc)
             self.bc_split = True
 
 
@@ -1143,6 +1152,10 @@ class GatedDeltaNet(Module):
             qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
             core_attn_out, core_attn_out_f, qkv_xh, o_xh,
         )
+        if self.kda_direct:
+            f_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_kf_xh")
+            g_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_kg_xh")
+            self.bc.set_direct_scratch(bsz, seqlen, history, f_xh, g_xh)
         if history:
             self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
 
@@ -1288,10 +1301,11 @@ class GatedDeltaNet(Module):
         if self.bc_split and not self.ba_weight_filled and self.kda:
             self.dt_bias_bc.copy_(self.dt_bias)
             self.kda_b_t.copy_(self.b_proj.inner.get_weight_tensor().T)
-            self.kda_fa_t.copy_(self.f_a_proj.inner.get_weight_tensor().T)
-            self.kda_fb_t.copy_(self.f_b_proj.inner.get_weight_tensor().T)
-            self.kda_ga_t.copy_(self.g_a_proj.inner.get_weight_tensor().T)
-            self.kda_gb_t.copy_(self.g_b_proj.inner.get_weight_tensor().T)
+            if not self.kda_direct:
+                self.kda_fa_t.copy_(self.f_a_proj.inner.get_weight_tensor().T)
+                self.kda_fb_t.copy_(self.f_b_proj.inner.get_weight_tensor().T)
+                self.kda_ga_t.copy_(self.g_a_proj.inner.get_weight_tensor().T)
+                self.kda_gb_t.copy_(self.g_b_proj.inner.get_weight_tensor().T)
             self.ba_weight_filled = True
         elif self.bc_split and not self.ba_weight_filled:
             self.ba_weight_t.copy_(torch.cat([

@@ -156,6 +156,23 @@ struct BC_GatedDeltaNetSplit
     at::Tensor g_a_weight_t;      // (Hv, hidden) half
     at::Tensor g_b_weight_t;      // (Nv*Hv, Hv) half
 
+    // Direct KDA gates (Bailing/Ling): f and g are full EXL3 projections off x instead of the
+    // fp16 low-rank pairs. Set once after construction; the low-rank weights are then unused
+    std::shared_ptr<BC_LinearEXL3> f_proj;   // hidden -> Nv*Hk
+    std::shared_ptr<BC_LinearEXL3> g_proj;   // hidden -> Nv*Hv
+    void set_direct_gates(std::shared_ptr<BC_LinearEXL3> _f_proj, std::shared_ptr<BC_LinearEXL3> _g_proj)
+    {
+        TORCH_CHECK(kda, "BC_GatedDeltaNetSplit: direct gates need KDA mode");
+        f_proj = _f_proj;
+        g_proj = _g_proj;
+    }
+    void set_direct_scratch(int bsz, int seqlen, bool history, at::Tensor f_xh, at::Tensor g_xh)
+    {
+        Slot& s = slot(bsz, seqlen, history);
+        s.f_xh = std::move(f_xh);
+        s.g_xh = std::move(g_xh);
+    }
+
     struct Slot
     {
         bool configured = false;
@@ -181,6 +198,7 @@ struct BC_GatedDeltaNetSplit
         // Hadamard scratch for the bypassed exl3_gemm_gr calls (qkv_proj/z_proj/o_proj), shaped
         // like each projection's own input
         at::Tensor qkv_xh, z_xh, o_xh;
+        at::Tensor f_xh, g_xh;             // direct KDA gate projections
         at::Tensor qkvz_c_ptrs, qkvz_xh;   // sliced qkv+z bundle: per-slice output pointers, (2, R, hidden) scratch
 
         // State-buffer geometry baked into this slot's captured graph (scalar kernel args can't

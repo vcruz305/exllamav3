@@ -258,10 +258,24 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         // KDA: three fp16 GEMVs off x (patched inputs), low-rank second stages and the gate op
         // run entirely on graph statics. z (the sigmoid norm gate) is the g_b output
         gdn_ba_gemv_gr(x, b_weight_t, {}, s.b_out, graph);
-        gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
-        gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
-        gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
-        gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        if (f_proj)
+        {
+            // Direct gates: two more EXL3 projections off x into the same statics
+            TORCH_CHECK(s.f_xh.defined() && s.g_xh.defined(), "BC_GatedDeltaNetSplit: direct gate scratch not set");
+            exl3_gemm_gr(x, f_proj->trellis, s.fb_out, f_proj->suh, s.f_xh, f_proj->svh, -1, f_proj->mcg, f_proj->mul1, 0, graph);
+            if (f_proj->bias)
+                add_gr(s.fb_out, f_proj->bias.value(), s.fb_out, graph);
+            exl3_gemm_gr(x, g_proj->trellis, s.z_flat, g_proj->suh, s.g_xh, g_proj->svh, -1, g_proj->mcg, g_proj->mul1, 0, graph);
+            if (g_proj->bias)
+                add_gr(s.z_flat, g_proj->bias.value(), s.z_flat, graph);
+        }
+        else
+        {
+            gdn_ba_gemv_gr(x, f_a_weight_t, {}, s.fa_out, graph);
+            gdn_ba_gemv_gr(x, g_a_weight_t, {}, s.ga_out, graph);
+            gdn_lowrank_gemv_f_gr(s.fa_out, f_b_weight_t, s.fb_out, graph);
+            gdn_lowrank_gemv_f_gr(s.ga_out, g_b_weight_t, s.z_flat, graph);
+        }
         kda_gate_op_gr
         (
             s.qkv, s.b_out, s.fb_out,
@@ -381,7 +395,20 @@ void BC_GatedDeltaNetSplit::run_bszN
     }
 
     std::vector<PPTR> args;
-    if (kda)
+    if (kda && f_proj)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // f_proj input
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // g_proj input
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots_scan.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else if (kda)
         args = std::vector<PPTR>
         {
             PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input

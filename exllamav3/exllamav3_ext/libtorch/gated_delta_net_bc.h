@@ -130,6 +130,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
 .def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure,
     py::arg("bsz"), py::arg("seqlen"), py::arg("history"), py::arg("stage_key") = 0)
 .def("set_stage_key", &BC_GatedDeltaNetSplit::set_stage_key)
+.def("set_direct_gates", &BC_GatedDeltaNetSplit::set_direct_gates)
+.def("set_direct_scratch", &BC_GatedDeltaNetSplit::set_direct_scratch)
 .def("configure_slot_kda", &BC_GatedDeltaNetSplit::configure_slot_kda,
     py::arg("bsz"),
     py::arg("seqlen"),
