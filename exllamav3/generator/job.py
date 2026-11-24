@@ -329,6 +329,7 @@ class Job:
 
         # MTP state
         self.mtp_last_hidden = None
+        self.draft_off = False      # a single-context drafter stood down for this job (Generator.dense_draft)
 
 
     def get_pinned_logit_mask(self):
@@ -1825,7 +1826,7 @@ class Job:
                     "mm_span_prefix": mm_span_prefix,
                 }
                 gen = self.generator
-                dm = gen.draft_model
+                dm = gen.draft_model if not self.draft_off else None
                 if dm:
                     params.update(dm.draft_verifier_params)
                 # MTP needs the target's post-final-norm state for every prompt token. Normal prefill stops at the
@@ -1910,6 +1911,8 @@ class Job:
         exported go in as they are, or the draft model takes the chunk itself. Runs on the draft model's device when
         the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
         """
+        if self.draft_off:
+            return
         if self.generator.dflash_draft:
             if getattr(self.generator.draft_model, "dense_context", False):
                 self.generator.draft_model.ctx_seq = seq.sequence_ids

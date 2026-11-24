@@ -481,6 +481,10 @@ class Generator:
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
+        # A drafter with dense context holds the context of one sequence. With more than one job active it stands
+        # down: those jobs decode without it (for the rest of their run, their context was not kept).
+        self.dense_draft = self.draft_model is not None and getattr(self.draft_model, "dense_context", False)
+        self._dense_off = False
         self._mtp_skipped_round = False
         # DFlash writes its full native block even when verification is shortened.
         self.draft_reserve_tokens = self.max_draft_tokens
@@ -822,6 +826,16 @@ class Generator:
         results = []
         self.iterate_start_jobs(results)
 
+        if self.dense_draft:
+            if len(self.active_jobs) > 1 and not all(job.draft_off for job in self.active_jobs):
+                for job in self.active_jobs:
+                    job.draft_off = True
+                if self.pipeline is not None and self.pipeline.busy:
+                    self.pipeline.flush()
+                self.draft_model.ctx_seq = None
+                self.draft_model._ctx_len = 0
+            self._dense_off = any(job.draft_off for job in self.active_jobs)
+
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
         # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
@@ -865,7 +879,7 @@ class Generator:
             self.reap_pipeline_failures(results)
 
         # Generation with draft model, with the draft window trimmed to the row ceiling (draft_max_rows)
-        draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model else 0
+        draft_window = self.row_limited(self.num_draft_tokens) if self.draft_model and not self._dense_off else 0
         round_start = None
         if self.sparse_head is not None and draft_window > 0:
             self._sparse_flag = self.sparse_head.round_flag()
@@ -2034,7 +2048,7 @@ class Generator:
             "pinned_staging": True,
         }
         self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
-        if self.draft_model:
+        if self.draft_model and not self._dense_off:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
@@ -2387,7 +2401,7 @@ class Generator:
 
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
-        if self.dflash_draft:
+        if self.dflash_draft and not self._dense_off:
             update_params = {
                 "block_table": block_index,
                 "cache_seqlens": p_cache_seqlens,

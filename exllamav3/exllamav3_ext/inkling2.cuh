@@ -43,6 +43,14 @@ at::Tensor ink_sconv_rows(at::Tensor st, at::Tensor x, at::Tensor w, c10::option
                           bool record);
 void ink_hist_rows(at::Tensor st, at::Tensor x, int64_t taps, bool record);
 void ink_rewind_all(std::vector<at::Tensor> states, int64_t slot, int64_t taps, int64_t num_tokens);
+// one row per sequence (InkToken::step_seqs): row r uses ring slot slots[r]
+at::Tensor ink_sconv_seqs(at::Tensor ring, std::vector<int64_t> slots, int64_t ch0, at::Tensor x, at::Tensor w,
+                          c10::optional<at::Tensor> resid, int64_t taps);
+void ink_hist_seqs(at::Tensor ring, std::vector<int64_t> slots, int64_t ch0, at::Tensor x, int64_t taps);
+void ink_kv_glue_seqs(at::Tensor k_raw, at::Tensor v_raw, at::Tensor ring, std::vector<int64_t> slots, at::Tensor k_in,
+                      at::Tensor v_in, at::Tensor wk, at::Tensor wv, c10::optional<at::Tensor> pk,
+                      c10::optional<at::Tensor> pv, at::Tensor kf, at::Tensor vf, at::Tensor pos_dev, int64_t pst,
+                      at::Tensor pt, int64_t taps, double qk_clip, double eps);
 std::vector<at::Tensor> ink_q_glue_rows(at::Tensor q_f, at::Tensor r_f, at::Tensor g_f, at::Tensor q_in, at::Tensor q_scale,
                                         at::Tensor r_scale, at::Tensor rel_proj, at::Tensor sink_w, double qk_clip,
                                         double rel_clip, at::Tensor tau_dev, int64_t tst);

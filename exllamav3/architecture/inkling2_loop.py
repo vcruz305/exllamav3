@@ -102,6 +102,9 @@ _TOKEN_BLOCKERS = ("capture", "capture_qmaps", "capture_sens", "ovr", "reconstru
 
 # Largest forward (rows) the token step takes: the verify window of the drafter (one sequence, one pass).
 TOK_ROWS_MAX = 9
+# One token of several sequences in one token step (concurrent requests); INKLING2_SEQS=0: the general batched path
+_SEQS = os.environ.get("INKLING2_SEQS", "1") != "0"
+TOK_SEQS_MAX = 8
 
 
 def _build_token(model, params: dict):
@@ -477,7 +480,69 @@ class Inkling2LoopModel(Model):
         final.hidden(x, params)
         return None
 
+    def _tok_seqs(self, x: torch.Tensor, params: dict):
+        """
+        (page lists, positions, ring slots) of a forward of one token for each of several sequences, or None when
+        the multi-sequence token step does not apply (see _tok_pages for the single-sequence conditions)
+        """
+        B = x.shape[0] if x.dim() == 2 else 0
+        if not (_SEQS and _TOKEN_T and _GRAPH and _TOKEN_BATCH) or self._tok_disabled:
+            return None
+        if not (2 <= B <= TOK_SEQS_MAX) or x.shape[1] != 1 or params.get("cache") is None:
+            return None
+        if params.get("recurrent_history") or params.get("export_state_layers"):
+            return None
+        rs = params.get("recurrent_states")
+        if not rs or len(rs) != B or any(r is None for r in rs) or any(k in params for k in _TOKEN_BLOCKERS):
+            return None
+        bt, cs = params.get("block_table"), params.get("cache_seqlens")
+        if bt is None or cs is None or bt.is_cuda or cs.is_cuda or bt.shape[0] != B or cs.numel() != B:
+            return None
+        poss = [int(p) for p in cs.tolist()]
+        rows = bt.tolist()
+        tabs = []
+        for pos, row in zip(poss, rows):
+            used = pos // PAGE_SIZE + 1
+            if used > len(row):
+                return None
+            tabs.append(row[:used])
+        slots = [r.slot for r in rs]
+        if len(set(slots)) != B:
+            return None
+        return tabs, poss, slots
+
+    def _forward_seqs(self, x: torch.Tensor, params: dict, seqs):
+        tabs, poss, slots = seqs
+        key = (params["cache"], params["recurrent_states"][0].cache)
+        if self._tok is None or self._tok_key[0] is not key[0] or self._tok_key[1] is not key[1]:
+            self._tok = ext.InkToken(_build_token(self, params))
+            self._tok.set_batched(_TOKEN_BATCH)
+            self._tok_key = key
+            self._tok_taps_set = None
+        if self._tok_taps_set != (None, None):
+            self._tok.set_taps([-1] * self.n_visits, -1)
+            self._tok_taps_set = (None, None)
+        self._tok.set_tables(tabs)
+        self._tok_pages_set = None
+        gk = (id(self._tok), tuple(slots), None)
+        if self._gkey != gk:
+            self._gkey, self._graphs, self._gwarm = gk, {}, {}
+        self.tok_steps += 1
+        self._tok.update_seqs([int(t) for t in x.reshape(-1).tolist()], poss, slots)
+        return self._tok_step_graph(False, len(slots), seqs = True)
+
     def forward_ls(self, x: torch.Tensor, params: dict):
+        seqs = self._tok_seqs(x, params) if _TOKEN else None
+        if seqs is not None:
+            try:
+                return self._forward_seqs(x, params, seqs)
+            except Exception as e:
+                # nothing has been written yet when the build or the staging raises; a step failure is fatal
+                if self._gwarm.get(("seqs", len(seqs[2])), 0) > 0:
+                    raise
+                self._tok_disabled = True
+                print(f" -- Inkling2 token path off ({e}); general batched path")
+                return super().forward_ls(x, params)
         pages = self._tok_pages(x, params) if _TOKEN else None
         if pages is not None:
             key = (params["cache"], params["recurrent_states"][0].cache)
@@ -536,10 +601,13 @@ class Inkling2LoopModel(Model):
             return out
         return super().forward_ls(x, params)
 
-    def _tok_step_graph(self, record: bool, T: int):
+    def _tok_step_graph(self, record: bool, T: int, seqs: bool = False):
         """The forward of T staged rows through the captured graph of (T, record) (eager for the first two calls)."""
-        key = (T, record)
-        step = self._tok.step_dev if T == 1 else self._tok.step_rows
+        key = ("seqs", T) if seqs else (T, record)
+        if seqs:
+            step = lambda record: self._tok.step_seqs()
+        else:
+            step = self._tok.step_dev if T == 1 else self._tok.step_rows
         if key in self._graphs:
             g, out = self._graphs[key]
             g.replay()

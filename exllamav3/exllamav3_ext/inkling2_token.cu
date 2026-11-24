@@ -270,6 +270,11 @@ struct InkToken {
     int64_t Tcur_ = 1;
     // batched rows (step_rows2) or the sequential rows (step_row per row; no record support)
     bool batched_ = true;
+    // independent sequences (step_seqs): the staged rows are one token of seq_slots_.size() sequences. Row r reads
+    // page-table row r (pt_ holds TMAX tables of cap_ entries) through positions offset by r * cap_ pages.
+    bool seqs_ = false;
+    std::vector<int64_t> seq_slots_;
+    std::vector<std::vector<int64_t>> tabs_host_;
 
     explicit InkToken(const py::dict& s)
     {
@@ -295,7 +300,7 @@ struct InkToken {
         TORCH_CHECK(page == INK_PAGE, "InkToken: page size must be INK_PAGE");
         cap_ = (int64_t)1 << 40;
         for (auto& b : blocks) cap_ = std::min<int64_t>(cap_, b.kf.size(0) / page);
-        pt_ = at::zeros({cap_}, emb.options().dtype(at::kInt));
+        pt_ = at::zeros({cap_ * TMAX}, emb.options().dtype(at::kInt));
         dI = at::zeros({TMAX * (2 + 3 * NB)}, emb.options().dtype(at::kLong));
         dD = at::zeros({TMAX * NB}, emb.options().dtype(at::kDouble));
         for (int k = 0; k < 4; ++k) {
@@ -315,6 +320,7 @@ struct InkToken {
         const at::cuda::OptionalCUDAGuard guard(emb.device());
         slot_ = slot;
         Tcur_ = T;
+        seqs_ = false;
         const int k = hs_;
         hs_ = (hs_ + 1) % 4;
         if (evs_[k].isCreated()) evs_[k].synchronize();
@@ -365,6 +371,71 @@ struct InkToken {
         std::vector<int32_t> h(pages.begin(), pages.end());
         pt_.narrow(0, 0, (int64_t)h.size()).copy_(at::tensor(h));
         pt_host_ = pages;
+        tabs_host_.clear();
+    }
+
+    // Page tables of the sequences of a step_seqs forward: row r of pt_ (cap_ entries each) = tabs[r]
+    void set_tables(const std::vector<std::vector<int64_t>>& tabs)
+    {
+        TORCH_CHECK(tabs.size() >= 1 && (int64_t)tabs.size() <= TMAX, "InkToken: 1..9 sequences");
+        if (tabs == tabs_host_) return;
+        std::vector<int32_t> h(tabs.size() * cap_, 0);
+        for (size_t r = 0; r < tabs.size(); ++r) {
+            TORCH_CHECK((int64_t)tabs[r].size() <= cap_, "InkToken: page table longer than the cache");
+            for (size_t i = 0; i < tabs[r].size(); ++i) {
+                TORCH_CHECK(tabs[r][i] >= 0 && tabs[r][i] < cap_, "InkToken: page index outside the cache");
+                h[r * cap_ + i] = (int32_t)tabs[r][i];
+            }
+        }
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        pt_.narrow(0, 0, (int64_t)h.size()).copy_(at::tensor(h));
+        tabs_host_ = tabs;
+        pt_host_.assign(1, -1);                 // the single-sequence table is gone
+    }
+
+    // Host side of a forward of one token for each of B sequences: row r = (toks[r], poss[r], ring slot slots[r])
+    void update_seqs(const std::vector<int64_t>& toks, const std::vector<int64_t>& poss, const std::vector<int64_t>& slots)
+    {
+        const int64_t T = (int64_t)toks.size();
+        TORCH_CHECK(T >= 1 && T <= TMAX && (int64_t)poss.size() == T && (int64_t)slots.size() == T,
+                    "InkToken: 1..9 sequences, one position and slot each");
+        const at::cuda::OptionalCUDAGuard guard(emb.device());
+        slot_ = slots[0];
+        Tcur_ = T;
+        seqs_ = true;
+        seq_slots_ = slots;
+        const int k = hs_;
+        hs_ = (hs_ + 1) % 4;
+        if (evs_[k].isCreated()) evs_[k].synchronize();
+        const int64_t S = 2 + 3 * NB;
+        int64_t* I = hI[k].data_ptr<int64_t>();
+        double* Dd = hD[k].data_ptr<double>();
+        for (int64_t r = 0; r < T; ++r) {
+            int64_t* Ir = I + r * S;
+            double* Dr = Dd + r * NB;
+            const int64_t pos = poss[r], off = r * cap_ * page;
+            Ir[0] = pos + off;
+            for (int64_t i = 0; i < NB; ++i) {
+                const InkBlock& b = blocks[i];
+                const int64_t lo = (b.W < 0) ? 0 : std::max<int64_t>(0, pos - (b.W - 1));
+                const int64_t L = pos + 1 - lo;
+                Ir[1 + 3 * i] = lo + off;
+                Ir[2 + 3 * i] = L;
+                Ir[3 + 3 * i] = (L + INK_ACH_H - 1) / INK_ACH_H;
+                Dr[i] = b.log_scaling ? 1.0 + b.alpha * std::log(std::max(((double)(pos + 1)) / b.nfloor, 1.0)) : 1.0;
+            }
+            Ir[1 + 3 * NB] = toks[r];
+        }
+        dI.narrow(0, 0, T * S).copy_(hI[k].narrow(0, 0, T * S), /*non_blocking=*/true);
+        dD.narrow(0, 0, T * NB).copy_(hD[k].narrow(0, 0, T * NB), /*non_blocking=*/true);
+        evs_[k].record(at::cuda::getCurrentCUDAStream());
+    }
+
+    // One token of each staged sequence (update_seqs): (B, 1, V)
+    at::Tensor step_seqs()
+    {
+        TORCH_CHECK(seqs_, "InkToken: step_seqs follows update_seqs");
+        return step_rows3(false).transpose(0, 1);
     }
 
     // Host side of one token: fills the next pinned slot and copies it to the device buffers (async, stream-ordered).
@@ -373,6 +444,7 @@ struct InkToken {
     {
         const at::cuda::OptionalCUDAGuard guard(emb.device());
         slot_ = slot;
+        seqs_ = false;
         const int k = hs_;
         hs_ = (hs_ + 1) % 4;
         if (evs_[k].isCreated()) evs_[k].synchronize();
@@ -921,6 +993,7 @@ struct InkToken {
     {
         const int64_t T = Tcur_, S = 2 + 3 * NB;
         TORCH_CHECK(T >= 1 && T <= TMAX, "InkToken: 1..9 rows per forward");
+        TORCH_CHECK(!(seqs_ && record), "InkToken: independent sequences do not record history");
         const at::cuda::OptionalCUDAGuard guard(emb.device());
         const int64_t Hc = H;
         auto row = [](const at::Tensor& t, int64_t r) { return t.narrow(0, r, 1); };
@@ -1035,10 +1108,16 @@ struct InkToken {
             std::vector<at::Tensor> qg = ink_q_glue_rows(q_f, r_f, g_f, q_in, b.q_scale, b.rel_scale, b.rel_proj,
                                                          b.sink_proj, b.qk_clip, b.rel_clip,
                                                          dD.narrow(0, bi, (T - 1) * NB + 1), NB);
-            at::Tensor rkv = rs.narrow(0, 0, kv2);
-            ink_kv_glue_rows(k_raw, v_raw, rkv, k_in, v_in, b.kw, b.vw, b.kp, b.vp, b.kf, b.vf,
-                             dI.narrow(0, 0, (T - 1) * S + 1), S, pt_, taps, b.qk_clip, b.eps);
-            ink_hist_rows(rkv, at::cat({k_raw, v_raw}, 1).contiguous(), taps, record);
+            if (seqs_) {
+                ink_kv_glue_seqs(k_raw, v_raw, b.ring, seq_slots_, k_in, v_in, b.kw, b.vw, b.kp, b.vp, b.kf, b.vf,
+                                 dI.narrow(0, 0, (T - 1) * S + 1), S, pt_, taps, b.qk_clip, b.eps);
+                ink_hist_seqs(b.ring, seq_slots_, 0, at::cat({k_raw, v_raw}, 1).contiguous(), taps);
+            } else {
+                at::Tensor rkv = rs.narrow(0, 0, kv2);
+                ink_kv_glue_rows(k_raw, v_raw, rkv, k_in, v_in, b.kw, b.vw, b.kp, b.vp, b.kf, b.vf,
+                                 dI.narrow(0, 0, (T - 1) * S + 1), S, pt_, taps, b.qk_clip, b.eps);
+                ink_hist_rows(rkv, at::cat({k_raw, v_raw}, 1).contiguous(), taps, record);
+            }
             at::Tensor o = ink_attend_rows_dev(qg[0], qg[1], qg[2], qg[3], b.kf, b.vf, pt_,
                                                dI.narrow(0, 1 + 3 * bi, (T - 1) * S + 3), S, b.sm_scale, b.Hk, b.E);
             at::Tensor a = lin(b.o, o, H).contiguous();                                    // (T, H) fp32
@@ -1046,12 +1125,17 @@ struct InkToken {
             // attention output short conv; a block boundary also appends the block state
             at::Tensor ra = rs.narrow(0, kv2, H);
             at::Tensor rm = rs.narrow(0, kv2 + H, H);
+            auto sconv = [&](const at::Tensor& st, int64_t ch0, const at::Tensor& xx, const at::Tensor& w,
+                             c10::optional<at::Tensor> res) -> at::Tensor {
+                return seqs_ ? ink_sconv_seqs(b.ring, seq_slots_, ch0, xx, w, res, taps)
+                             : ink_sconv_rows(st, xx, w, res, taps, record);
+            };
             at::Tensor RES;
             if (b.boundary) {
                 bs.push_back(x);
-                RES = ink_sconv_rows(ra, a, b.conv_attn, c10::nullopt, taps, record);
+                RES = sconv(ra, kv2, a, b.conv_attn, c10::nullopt);
             } else {
-                RES = ink_sconv_rows(ra, a, b.conv_attn, x, taps, record);
+                RES = sconv(ra, kv2, a, b.conv_attn, x);
             }
 
             // MLP input: attention residual over the block states, message gate, norm
@@ -1087,7 +1171,7 @@ struct InkToken {
             }
 
             // MLP output short conv with the residual
-            x = ink_sconv_rows(rm, MO, b.conv_mlp, RES, taps, record);
+            x = sconv(rm, kv2 + H, MO, b.conv_mlp, RES);
         }
 
         // Final: attention residual over the block states, norm, head (batched), softcap
@@ -1130,6 +1214,9 @@ void ink_token_bind(py::module_& m)
         .def("set_taps", &InkToken::set_taps, py::arg("tapb"), py::arg("tapf"))
         .def("update_rows", &InkToken::update_rows, py::arg("tokens"), py::arg("pos0"), py::arg("slot"))
         .def("step_rows", &InkToken::step_rows, py::arg("record"))
+        .def("set_tables", &InkToken::set_tables, py::arg("tables"))
+        .def("update_seqs", &InkToken::update_seqs, py::arg("tokens"), py::arg("positions"), py::arg("slots"))
+        .def("step_seqs", &InkToken::step_seqs)
         .def("dump_on", [](InkToken&, bool v) { g_dump_on = v; g_dump.clear(); }, py::arg("on"))
         .def("dump_get", [](InkToken&) { return g_dump; })
         .def("set_batched", [](InkToken& t, bool v) { t.batched_ = v; }, py::arg("batched"))
