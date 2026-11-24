@@ -1557,6 +1557,27 @@ class Job:
                 omitted_pages = len(seq.page_hashes) - len(cached_hashes)
                 all_unique_hashes.update(cached_hashes)
                 all_unique_pages += unique_pages + omitted_pages
+            elif getattr(self.generator.draft_model, "solo_stream", False):
+                # Pages written while the drafter stood down have no drafter K/V. A job queued with nothing else
+                # running stops reuse at the first such page and drafts; one queued behind other jobs takes the
+                # pages and decodes without the drafter.
+                pt, held = self.pagetable, 0
+                alone = len(self.generator.active_jobs) + len(self.generator.pending_jobs) == 0
+                for h in seq.page_hashes:
+                    page = pt.referenced_pages.get(h) or pt.unreferenced_pages.get(h)
+                    if page is not None and page.nodraft:
+                        if alone:
+                            break
+                        self.draft_off = True
+                    held += 1
+                if held < len(seq.page_hashes):
+                    seq.max_cached_pages = held
+                    cached_hashes = seq.page_hashes[:held]
+                    all_unique_hashes.update(cached_hashes)
+                    all_unique_pages += unique_pages + len(seq.page_hashes) - held
+                else:
+                    all_unique_hashes |= unique_hashes
+                    all_unique_pages += unique_pages
             elif self.generator.mtp_draft:
                 seq.max_cached_pages = max(0, (len(seq.sequence_ids) - 2) // PAGE_SIZE)
                 cached_hashes = seq.page_hashes[:seq.max_cached_pages]
@@ -1700,6 +1721,8 @@ class Job:
                 best_match_page = None
                 for page in self.pagetable.all_pages:
                     if page.prev_hash != prev_hash or id(page) == id(seq.allocated_pages[p0]):
+                        continue
+                    if page.nodraft and not self.draft_off:
                         continue
                     match = ext.count_match_tensor(page.sequence, prefill_ids, page.kv_position)
                     if match > best_match:
@@ -1912,6 +1935,10 @@ class Job:
         the chunk went through the prefill pipeline, after the target's last device has finished issuing it.
         """
         if self.draft_off:
+            if self.generator.dflash_draft and seq.allocated_pages:
+                for p in range(prefill_start // PAGE_SIZE,
+                               min((prefill_start + prefill_ids.shape[-1] - 1) // PAGE_SIZE + 1, len(seq.allocated_pages))):
+                    seq.allocated_pages[p].nodraft = True
             return
         if self.generator.dflash_draft:
             if getattr(self.generator.draft_model, "dense_context", False):

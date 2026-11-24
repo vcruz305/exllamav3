@@ -251,6 +251,9 @@ class DFlash2Model(Model):
         # (0: the whole block). INKLING2_DFLASH_SPEC=0: greedy drafts only (a sampling job then accepts a draft
         # only when its own sample equals it) instead of sampled drafts with their probabilities.
         self.scored_walk = hasattr(target.modules[target.logit_layer_idx], "draft_logits")
+        # Such a target decodes several sequences in one token step, which a draft round cannot share: the
+        # drafter serves one sequence and stands down while more are active (Generator.dense_draft)
+        self.solo_stream = self.scored_walk
         self.conf_thr = float(os.environ.get("INKLING2_DFLASH_CONF", "0.3"))
         self.spec_sampling = self.scored_walk and os.environ.get("INKLING2_DFLASH_SPEC", "1") != "0"
         # A target with a padded head (Inkling 2) stores the padded width in the drafter's config

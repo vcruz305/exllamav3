@@ -483,7 +483,8 @@ class Generator:
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
         # A drafter with dense context holds the context of one sequence. With more than one job active it stands
         # down: those jobs decode without it (for the rest of their run, their context was not kept).
-        self.dense_draft = self.draft_model is not None and getattr(self.draft_model, "dense_context", False)
+        self.dense_draft = self.draft_model is not None and (
+            getattr(self.draft_model, "dense_context", False) or getattr(self.draft_model, "solo_stream", False))
         self._dense_off = False
         self._mtp_skipped_round = False
         # DFlash writes its full native block even when verification is shortened.
@@ -835,6 +836,12 @@ class Generator:
                 self.draft_model.ctx_seq = None
                 self.draft_model._ctx_len = 0
             self._dense_off = any(job.draft_off for job in self.active_jobs)
+            if self._dense_off and self.dflash_draft:
+                # the page each of these jobs writes next gets no drafter K/V
+                for job in self.active_jobs:
+                    for seq in job.sequences:
+                        if seq.allocated_pages:
+                            seq.allocated_pages[min(seq.kv_position // PAGE_SIZE, len(seq.allocated_pages) - 1)].nodraft = True
 
         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
@@ -1058,7 +1065,7 @@ class Generator:
         """A complete, content-hashed, persistable page in VRAM that is in neither the CPU nor the disk tier"""
         disk, tier = self.disk_page_cache, self.cpu_page_cache
         h = page.phash
-        if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable:
+        if page.kv_position != PAGE_SIZE or not is_content_hash(h) or not page.persistable or page.nodraft:
             return False
         return not (h in tier or disk.has_page(h) or h in disk.pending_pages)
 

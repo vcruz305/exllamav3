@@ -80,6 +80,10 @@ class CachePage:
     # only meaningful within this process (see Sequence.allocate_pages), so the disk tier does not keep the page
     persistable: bool = True
 
+    # True when a drafter that stood down (Generator.dense_draft) has no K/V for tokens of this page: a job that
+    # drafts does not reuse the page
+    nodraft: bool = False
+
     def __repr__(self):
         return (
             f"CachePage: idx = {self.page_index}, ref_count = {self.ref_count}, "
@@ -148,6 +152,7 @@ class CachePage:
         self.prev_hash = None
         self.can_revert = False
         self.kv_position = 0
+        self.nodraft = False
 
     # Add reference to (currently) unique page
     def add_ref_unique(self, serial):
@@ -161,6 +166,7 @@ class CachePage:
         self.access_serial = serial
         self.prev_hash = None
         self.kv_position = 0
+        self.nodraft = False
 
     # Decrease reference count
     def sub_ref(self):
@@ -182,6 +188,7 @@ class CachePage:
         self.phash = _randomhash()
         self.prev_hash = None
         self.kv_position = 0
+        self.nodraft = False
         self.can_revert = False
         self.sequence[:, :] = 0
         assert self.phash not in self.pagetable.unreferenced_pages
@@ -208,6 +215,7 @@ class CachePage:
         self.pagetable.referenced_pages[self.phash] = self
         self.prev_hash = None
         self.kv_position = 0
+        self.nodraft = False
 
 
 class Sequence:
