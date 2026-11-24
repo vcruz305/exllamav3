@@ -20,6 +20,9 @@ except ImportError as e:
     ) from e
 
 
+# True once this package switched the CUDA caching allocator to expandable segments
+expandable_segments = False
+
 def _default_allocator_settings():
     """
     Expandable segments for the CUDA caching allocator, unless the user configured the
@@ -45,6 +48,8 @@ def _default_allocator_settings():
         setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) \
             or torch.cuda.memory._set_allocator_settings
         setter("expandable_segments:True")
+        global expandable_segments
+        expandable_segments = True
     except Exception:
         pass
 
