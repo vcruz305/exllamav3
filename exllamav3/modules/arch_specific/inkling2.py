@@ -1273,6 +1273,16 @@ class Inkling2Final(Module):
             _export_tap(params, x)
         return x
 
+    def draft_logits(self, x: torch.Tensor, params: dict, softcap: bool = True) -> torch.Tensor:
+        """Head logits (padded width) of a drafter's normed state, with or without the head's softcap"""
+        cap = self.head.softcap
+        if not softcap:
+            self.head.softcap = 0.0
+        try:
+            return self.head.forward(x, params)
+        finally:
+            self.head.softcap = cap
+
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None) -> torch.Tensor:
         x = self.hidden(x, params)
         logits = self.head.forward(x, params, out_dtype)

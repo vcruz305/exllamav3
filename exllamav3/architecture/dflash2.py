@@ -68,6 +68,12 @@ class DFlash2Config(DFlashConfig):
             [float, int], ["dflash_config->output_multiplier", "output_multiplier"], 1.0))
         self.final_logit_softcapping = float(self.read_cfg(
             [float, int], ["dflash_config->final_logit_softcapping", "final_logit_softcapping"], 0.0))
+        # Where the selector applies the logit softcap: on the head's logits ("before_correction") or on the
+        # candidate scores after the predecessor correction ("after_correction")
+        self.selector_softcap_mode = self.read_cfg(
+            str, ["dflash_config->selector_softcap_mode", "selector_softcap_mode"], "before_correction")
+        assert self.selector_softcap_mode in ("before_correction", "after_correction"), \
+            "DFlash2 selector_softcap_mode must be before_correction or after_correction"
         assert 0 < self.conv_kernel_size <= self.block_size, \
             "DFlash2 conv_kernel_size must be positive and no larger than block_size"
         assert self.conv_group_size > 0 and self.hidden_size % self.conv_group_size == 0, \
@@ -239,7 +245,9 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
-        if target.config.vocab_size != self.config.vocab_size:
+        # A target with a padded head (Inkling 2) stores the padded width in the drafter's config
+        target_vocab = getattr(target.config, "padded_vocab_size", None) or target.config.vocab_size
+        if target_vocab != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
                 f"target vocabulary size {target.config.vocab_size}"
@@ -253,7 +261,10 @@ class DFlash2Model(Model):
             raise ValueError("DFlash2 mask_token_id is outside the target vocabulary")
         if target.logit_layer_idx is None:
             raise ValueError("DFlash2 target has no compatible LM head")
-        if any(not 0 <= layer_id < target.config.num_hidden_layers
+        # A looped target (Inkling 2) numbers its taps by block visit, the last one being the normed final state
+        visits = getattr(target, "n_visits", None)
+        last_tap = visits if visits else target.config.num_hidden_layers - 1
+        if any(not 0 <= layer_id <= last_tap
                for layer_id in self.config.target_layer_ids):
             raise ValueError("DFlash2 target_layer_ids contains a layer outside the target model")
         self.attached_model = weakref.ref(target)
@@ -314,6 +325,21 @@ class DFlash2Model(Model):
             out, confidence = self.selector.walk_candidates(
                 to_device(state[:, 1:], dev), to_device(unary, dev), to_device(cands, dev), anchor,
                 return_confidence = export_conf,
+            )
+            if export_conf:
+                params["draft_conf"] = confidence
+            return out
+        draft_logits = getattr(lm, "draft_logits", None)
+        if draft_logits is not None:
+            # The target's head takes the drafter's own normed state (no final mixing of the target's blocks) and
+            # applies its softcap itself. tanh is monotonic, so capping the scores after the correction leaves the
+            # greedy walk where the uncapped logits put it: the head runs without its cap in that mode.
+            capped = self.config.selector_softcap_mode != "after_correction"
+            logits = draft_logits(lm.prepare_for_device(state.half(), params), params, softcap = capped)
+            out, confidence = self.selector.walk_block(
+                to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
+                return_confidence = export_conf,
+                vocab_size = target.config.vocab_size,
             )
             if export_conf:
                 params["draft_conf"] = confidence
