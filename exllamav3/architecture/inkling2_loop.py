@@ -12,6 +12,7 @@ from ..modules.quant.exl3 import LinearEXL3
 from ..modules.quant.fp16 import LinearFP16
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..constants import PAGE_SIZE
+from ..util.memory import graph_capture
 from ..ext import exllamav3_ext as ext
 from ..modules.arch_specific.inkling2 import (
     Inkling2Embedding,
@@ -221,20 +222,6 @@ def _mlin_fields(a, dev):
     rout = [torch.empty((16, l.out_features), dtype = torch.float, device = dev) for l in lins]
     return dict(mlin = True, mlin_t = [l.inner.trellis for l in lins], mlin_su = [l.inner.suh for l in lins],
                 mlin_sv = [l.inner.svh for l in lins], mlin_out = outs, mlin_cnt = cnt, mlin_xh = xh, mlin_rout = rout)
-
-
-def _segments(expandable: bool) -> bool:
-    """Segment type of the allocator pools created from here on; False when the package left the allocator alone"""
-    import exllamav3
-    if not getattr(exllamav3, "expandable_segments", False):
-        return False
-    try:
-        setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) \
-            or torch.cuda.memory._set_allocator_settings
-        setter("expandable_segments:" + ("True" if expandable else "False"))
-        return True
-    except Exception:
-        return False
 
 
 class Inkling2LoopConfig(Config):
@@ -631,16 +618,8 @@ class Inkling2LoopModel(Model):
             self._gwarm[key] = n + 1
             return step(record).clone()
         g = torch.cuda.CUDAGraph()      # capture records only; the replay below executes the forward once
-        # The step's temporaries live in the graph's private pool and are free blocks once the capture ends. In an
-        # expandable segment the allocator unmaps free blocks when it trims its cache (a long prefill does that),
-        # and the next replay faults on them. The pool is therefore created from fixed segments.
-        fixed = _segments(False)
-        try:
-            with torch.cuda.graph(g):
-                out = step(record)
-        finally:
-            if fixed:
-                _segments(True)
+        with graph_capture(g):
+            out = step(record)
         g.replay()
         self._graphs[key] = (g, out)
         self.graph_captures += 1

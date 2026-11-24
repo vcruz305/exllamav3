@@ -882,3 +882,37 @@ def windows_memory_status() -> tuple[int, int]:
     if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
         raise ctypes.WinError(ctypes.get_last_error())
     return status.ullAvailPhys, status.ullAvailPageFile
+
+
+import contextlib
+
+def _segments(expandable: bool) -> bool:
+    """Segment type of the allocator pools created from here on; False when the package left the allocator alone"""
+    import exllamav3
+    if not getattr(exllamav3, "expandable_segments", False):
+        return False
+    try:
+        setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None) \
+            or torch.cuda.memory._set_allocator_settings
+        setter("expandable_segments:" + ("True" if expandable else "False"))
+        return True
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def graph_capture(graph: torch.cuda.CUDAGraph):
+    """
+    torch.cuda.graph(graph), with the graph's private pool made of fixed allocator segments.
+
+    The temporaries of a captured region live in the graph's private pool and are free blocks once the capture
+    ends. In an expandable segment the allocator unmaps free blocks when it trims its cache (a long prefill does
+    that), and the next replay faults on them with an illegal memory access.
+    """
+    fixed = _segments(False)
+    try:
+        with torch.cuda.graph(graph):
+            yield
+    finally:
+        if fixed:
+            _segments(True)

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from typing_extensions import override
 
 from ..model.model import Model
+from ..util.memory import graph_capture
 from ..modules.module import Module
 from ..modules.linear import Linear
 from ..modules.arch_specific.inkling2 import _side
@@ -360,7 +361,7 @@ class Inkling2MTPModel(Model):
         for _ in range(2):      # on the current stream: a side stream per capture stalls the WSL driver after a few
             fn()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with graph_capture(g):
             out = fn()
         return g, out
 
@@ -577,7 +578,7 @@ class Inkling2MTPModel(Model):
         for _ in range(2):
             self._head_markov(*self._mg_in)
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
+        with graph_capture(g):
             self._mg_out = self._head_markov(*self._mg_in)
         self._mg = g
         return g
